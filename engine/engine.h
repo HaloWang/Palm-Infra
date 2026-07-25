@@ -221,7 +221,6 @@ public:
 
 private:
     void prepare_metal_prefill_weights();
-    void release_metal_prefill_weights();
 
     EngineConfig cfg_;
     Graph graph_prefill_;

@@ -570,25 +570,6 @@ void LLMEngine::prepare_metal_prefill_weights() {
 #endif
 }
 
-void LLMEngine::release_metal_prefill_weights() {
-#ifdef MOLLM_METAL
-    if (!moe_ssd_cache_ || !metal_backend_ ||
-        exec_ctx_prefill_.backend != metal_backend_.get())
-        return;
-    as_metal(metal_backend_)->release_weight_copies();
-    for (auto& node : graph_prefill_.nodes) {
-        if (node.op_type != OpType::CONSTANT || node.params.str.empty())
-            continue;
-        Tensor& t = graph_prefill_.runtime.tensors[node.id];
-        // KV caches and recurrent state are also CONSTANT nodes, but have no
-        // mmap-backed row-major weight source and must stay device-resident.
-        if (!t.rowmajor_data) continue;
-        t.device_data = nullptr;
-        t.device_offset = 0;
-    }
-#endif
-}
-
 void LLMEngine::release_prefill_buffers() {
     release_graph_temporaries(graph_prefill_, exec_ctx_prefill_.backend);
     invalidate_workspace_key(exec_ctx_prefill_);
@@ -614,10 +595,8 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
          (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
         // Small-M GPU kernels plus one GPU→CPU synchronization per MoE layer
-        // lose to the CPU path. Drop dense Metal copies before CPU work so UMA
-        // pressure cannot slow the SSD expert kernels.
-        if (!cfg_.metal_ssd_full)
-            release_metal_prefill_weights();
+        // lose to the CPU path. Retain any existing dense Metal copies so a
+        // later long prompt can reuse them without VM/allocation churn.
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
@@ -629,14 +608,12 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
 #endif
     auto finish_prefill_phase = [&] {
         // Hybrid decode is CPU-only, so no prefill workspace is useful after
-        // the last chunk. Releasing it also makes backend switching explicit.
+        // the last chunk. Dense Metal weights remain cached for later prompts.
         if (moe_ssd_cache_) {
             release_graph_temporaries(graph_prefill_,
                                       exec_ctx_prefill_.backend);
             invalidate_workspace_key(exec_ctx_prefill_);
         }
-        if (!short_ssd_cpu_prefill && !cfg_.metal_ssd_full)
-            release_metal_prefill_weights();
         if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
             !moe_ssd_cache_->clear_resident()) {
             fprintf(stderr,
@@ -705,8 +682,6 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         (n < metal_ssd_prefill_min_tokens() ||
          (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
-        if (!cfg_.metal_ssd_full)
-            release_metal_prefill_weights();
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
@@ -794,8 +769,6 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
                                   exec_ctx_prefill_.backend);
         invalidate_workspace_key(exec_ctx_prefill_);
     }
-    if (!short_ssd_cpu_prefill && !cfg_.metal_ssd_full)
-        release_metal_prefill_weights();
     if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
         !moe_ssd_cache_->clear_resident()) {
         fprintf(stderr,

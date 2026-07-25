@@ -1020,14 +1020,6 @@ void MetalBackend::enable_weight_copy_mode() {
     impl_->copy_weights = true;
 }
 
-void MetalBackend::release_weight_copies() {
-    if (!impl_->copy_weights) return;
-    synchronize_for_host_read();
-    impl_->copied_weights.clear();
-    impl_->decoded_q4_weights.clear();
-    impl_->weight_copies.clear();
-}
-
 bool MetalBackend::has_weight_copies() const {
     return !impl_->weight_copies.empty();
 }
