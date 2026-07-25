@@ -2284,6 +2284,62 @@ kernel void rms_norm_f32(
     }
 }
 
+// Residual add + RMSNorm. The residual stream is updated in place and the
+// normalized value is written separately for the following projection.
+kernel void add_rms_norm_f32(
+    device float*                 RESIDUAL [[buffer(0)]],
+    device const float*           UPDATE   [[buffer(1)]],
+    device float*                 O        [[buffer(2)]],
+    constant AddRmsNormParams&    p        [[buffer(3)]],
+    device const float*           W        [[buffer(4)]],
+    uint row                               [[threadgroup_position_in_grid]],
+    uint tid                               [[thread_position_in_threadgroup]],
+    uint tcount                            [[threads_per_threadgroup]])
+{
+    if (int(row) >= p.rows) return;
+    device float* residual =
+        RESIDUAL + p.residual_offset +
+        row * (uint)p.residual_row_stride;
+    device const float* update =
+        UPDATE + p.update_offset + row * (uint)p.update_row_stride;
+    device float* out =
+        O + p.out_offset + row * (uint)p.out_row_stride;
+
+    float partial = 0.0f;
+    const int d4 = p.dim0 & ~3;
+    device float4* residual4 = (device float4*)residual;
+    device const float4* update4 = (device const float4*)update;
+    for (int q = int(tid); q < (d4 >> 2); q += int(tcount)) {
+        const float4 value = residual4[q] + update4[q];
+        residual4[q] = value;
+        partial += dot(value, value);
+    }
+    for (int i = d4 + int(tid); i < p.dim0; i += int(tcount)) {
+        const float value = residual[i] + update[i];
+        residual[i] = value;
+        partial += value * value;
+    }
+
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5;
+    const uint nsg = (tcount + 31u) >> 5;
+    partial = simd_sum(partial);
+    threadgroup float sh[32];
+    if (lane == 0) sh[sg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total =
+        simd_sum(lane < nsg ? sh[lane] : 0.0f);
+    const float scale =
+        rsqrt(total / float(p.dim0) + p.eps);
+
+    device float4* out4 = (device float4*)out;
+    device const float4* weight4 = (device const float4*)W;
+    for (int q = int(tid); q < (d4 >> 2); q += int(tcount))
+        out4[q] = residual4[q] * scale * weight4[q];
+    for (int i = d4 + int(tid); i < p.dim0; i += int(tcount))
+        out[i] = residual[i] * scale * W[i];
+}
+
 // Layer norm over dim0. W and bias are bound at their byte offsets, so the
 // parameter block only carries activation/output offsets.
 kernel void layer_norm_f32(
@@ -2416,6 +2472,33 @@ kernel void mul_f32(
               i1*(uint)p.out_stride[1] + i2*(uint)p.out_stride[2] +
               i3*(uint)p.out_stride[3];
     O[oi] = A[ai] * B[bi];
+}
+
+// Fused output gate: value * sigmoid(gate).
+kernel void sigmoid_mul_f32(
+    device const float*   VALUE  [[buffer(0)]],
+    device const float*   GATE   [[buffer(1)]],
+    device float*         O      [[buffer(2)]],
+    constant EwiseParams& p      [[buffer(3)]],
+    uint gid                      [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.n) return;
+    uint q = gid;
+    uint i0 = q % (uint)p.shape[0]; q /= (uint)p.shape[0];
+    uint i1 = q % (uint)p.shape[1]; q /= (uint)p.shape[1];
+    uint i2 = q % (uint)p.shape[2]; q /= (uint)p.shape[2];
+    uint i3 = q;
+    uint vi = p.a_offset + i0*(uint)p.a_stride[0] +
+              i1*(uint)p.a_stride[1] + i2*(uint)p.a_stride[2] +
+              i3*(uint)p.a_stride[3];
+    uint gi = p.b_offset + i0*(uint)p.b_stride[0] +
+              i1*(uint)p.b_stride[1] + i2*(uint)p.b_stride[2] +
+              i3*(uint)p.b_stride[3];
+    uint oi = p.out_offset + i0*(uint)p.out_stride[0] +
+              i1*(uint)p.out_stride[1] + i2*(uint)p.out_stride[2] +
+              i3*(uint)p.out_stride[3];
+    const float gate = GATE[gi];
+    O[oi] = VALUE[vi] / (1.0f + exp(-gate));
 }
 
 // SILU: x * sigmoid(x) (contiguous).
@@ -3102,8 +3185,10 @@ kernel void gdn_prefill_f32(
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // gate scalars for (t, vh): a/b are [seq, num_v_heads].
-        float a_h = A[p.a_offset + (uint)(t*p.num_v_heads) + vh];
-        float b_h = B[p.b_offset + (uint)(t*p.num_v_heads) + vh];
+        float a_h =
+            A[p.a_offset + (uint)t*(uint)p.a_row_stride + vh];
+        float b_h =
+            B[p.b_offset + (uint)t*(uint)p.b_row_stride + vh];
         float sp = gdn_softplus(a_h + DTB[p.dtb_offset + vh]);
         float g_exp = exp(neg_exp_A * sp);
         float beta = 1.0f/(1.0f+exp(-b_h));
@@ -3131,7 +3216,9 @@ kernel void gdn_prefill_f32(
         float at=simd_sum(lane<nsg?red[lane]:0.0f);
         float rms=1.0f/sqrt(at/(float)V + p.rms_eps);
         float normed = attn*rms*NORMW[p.norm_offset + dv];
-        float z = Z[p.z_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv];
+        float z =
+            Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
+              (uint)((int)vh*V) + dv];
         float silu_z = z/(1.0f+exp(-z));
         O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = normed * silu_z;
         threadgroup_barrier(mem_flags::mem_threadgroup);  // state consistent before next t
@@ -3231,9 +3318,9 @@ kernel void gdn_prefill_kparallel_f32(
         }
         if (tid == 0) {
             const float a_h =
-                A[p.a_offset + (uint)(t*p.num_v_heads) + vh];
+                A[p.a_offset + (uint)t*(uint)p.a_row_stride + vh];
             const float b_h =
-                B[p.b_offset + (uint)(t*p.num_v_heads) + vh];
+                B[p.b_offset + (uint)t*(uint)p.b_row_stride + vh];
             gate[0] =
                 exp(neg_exp_A *
                     gdn_softplus(a_h + DTB[p.dtb_offset + vh]));
@@ -3289,7 +3376,7 @@ kernel void gdn_prefill_kparallel_f32(
             const float rms =
                 1.0f / sqrt(at / (float)V + p.rms_eps);
             const float z =
-                Z[p.z_offset + (uint)(t*zdim) +
+                Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
                   (uint)((int)vh*V + dv)];
             const float silu_z = z / (1.0f + exp(-z));
             O[p.out_offset + (uint)(t*zdim) +
@@ -3362,8 +3449,11 @@ kernel void gdn_prepare_gates_f32(
     const int total = p.seq_len * p.num_v_heads;
     if ((int)gid >= total) return;
     const int vh = (int)gid % p.num_v_heads;
-    const float a = A[p.a_offset + gid];
-    const float b = B[p.b_offset + gid];
+    const int t = (int)gid / p.num_v_heads;
+    const float a =
+        A[p.a_offset + (uint)t*(uint)p.a_row_stride + (uint)vh];
+    const float b =
+        B[p.b_offset + (uint)t*(uint)p.b_row_stride + (uint)vh];
     GEXP[gid] =
         exp(-exp(ALOG[p.Alog_offset + vh]) *
             gdn_softplus(a + DTB[p.dtb_offset + vh]));
@@ -3476,7 +3566,8 @@ kernel void gdn_post_f32(
         const float rms =
             1.0f / sqrt(total/(float)V + p.rms_eps);
         const float z =
-            Z[p.z_offset + (uint)base + tid];
+            Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
+              (uint)(vh*V) + tid];
         const float silu_z = z/(1.0f + exp(-z));
         O[p.out_offset + (uint)base + tid] =
             RAW[base + tid] * rms *

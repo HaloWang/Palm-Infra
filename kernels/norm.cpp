@@ -120,6 +120,77 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
 #endif
 }
 
+void kernel_add_rms_norm(Tensor& residual, const Tensor& update,
+                         const Tensor& weight, float eps, Tensor& out,
+                         ThreadPool* thread_pool) {
+    const int D = (int)residual.shape[0];
+    const int N = (int)residual.shape[1];
+    const int ldr = (int)(residual.stride[1] / sizeof(float));
+    const int ldu = (int)(update.stride[1] / sizeof(float));
+    const int ldo = (int)(out.stride[1] / sizeof(float));
+    float* residual_data = residual.ptr<float>();
+    const float* update_data = update.ptr<float>();
+    const float* weight_data = weight.ptr<float>();
+    float* out_data = out.ptr<float>();
+
+    auto process_rows = [&](int, int begin, int end) {
+        for (int n = begin; n < end; ++n) {
+            float* r = residual_data + (size_t)n * ldr;
+            const float* u = update_data + (size_t)n * ldu;
+            float* o = out_data + (size_t)n * ldo;
+            float sum_sq = 0.0f;
+            int d = 0;
+#if HAS_NEON
+            float32x4_t sum4 = vdupq_n_f32(0.0f);
+            for (; d + 7 < D; d += 8) {
+                float32x4_t r0 = vaddq_f32(
+                    vld1q_f32(r + d), vld1q_f32(u + d));
+                float32x4_t r1 = vaddq_f32(
+                    vld1q_f32(r + d + 4), vld1q_f32(u + d + 4));
+                vst1q_f32(r + d, r0);
+                vst1q_f32(r + d + 4, r1);
+                sum4 = vfmaq_f32(sum4, r0, r0);
+                sum4 = vfmaq_f32(sum4, r1, r1);
+            }
+            sum_sq = vaddvq_f32(sum4);
+#endif
+            for (; d < D; ++d) {
+                const float value = r[d] + u[d];
+                r[d] = value;
+                sum_sq += value * value;
+            }
+            const float scale =
+                1.0f / std::sqrt(sum_sq / (float)D + eps);
+            d = 0;
+#if HAS_NEON
+            const float32x4_t scale4 = vdupq_n_f32(scale);
+            for (; d + 7 < D; d += 8) {
+                vst1q_f32(
+                    o + d,
+                    vmulq_f32(
+                        vmulq_f32(vld1q_f32(r + d), scale4),
+                        vld1q_f32(weight_data + d)));
+                vst1q_f32(
+                    o + d + 4,
+                    vmulq_f32(
+                        vmulq_f32(vld1q_f32(r + d + 4), scale4),
+                        vld1q_f32(weight_data + d + 4)));
+            }
+#endif
+            for (; d < D; ++d)
+                o[d] = r[d] * scale * weight_data[d];
+        }
+    };
+    if (thread_pool && thread_pool->num_threads() > 1 && N >= 16) {
+        const int chunk = std::max(
+            1, (N + thread_pool->num_threads() - 1) /
+                   thread_pool->num_threads());
+        thread_pool->parallel_for(0, N, chunk, process_rows);
+    } else {
+        process_rows(0, 0, N);
+    }
+}
+
 void kernel_layer_norm(const Tensor& x, const Tensor& weight, const Tensor& bias,
                        float eps, Tensor& out, ThreadPool* thread_pool) {
     const int d = (int)x.shape[0], n = (int)x.shape[1];

@@ -32,6 +32,10 @@ def main():
     check(_quant_spec("w4mixg128", 1024, v_proj), ("w8", 128),
           "mixed W4 promotes full-attention V")
 
+    qkv_proj = "model.language_model.layers.7.self_attn.qkv_proj.weight"
+    check(_quant_spec("w4mixg128", 1024, qkv_proj), ("w8", 128),
+          "mixed W4 promotes merged full-attention QKV")
+
     q_proj = "model.language_model.layers.7.self_attn.q_proj.weight"
     check(_quant_spec("w4mixg128", 1024, q_proj), ("w4", 128),
           "mixed W4 leaves full-attention Q at base W4")

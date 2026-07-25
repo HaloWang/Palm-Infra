@@ -61,7 +61,7 @@ static void fused_gdn_head(
     const float* neg_exp_A, const float* dt_bias, const float* norm_w,
     float* state, float* out,
     int num_heads, int k_dim, int v_dim, int num_v_heads, int seq_len,
-    int data_seq_len,
+    int data_seq_len, int a_row_stride, int b_row_stride, int z_row_stride,
     bool use_l2norm, float rms_eps, float l2norm_eps, float scale)
 {
     int qkv_dim   = num_heads * k_dim;       // key_dim (q/k are key_heads * k_dim)
@@ -89,13 +89,13 @@ static void fused_gdn_head(
                 v_t[d] = qkv[(2 * qkv_dim + vh * v_dim + d) * data_seq_len + t];
 
             // g = -exp(A_log[kh]) * softplus(a[t, vh] + dt_bias[kh])
-            float a_ht = a[t * num_v_heads + vh];
+            float a_ht = a[t * a_row_stride + vh];
             float sp = softplusf(a_ht + dtb);
             float g_t = nea * sp;
             float g_t_exp = std::exp(g_t);
 
             // beta = sigmoid(b[t, vh])
-            float b_ht = b[t * num_v_heads + vh];
+            float b_ht = b[t * b_row_stride + vh];
             float beta_t = sigmoidf(b_ht);
 
             // L2 normalize q, k (if enabled)
@@ -143,7 +143,7 @@ static void fused_gdn_head(
             // 6. RMSNormGated: out = rms_norm(attn_out, norm_w) * silu(z)
             // Output layout: [z_dim, seq] row-major. Matmul reads lda = stride[1]/es = z_dim.
             // out[global_dim + t * z_dim] matches matmul's A[m*z_dim + k] for out_proj.
-            const float* z_row = z + t * z_dim + vh * v_dim;
+            const float* z_row = z + t * z_row_stride + vh * v_dim;
             float sum_sq = 0.f;
             for (int d = 0; d < v_dim; d++) sum_sq += attn_out[d] * attn_out[d];
             float rms = 1.f / std::sqrt(sum_sq / (float)v_dim + rms_eps);
@@ -208,6 +208,9 @@ void kernel_gdn_prefill(const OpParams& params,
 
     // Zero out output for padding positions.
     int z_dim = num_v_heads * v_head_dim;
+    int a_row_stride = (int)(inputs[1]->stride[1] / sizeof(float));
+    int b_row_stride = (int)(inputs[2]->stride[1] / sizeof(float));
+    int z_row_stride = (int)(inputs[3]->stride[1] / sizeof(float));
     int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
     if (process_len < seq_len) {
         for (int t = process_len; t < seq_len; t++) {
@@ -220,6 +223,7 @@ void kernel_gdn_prefill(const OpParams& params,
                    state_data, out_data,
                    num_heads, k_head_dim, v_head_dim, num_v_heads,
                    process_len, seq_len,
+                   a_row_stride, b_row_stride, z_row_stride,
                    use_l2norm, rms_eps, l2norm_eps, scale);
 }
 

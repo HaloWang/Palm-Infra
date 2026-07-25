@@ -67,6 +67,7 @@ enum class OpType : uint32_t {
     // normalisation
     RMS_NORM   = 20,
     LAYER_NORM = 21,
+    ADD_RMS_NORM = 22,  // residual += update; out = rms_norm(residual)
 
     // activations
     SILU = 30,
@@ -100,6 +101,7 @@ enum class OpType : uint32_t {
     SIGMOID_EXACT = 76,
     EXP_EXACT     = 77,
     GEMV_SPARSE_A = 78,
+    SIGMOID_MUL   = 79,   // value * sigmoid(gate)
 
     // KV cache
     QUANTIZE_KV   = 80,
@@ -127,6 +129,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::MATMUL: return "MATMUL";
     case OpType::RMS_NORM: return "RMS_NORM";
     case OpType::LAYER_NORM: return "LAYER_NORM";
+    case OpType::ADD_RMS_NORM: return "ADD_RMS_NORM";
     case OpType::SILU: return "SILU";
     case OpType::GELU: return "GELU";
     case OpType::TANH: return "TANH";
@@ -148,6 +151,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::EXP_EXACT: return "EXP_EXACT";
     case OpType::GEMV_SPARSE_A: return "GEMV_SPARSE_A";
     case OpType::SWIGLU: return "SWIGLU";
+    case OpType::SIGMOID_MUL: return "SIGMOID_MUL";
     case OpType::QUANTIZE_KV: return "QUANTIZE_KV";
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";

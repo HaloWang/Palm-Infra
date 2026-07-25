@@ -541,8 +541,15 @@ int main() {
         float l2eps = 1e-6f, rmseps = 1e-6f, scale = 1.0f/std::sqrt((float)K);
         int qkv_dim = H*K, qkv_total = 2*H*K + VH*Vd, zdim = VH*Vd;
         Tensor QKV = make_dev(mb, Precision::FP32, qkv_total, S);   // [qkv_total, seq]
-        Tensor A = make_dev(mb, Precision::FP32, VH, S);            // [seq, VH] data
-        Tensor B = make_dev(mb, Precision::FP32, VH, S);
+        // A/B are views into one merged [2*VH, S] projection. Their logical
+        // row width is VH while stride[1] remains 2*VH, matching converter
+        // output after a dim-0 slice.
+        Tensor AB = make_dev(mb, Precision::FP32, 2*VH, S);
+        Tensor A = AB;
+        Tensor B = AB;
+        A.shape[0] = VH;
+        B.shape[0] = VH;
+        B.device_offset += (size_t)VH * sizeof(float);
         Tensor Z = make_dev(mb, Precision::FP32, zdim, S);          // [seq, zdim]
         Tensor ALG = make_dev(mb, Precision::FP32, VH, 1);
         Tensor DTB = make_dev(mb, Precision::FP32, VH, 1);
@@ -554,8 +561,15 @@ int main() {
         fill_rand(qkv.data(),qkv.size()); fill_rand(a.data(),a.size()); fill_rand(b.data(),b.size());
         fill_rand(z.data(),z.size()); fill_rand(alg.data(),VH); fill_rand(dtb.data(),VH);
         fill_rand(nrm.data(),Vd); fill_rand(st.data(),st.size());
-        memcpy(QKV.data,qkv.data(),qkv.size()*4); memcpy(A.data,a.data(),a.size()*4);
-        memcpy(B.data,b.data(),b.size()*4); memcpy(Z.data,z.data(),z.size()*4);
+        std::vector<float> ab((size_t)2*VH*S);
+        for (int t=0;t<S;t++) {
+            memcpy(ab.data() + (size_t)t*2*VH,
+                   a.data() + (size_t)t*VH, (size_t)VH*4);
+            memcpy(ab.data() + (size_t)t*2*VH + VH,
+                   b.data() + (size_t)t*VH, (size_t)VH*4);
+        }
+        memcpy(QKV.data,qkv.data(),qkv.size()*4);
+        memcpy(AB.data,ab.data(),ab.size()*4); memcpy(Z.data,z.data(),z.size()*4);
         memcpy(ALG.data,alg.data(),VH*4); memcpy(DTB.data,dtb.data(),VH*4);
         memcpy(NRM.data,nrm.data(),Vd*4); memcpy(ST.data,st.data(),st.size()*4);
         std::vector<int> i32 = {H, K, Vd, S, 1, 4, 0, VH};
@@ -589,7 +603,8 @@ int main() {
         }
         bool ok_out = close((const float*)O.data, ref.data(), (int)((size_t)zdim*S), 5e-3f, 5e-3f);
         bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 5e-3f, 5e-3f);
-        CHECK(ok_out && ok_st, "GDN_PREFILL H=4 K=128 V=128 S=6");
+        CHECK(ok_out && ok_st,
+              "GDN_PREFILL H=4 K=128 V=128 S=6 strided A/B");
     }
 
     // ---- SWIGLU: silu(gate)*up over merged [2I, S] (dim0=2I inner) ----
@@ -613,6 +628,26 @@ int main() {
         CHECK(close((const float*)O.data, ref.data(), I*S, 1e-5f, 1e-4f), "SWIGLU I=48 S=5");
     }
 
+    // ---- SIGMOID_MUL: value * sigmoid(gate) -------------------------------
+    {
+        int D = 96, rows = 5;
+        Tensor V = make_dev(mb, Precision::FP32, D, rows);
+        Tensor G = make_dev(mb, Precision::FP32, D, rows);
+        Tensor O = make_dev(mb, Precision::FP32, D, rows);
+        std::vector<float> value((size_t)D*rows), gate((size_t)D*rows);
+        std::vector<float> ref((size_t)D*rows);
+        fill_rand(value.data(), (int)value.size());
+        fill_rand(gate.data(), (int)gate.size());
+        memcpy(V.data, value.data(), value.size()*4);
+        memcpy(G.data, gate.data(), gate.size()*4);
+        for (size_t i=0;i<ref.size();++i)
+            ref[i] = value[i] / (1.0f + std::exp(-gate[i]));
+        metal_op(mb, OpType::SIGMOID_MUL, {&V,&G}, O);
+        CHECK(close((const float*)O.data, ref.data(), (int)ref.size(),
+                    1e-5f, 1e-4f),
+              "SIGMOID_MUL D=96 rows=5");
+    }
+
     // ---- RMS_NORM over dim0 ----
     {
         int D = 128, rows = 8;
@@ -631,6 +666,47 @@ int main() {
             for(int i=0;i<D;i++) ref[r*D+i]=(float)(x[r*D+i]*inv*w[i]);
         }
         CHECK(close((const float*)O.data, ref.data(), D*rows, 1e-4f, 1e-3f), "RMS_NORM D=128 rows=8");
+    }
+
+    // ---- ADD_RMS_NORM: update residual in place + normalized output -------
+    {
+        int D = 128, rows = 5;
+        Tensor R = make_dev(mb, Precision::FP32, D, rows);
+        Tensor U = make_dev(mb, Precision::FP32, D, rows);
+        Tensor W = make_dev(mb, Precision::FP32, D, 1);
+        Tensor O = make_dev(mb, Precision::FP32, D, rows);
+        std::vector<float> residual((size_t)D*rows);
+        std::vector<float> update((size_t)D*rows);
+        std::vector<float> weight(D);
+        std::vector<float> expected_residual((size_t)D*rows);
+        std::vector<float> expected_out((size_t)D*rows);
+        fill_rand(residual.data(), (int)residual.size());
+        fill_rand(update.data(), (int)update.size());
+        fill_rand(weight.data(), D);
+        for (size_t i=0;i<residual.size();++i)
+            expected_residual[i] = residual[i] + update[i];
+        for (int row=0;row<rows;++row) {
+            double ss = 0.0;
+            for (int d=0;d<D;++d) {
+                const float v = expected_residual[(size_t)row*D+d];
+                ss += (double)v*v;
+            }
+            const float scale =
+                1.0f/std::sqrt((float)(ss/D)+1e-6f);
+            for (int d=0;d<D;++d)
+                expected_out[(size_t)row*D+d] =
+                    expected_residual[(size_t)row*D+d]*scale*weight[d];
+        }
+        memcpy(R.data, residual.data(), residual.size()*4);
+        memcpy(U.data, update.data(), update.size()*4);
+        memcpy(W.data, weight.data(), weight.size()*4);
+        metal_op(mb, OpType::ADD_RMS_NORM, {&R,&U,&W}, O, {}, {1e-6f});
+        CHECK(close((const float*)R.data, expected_residual.data(),
+                    (int)residual.size(), 1e-6f, 1e-6f),
+              "ADD_RMS_NORM residual update");
+        CHECK(close((const float*)O.data, expected_out.data(),
+                    (int)expected_out.size(), 2e-4f, 2e-4f),
+              "ADD_RMS_NORM normalized output");
     }
 
     // ---- LAYER_NORM over dim0 ---------------------------------------------

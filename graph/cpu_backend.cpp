@@ -129,6 +129,17 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::ADD_RMS_NORM:
+        if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] &&
+            output) {
+            float eps = graph_params::get_f32(params, 0, 1e-6f);
+            Tensor& residual = *const_cast<Tensor*>(inputs[0]);
+            kernel_add_rms_norm(
+                residual, *inputs[1], *inputs[2], eps, *output,
+                thread_pool);
+        }
+        break;
+
     case OpType::LAYER_NORM:
         if (inputs.size() >= 3 && inputs[0] && inputs[1] && inputs[2] && output) {
             float eps = graph_params::get_f32(params, 0, 1e-5f);
@@ -140,6 +151,7 @@ void CPUBackend::dispatch(const GraphNode& node,
 
     case OpType::ADD:
     case OpType::MUL:
+    case OpType::SIGMOID_MUL:
     case OpType::SILU:
     case OpType::GELU:
     case OpType::TANH:

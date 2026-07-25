@@ -45,8 +45,11 @@ def _w4mix_promote_to_w8(wname: str) -> bool:
     if ".linear_attn.in_proj_qkv.weight" in wname:
         return True
 
-    # Full-attention V projection is the split equivalent of attn_v.weight.
-    if ".self_attn.v_proj.weight" in wname:
+    # Full-attention V projection is sensitive. New packages merge Q/K/V, so
+    # promote the whole row-concatenated tensor rather than silently lowering
+    # the V rows from W8 to W4.
+    if (".self_attn.v_proj.weight" in wname
+            or ".self_attn.qkv_proj.weight" in wname):
         return True
 
     # Our current W4 format is a symmetric per-group baseline, not Q4_K. Be
@@ -164,6 +167,18 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "fp16"):
             continue
         if wname.endswith('lm_head.weight'):
             continue
+        # MLP gate/up weights are exported as one row-concatenated matrix
+        # below.  A single projection reuses the activation tile and feeds the
+        # fused SWIGLU op, avoiding two matmuls plus separate SILU/MUL kernels.
+        if '.mlp.gate_proj.weight' in wname or '.mlp.up_proj.weight' in wname:
+            continue
+        if ('.self_attn.q_proj.weight' in wname
+                or '.self_attn.k_proj.weight' in wname
+                or '.self_attn.v_proj.weight' in wname):
+            continue
+        if ('.linear_attn.in_proj_a.weight' in wname
+                or '.linear_attn.in_proj_b.weight' in wname):
+            continue
 
         # Final norm (check before generic norm)
         if wname.endswith('model.language_model.norm.weight'):
@@ -211,6 +226,105 @@ def export_weights(weights: dict, weights_dir: str, quant: str = "fp16"):
         # Projection weights are FP16 by default, optionally W8 quantized.
         d = wdata.astype(np.float16) if wdata.dtype != np.float16 else wdata
         save(wname.replace('.', '_'), d, quantizable=True, raw_name=wname)
+
+    # Merge MLP gate/up projections per layer. Quantization is row-local, so
+    # concatenating output rows preserves each original row's W8/W4 scales and
+    # integer values exactly.
+    gate_pat = re.compile(
+        r'^model\.language_model\.layers\.(\d+)\.mlp\.gate_proj\.weight$'
+    )
+    layer_ids = sorted(
+        int(match.group(1))
+        for wname in weights
+        for match in [gate_pat.match(wname)]
+        if match
+    )
+    for layer_idx in layer_ids:
+        gate_name = (
+            f"model.language_model.layers.{layer_idx}.mlp.gate_proj.weight"
+        )
+        up_name = (
+            f"model.language_model.layers.{layer_idx}.mlp.up_proj.weight"
+        )
+        if up_name not in weights:
+            raise KeyError(f"Missing matching MLP up projection: {up_name}")
+        merged = np.concatenate(
+            [weights[gate_name], weights[up_name]], axis=0
+        )
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(
+            f"model_language_model_layers_{layer_idx}_mlp_gate_up_proj_weight",
+            merged,
+            quantizable=True,
+            raw_name=(
+                f"model.language_model.layers.{layer_idx}."
+                "mlp.gate_up_proj.weight"
+            ),
+        )
+
+    # Full-attention Q/K/V projections share the same input. Store their output
+    # rows in one matrix so both prefill tensor GEMM and decode GEMV read the
+    # activation once. The q projection already contains query and output-gate
+    # rows; it remains the first contiguous slice.
+    q_pat = re.compile(
+        r'^model\.language_model\.layers\.(\d+)\.self_attn\.q_proj\.weight$'
+    )
+    attn_layer_ids = sorted(
+        int(match.group(1))
+        for wname in weights
+        for match in [q_pat.match(wname)]
+        if match
+    )
+    for layer_idx in attn_layer_ids:
+        prefix = f"model.language_model.layers.{layer_idx}.self_attn"
+        names = [
+            f"{prefix}.q_proj.weight",
+            f"{prefix}.k_proj.weight",
+            f"{prefix}.v_proj.weight",
+        ]
+        missing = [name for name in names if name not in weights]
+        if missing:
+            raise KeyError(
+                f"Missing full-attention projection(s): {', '.join(missing)}"
+            )
+        merged = np.concatenate([weights[name] for name in names], axis=0)
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(
+            f"model_language_model_layers_{layer_idx}_self_attn_qkv_proj_weight",
+            merged,
+            quantizable=True,
+            raw_name=f"{prefix}.qkv_proj.weight",
+        )
+
+    # The two scalar GDN gates are tiny projections of the same activation.
+    # Concatenating their rows halves both dispatches and activation reads.
+    a_pat = re.compile(
+        r'^model\.language_model\.layers\.(\d+)\.'
+        r'linear_attn\.in_proj_a\.weight$'
+    )
+    linear_layer_ids = sorted(
+        int(match.group(1))
+        for wname in weights
+        for match in [a_pat.match(wname)]
+        if match
+    )
+    for layer_idx in linear_layer_ids:
+        prefix = f"model.language_model.layers.{layer_idx}.linear_attn"
+        a_name = f"{prefix}.in_proj_a.weight"
+        b_name = f"{prefix}.in_proj_b.weight"
+        if b_name not in weights:
+            raise KeyError(f"Missing matching GDN B projection: {b_name}")
+        merged = np.concatenate([weights[a_name], weights[b_name]], axis=0)
+        if merged.dtype != np.float16:
+            merged = merged.astype(np.float16)
+        save(
+            f"model_language_model_layers_{layer_idx}_linear_attn_in_proj_ab_weight",
+            merged,
+            quantizable=True,
+            raw_name=f"{prefix}.in_proj_ab.weight",
+        )
 
     if lm_head_source is None:
         raise KeyError("No lm_head.weight or embed_tokens.weight found for lm_head export")
@@ -312,32 +426,66 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             gc = g.input(f'gdn_conv{i}', (qkv_total, conv_kernel - 1), prec=Precision.FP16)
             cache_inputs.append(('gdn', gs, gc))
 
+    input_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_language_model_layers_{i}_"
+                "input_layernorm_weight.weights",
+            ),
+            (hidden_size,),
+            Precision.FP32,
+        )
+        for i in range(num_layers)
+    ]
+    post_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_language_model_layers_{i}_"
+                "post_attention_layernorm_weight.weights",
+            ),
+            (hidden_size,),
+            Precision.FP32,
+        )
+        for i in range(num_layers)
+    ]
+    final_norm_weight = g.weight(
+        os.path.join(weights_dir, "final_norm.weights"),
+        (hidden_size,), Precision.FP32)
+
     # ---- build layers ----
     x = hidden
+    x_normed = g.rms_norm(x, input_norm_weights[0], eps=eps)
     for i in range(num_layers):
         lt = layer_types[i]
         ck_in, cv_in = (cache_inputs[i][1], cache_inputs[i][2]) if cache_inputs[i][0] == 'kv' else (None, None)
         gs_in, gc_in = (cache_inputs[i][1], cache_inputs[i][2]) if cache_inputs[i][0] == 'gdn' else (None, None)
 
-        x = _build_layer(g, x, i, weights_dir, cfg, tc,
-                        cos, sin, mask, ck_in, cv_in, gs_in, gc_in,
-                        eps, seq_len, rope_dim, rope_theta,
-                        num_heads, num_kv_heads, head_dim,
-                        linear_num_heads, linear_k_dim, linear_v_dim,
-                        linear_num_v_heads,
-                        conv_kernel, intermediate, hidden_size, lt,
-                        is_prefill=is_prefill)
+        next_norm_weight = (
+            input_norm_weights[i + 1]
+            if i + 1 < num_layers
+            else final_norm_weight
+        )
+        x, x_normed = _build_layer(
+            g, x, x_normed, post_norm_weights[i], next_norm_weight,
+            i, weights_dir, cos, sin, mask,
+            ck_in, cv_in, gs_in, gc_in,
+            eps, seq_len, rope_dim, rope_theta,
+            num_heads, num_kv_heads, head_dim,
+            linear_num_heads, linear_k_dim, linear_v_dim,
+            linear_num_v_heads,
+            conv_kernel, intermediate, hidden_size, lt,
+            is_prefill=is_prefill)
 
-    # ---- final norm ----
-    w_norm = g.weight(os.path.join(weights_dir, "final_norm.weights"),
-                      (hidden_size,), Precision.FP32)
-    x = g.rms_norm(x, w_norm, eps=eps)
+    x = x_normed
 
     print(f"  Total: {len(g._nodes)} nodes")
     return g
 
 
-def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
+def _build_layer(g, x, x_normed, post_norm_weight, next_norm_weight,
+                 layer_idx, weights_dir,
                  cos, sin, mask, ck_in, cv_in, gs_in, gc_in,
                  eps, seq_len, rope_dim, rope_theta,
                  num_heads, num_kv_heads, head_dim,
@@ -348,11 +496,6 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
     """Build one layer (linear_attention or full_attention)."""
 
     pfx_lm = f'model_language_model_layers_{layer_idx}'
-
-    # ---- Input RMSNorm ----
-    w_ln = g.weight(os.path.join(weights_dir, f"{pfx_lm}_input_layernorm_weight.weights"),
-                    (hidden_size,), Precision.FP32)
-    x_normed = g.rms_norm(x, w_ln, eps=eps)
 
     if layer_type == 'linear_attention':
         attn_out = _build_linear_attn_layer(g, x_normed, layer_idx, weights_dir,
@@ -367,31 +510,26 @@ def _build_layer(g, x, layer_idx, weights_dir, cfg, tc,
                                            num_heads, num_kv_heads, head_dim,
                                            hidden_size, is_prefill=is_prefill)
 
-    # ---- Residual ----
-    x = g.add(x, attn_out)
-
-    # ---- Post-attention RMSNorm ----
-    w_ln2 = g.weight(os.path.join(weights_dir, f"{pfx_lm}_post_attention_layernorm_weight.weights"),
-                     (hidden_size,), Precision.FP32)
-    x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
+    # Update the residual stream in place while producing the normalized
+    # activation for the MLP.
+    x_normed2 = g.add_rms_norm(
+        x, attn_out, post_norm_weight, eps=eps)
 
     # ---- MLP (SwiGLU) ----
     mlp_pfx = f'{pfx_lm}_mlp'
-    w_gate = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_gate_proj_weight.weights"),
-                      (intermediate, hidden_size), Precision.FP16)
-    w_up = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_up_proj_weight.weights"),
-                    (intermediate, hidden_size), Precision.FP16)
+    w_gate_up = g.weight(
+        os.path.join(weights_dir, f"{mlp_pfx}_gate_up_proj_weight.weights"),
+        (2 * intermediate, hidden_size), Precision.FP16)
     w_down = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_down_proj_weight.weights"),
                       (hidden_size, intermediate), Precision.FP16)
 
-    gate = g.matmul(x_normed2, w_gate)
-    up = g.matmul(x_normed2, w_up)
-    gate = g.silu(gate)
-    mlp_hidden = g.mul(gate, up)
+    gate_up = g.matmul(x_normed2, w_gate_up)
+    mlp_hidden = g.swiglu(gate_up)
     mlp_out = g.matmul(mlp_hidden, w_down)
-    x = g.add(x, mlp_out)
+    next_x_normed = g.add_rms_norm(
+        x, mlp_out, next_norm_weight, eps=eps)
 
-    return x
+    return x, next_x_normed
 
 
 def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
@@ -411,13 +549,12 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                      (num_heads * k_dim * 2 + num_v_heads * v_dim, hidden_size), Precision.FP16)
     qkv = g.matmul(x, w_qkv)  # shape [qkv_total, seq], data [seq, qkv_total]
 
-    w_a = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_a_weight.weights"),
-                   (num_v_heads, hidden_size), Precision.FP16)
-    a_out = g.matmul(x, w_a)  # shape [num_v_heads, seq], data [seq, num_v_heads]
-
-    w_b = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_b_weight.weights"),
-                   (num_v_heads, hidden_size), Precision.FP16)
-    b_out = g.matmul(x, w_b)  # shape [num_v_heads, seq], data [seq, num_v_heads]
+    w_ab = g.weight(
+        os.path.join(weights_dir, f"{pfx}_in_proj_ab_weight.weights"),
+        (2 * num_v_heads, hidden_size), Precision.FP16)
+    ab_out = g.matmul(x, w_ab)
+    a_out, b_out = g.slice(
+        ab_out, [num_v_heads, num_v_heads], dim=0)
 
     w_z = g.weight(os.path.join(weights_dir, f"{pfx}_in_proj_z_weight.weights"),
                    (num_v_heads * v_dim, hidden_size), Precision.FP16)
@@ -473,11 +610,17 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     _S = SEQ.bind(seq_len) if is_prefill else seq_len
     pfx = f'model_language_model_layers_{layer_idx}_self_attn'
 
-    # ---- q_proj: [4096, 1024] → 8 × (256 query + 256 gate) ----
-    # q_proj output is chunked: first half = query, second half = gate
-    w_q = g.weight(os.path.join(weights_dir, f"{pfx}_q_proj_weight.weights"),
-                   (num_heads * head_dim * 2, hidden_size), Precision.FP16)
-    qg = g.matmul(x, w_q)  # [8 × 512, seq] = [4096, 4], data [4, 4096]
+    # ---- Fused Q/K/V projection -----------------------------------------
+    # q_proj contributes query+gate rows, followed by K and V. A single
+    # projection lets Metal reuse the input activation and removes two GPU
+    # dispatches per full-attention layer.
+    qg_dim = num_heads * head_dim * 2
+    kv_dim = num_kv_heads * head_dim
+    w_qkv = g.weight(
+        os.path.join(weights_dir, f"{pfx}_qkv_proj_weight.weights"),
+        (qg_dim + 2 * kv_dim, hidden_size), Precision.FP16)
+    qkv = g.matmul(x, w_qkv)
+    qg, k, v = g.slice(qkv, [qg_dim, kv_dim, kv_dim], dim=0)
 
     # ---- Split query and gate (matching HF's view+chunk) ----
     # HF: q_proj_out.view(seq, NH, HD*2).chunk(2, dim=-1)
@@ -499,14 +642,6 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     query, gate = g.slice(qg, [head_dim, head_dim], dim=0)         # [256, 8, seq] each
     query = g.reshape(query, (num_heads * head_dim, _S))      # [2048, seq]
     gate = g.reshape(gate, (num_heads * head_dim, _S))        # [2048, seq]
-
-    # ---- k_proj, v_proj ----
-    w_k = g.weight(os.path.join(weights_dir, f"{pfx}_k_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-    w_v = g.weight(os.path.join(weights_dir, f"{pfx}_v_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-    k = g.matmul(x, w_k)
-    v = g.matmul(x, w_v)
 
     # ---- QK norm (RMSNorm per head) ----
     # q_norm/k_norm weight shape: [head_dim]
@@ -599,8 +734,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     # ---- Output gate: attn * sigmoid(gate) ----
     # gate is matmul output (qg_proj second half): [NH*HD, seq], data [seq, NH*HD].
     # gate is already contiguous (from qg split + reshape), skip explicit contiguous.
-    gate_sigmoid = g.sigmoid(gate)
-    attn = g.mul(attn, gate_sigmoid)
+    attn = g.sigmoid_mul(attn, gate)
 
     # ---- o_proj ----
     w_o = g.weight(os.path.join(weights_dir, f"{pfx}_o_proj_weight.weights"),

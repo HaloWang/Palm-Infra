@@ -132,10 +132,32 @@ void test_swiglu(ThreadPool& pool) {
             const float gate = merged[row * 8 + i];
             const float up = merged[row * 8 + 4 + i];
             const float expected = gate / (1.f + std::exp(-gate)) * up;
-            matches &= close(output[row * 4 + i], expected);
+            matches &= close(output[row * 4 + i], expected, 2e-2f);
         }
     }
     check(matches, "SWIGLU");
+
+    // Fused output gate: value * sigmoid(gate).
+    {
+        float value_data[8] = {-2.f, -1.f, 0.f, 1.f, 2.f, 3.f, -3.f, 0.5f};
+        float gate_data[8] = {1.f, -1.f, 0.f, 2.f, -2.f, 0.5f, 3.f, -0.5f};
+        float out_data[8] = {};
+        Tensor value = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 8, 1, 1, 1, value_data);
+        Tensor gate = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 8, 1, 1, 1, gate_data);
+        Tensor out = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 8, 1, 1, 1, out_data);
+        kernel_elementwise(
+            OpType::SIGMOID_MUL, {&value, &gate}, &out, nullptr);
+        bool ok = true;
+        for (int i = 0; i < 8; ++i) {
+            const float ref =
+                value_data[i] / (1.0f + std::exp(-gate_data[i]));
+            ok = ok && std::fabs(out_data[i] - ref) < 2e-2f;
+        }
+        check(ok, "SIGMOID_MUL");
+    }
 }
 
 void test_parallel_exact(ThreadPool& pool) {

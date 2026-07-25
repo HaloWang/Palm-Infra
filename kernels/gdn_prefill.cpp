@@ -39,6 +39,9 @@ void kernel_gdn_prefill_neon(const OpParams& params,
 
     int qkv_dim   = num_heads * k_head_dim;
     int z_dim     = num_v_heads * v_head_dim;
+    int a_row_stride = (int)(inputs[1]->stride[1] / sizeof(float));
+    int b_row_stride = (int)(inputs[2]->stride[1] / sizeof(float));
+    int z_row_stride = (int)(inputs[3]->stride[1] / sizeof(float));
     int state_sz  = k_head_dim * v_head_dim;
     int repeat    = num_v_heads / num_heads;
     int process_len = (n_real > 0 && n_real < seq_len) ? n_real : seq_len;
@@ -79,14 +82,15 @@ void kernel_gdn_prefill_neon(const OpParams& params,
                 gdn_l2norm_neon(q, k_head_dim, l2_eps);
                 gdn_l2norm_neon(k_buf, k_head_dim, l2_eps);
 
-                float a_h = a_data[t * num_v_heads + vh];
-                float b_h = b_data[t * num_v_heads + vh];
+                float a_h = a_data[t * a_row_stride + vh];
+                float b_h = b_data[t * b_row_stride + vh];
                 float sp = gdn_softplusf(a_h + dtb_data[vh]);
                 float g_t = neg_exp_A[vh] * sp;
                 float g_t_exp = std::exp(g_t);
                 float beta_t = gdn_sigmoidf(b_h);
 
-                const float* z_row = z_data + t * z_dim + vh * v_head_dim;
+                const float* z_row =
+                    z_data + t * z_row_stride + vh * v_head_dim;
                 float* out_head = out_data + t * z_dim + vh * v_head_dim;
 
                 gdn_recurrence_neon(q, k_buf, v_buf,
@@ -119,15 +123,16 @@ void kernel_gdn_prefill_neon(const OpParams& params,
                     for (int d = 0; d < v_head_dim; d++)
                         v_buf[d] = qkv_data[(v_base + d) * seq_len + t];
 
-                    float a_h = a_data[t * num_v_heads + vh];
-                    float b_h = b_data[t * num_v_heads + vh];
+                    float a_h = a_data[t * a_row_stride + vh];
+                    float b_h = b_data[t * b_row_stride + vh];
                     float sp = gdn_softplusf(a_h + dtb_data[vh]);
                     float g_t = neg_exp_A[vh] * sp;
                     float g_t_exp = std::exp(g_t);
                     float beta_t = gdn_sigmoidf(b_h);
 
                     float* state_h = state_data + vh * state_sz;
-                    const float* z_row = z_data + t * z_dim + vh * v_head_dim;
+                    const float* z_row =
+                        z_data + t * z_row_stride + vh * v_head_dim;
                     float* out_head = out_data + t * z_dim + vh * v_head_dim;
 
                     gdn_recurrence_neon(q, k_buf, v_buf,

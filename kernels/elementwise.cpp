@@ -391,6 +391,61 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         }
         break;
 
+    case OpType::SIGMOID_MUL:
+        if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
+            const Tensor& value = *inputs[0];
+            const Tensor& gate = *inputs[1];
+            const char* value_base =
+                static_cast<const char*>(value.data);
+            const char* gate_base =
+                static_cast<const char*>(gate.data);
+            float* dst = output->ptr<float>();
+            const int D = (int)value.shape[0];
+            const int rows = (int)(
+                value.shape[1] * value.shape[2] * value.shape[3]);
+            auto process_rows = [&](int, int begin, int end) {
+                for (int row = begin; row < end; ++row) {
+                    int q = row;
+                    const int i1 = q % (int)value.shape[1];
+                    q /= (int)value.shape[1];
+                    const int i2 = q % (int)value.shape[2];
+                    const int i3 = q / (int)value.shape[2];
+                    const float* vp = reinterpret_cast<const float*>(
+                        value_base + i3 * value.stride[3] +
+                        i2 * value.stride[2] + i1 * value.stride[1]);
+                    const float* gp = reinterpret_cast<const float*>(
+                        gate_base + i3 * gate.stride[3] +
+                        i2 * gate.stride[2] + i1 * gate.stride[1]);
+                    float* op = dst + (size_t)row * D;
+                    int i = 0;
+#if HAS_NEON
+                    for (; i + 3 < D; i += 4) {
+                        const float32x4_t gv = vld1q_f32(gp + i);
+                        vst1q_f32(
+                            op + i,
+                            vmulq_f32(
+                                vld1q_f32(vp + i),
+                                sigmoid_f32_neon(gv)));
+                    }
+#endif
+                    for (; i < D; ++i)
+                        op[i] =
+                            vp[i] / (1.0f + std::exp(-gp[i]));
+                }
+            };
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                value.nelements() >= 32768) {
+                const int chunk = std::max(
+                    1, (rows + thread_pool->num_threads() - 1) /
+                           thread_pool->num_threads());
+                thread_pool->parallel_for(
+                    0, rows, chunk, process_rows);
+            } else {
+                process_rows(0, 0, rows);
+            }
+        }
+        break;
+
     case OpType::SILU:
         // SiLU: x * sigmoid(x). Stride-aware — handles SLICE views (gate/up
         // halves of merged gate_up matmul).
@@ -477,26 +532,50 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
         if (inputs.size() >= 1 && inputs[0] && output) {
             const Tensor& m = *inputs[0];
             const char* m_base = static_cast<const char*>(m.data);
-            StrideIter it = compute_stride_iter(m); // it.n_inner = 2I
-            const int I = it.n_inner / 2;
-            float* dst_row = output->ptr<float>();
-            for (int i3 = 0; i3 < it.d3; i3++) {
-                const char* p3 = m_base + i3 * it.s3;
-                for (int i2 = 0; i2 < it.d2; i2++) {
-                    const char* p2 = p3 + i2 * it.s2;
-                    for (int i1 = 0; i1 < it.d1; i1++) {
-                        const float* row =
-                            reinterpret_cast<const float*>(p2 + i1 * it.s1);
-                        const float* gate = row;
-                        const float* up = row + I;
-                        for (int i = 0; i < I; i++) {
-                            float g = gate[i];
-                            float sg = g / (1.f + std::exp(-g)); // silu(g)
-                            dst_row[i] = sg * up[i];
-                        }
-                        dst_row += I;
+            const int I = (int)m.shape[0] / 2;
+            const int rows =
+                (int)(m.shape[1] * m.shape[2] * m.shape[3]);
+            float* dst = output->ptr<float>();
+            auto process_rows = [&](int, int begin, int end) {
+                for (int flat_row = begin; flat_row < end; ++flat_row) {
+                    int q = flat_row;
+                    const int i1 = q % (int)m.shape[1];
+                    q /= (int)m.shape[1];
+                    const int i2 = q % (int)m.shape[2];
+                    const int i3 = q / (int)m.shape[2];
+                    const float* row = reinterpret_cast<const float*>(
+                        m_base + i3 * m.stride[3] + i2 * m.stride[2] +
+                        i1 * m.stride[1]);
+                    const float* gate = row;
+                    const float* up = row + I;
+                    float* out_row = dst + (size_t)flat_row * I;
+                    int i = 0;
+#if HAS_NEON
+                    for (; i + 3 < I; i += 4) {
+                        const float32x4_t g = vld1q_f32(gate + i);
+                        const float32x4_t silu =
+                            vmulq_f32(g, sigmoid_f32_neon(g));
+                        vst1q_f32(
+                            out_row + i,
+                            vmulq_f32(silu, vld1q_f32(up + i)));
+                    }
+#endif
+                    for (; i < I; ++i) {
+                        const float g = gate[i];
+                        out_row[i] =
+                            (g / (1.f + std::exp(-g))) * up[i];
                     }
                 }
+            };
+            if (thread_pool && thread_pool->num_threads() > 1 &&
+                output->nelements() >= 32768) {
+                const int chunk = std::max(
+                    1, (rows + thread_pool->num_threads() - 1) /
+                           thread_pool->num_threads());
+                thread_pool->parallel_for(
+                    0, rows, chunk, process_rows);
+            } else {
+                process_rows(0, 0, rows);
             }
         }
         break;

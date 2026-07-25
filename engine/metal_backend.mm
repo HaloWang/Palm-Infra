@@ -1424,6 +1424,38 @@ void MetalBackend::dispatch(const GraphNode& node,
         break;
     }
 
+    case OpType::ADD_RMS_NORM: {
+        Tensor& residual = *const_cast<Tensor*>(inputs[0]);
+        const Tensor& update = *inputs[1];
+        const Tensor& weight = *inputs[2];
+        Tensor& out = *output;
+        AddRmsNormParams p{};
+        p.dim0 = (int)residual.shape[0];
+        p.rows = (int)(
+            residual.shape[1] * residual.shape[2] * residual.shape[3]);
+        p.residual_offset = eoffset(residual);
+        p.update_offset = eoffset(update);
+        p.out_offset = eoffset(out);
+        p.residual_row_stride = estride(residual, 1);
+        p.update_row_stride = estride(update, 1);
+        p.out_row_stride = estride(out, 1);
+        p.eps = params.f32.size() > 0 ? params.f32[0] : 1e-6f;
+        id<MTLComputePipelineState> ps =
+            impl_->pipeline("add_rms_norm_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&residual) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&update) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&out) offset:0 atIndex:2];
+        [enc setBuffer:buf_of(&weight)
+               offset:weight.device_offset atIndex:4];
+        [enc setBytes:&p length:sizeof(p) atIndex:3];
+        NSUInteger tg = std::min<NSUInteger>(
+            256, ps.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
+            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+        break;
+    }
+
     case OpType::LAYER_NORM: {
         const Tensor& X = *inputs[0];
         const Tensor& W = *inputs[1];
@@ -1506,7 +1538,8 @@ void MetalBackend::dispatch(const GraphNode& node,
     }
 
     case OpType::ADD:
-    case OpType::MUL: {
+    case OpType::MUL:
+    case OpType::SIGMOID_MUL: {
         const Tensor& A = *inputs[0];
         const Tensor& B = *inputs[1];
         Tensor& O = *output;
@@ -1528,8 +1561,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                 ? 0 : estride(B, d);
             p.out_stride[d] = estride(O, d);
         }
-        id<MTLComputePipelineState> ps =
-            impl_->pipeline(op==OpType::ADD ? "add_f32" : "mul_f32");
+        const char* kernel =
+            op == OpType::ADD ? "add_f32" :
+            op == OpType::MUL ? "mul_f32" : "sigmoid_mul_f32";
+        id<MTLComputePipelineState> ps = impl_->pipeline(kernel);
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
         [enc setBuffer:buf_of(&B) offset:0 atIndex:1];
@@ -1776,6 +1811,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.qkv_offset = eoffset(QKV); p.a_offset = eoffset(Aa); p.b_offset = eoffset(Bb);
         p.z_offset = eoffset(Zz); p.Alog_offset = eoffset(ALG); p.dtb_offset = eoffset(DTB);
         p.norm_offset = eoffset(NRM); p.state_offset = eoffset(ST); p.out_offset = eoffset(O);
+        p.a_row_stride = estride(Aa, 1);
+        p.b_row_stride = estride(Bb, 1);
+        p.z_row_stride = estride(Zz, 1);
         const bool prefill =
             op == OpType::GATED_DELTANET_PREFILL;
         const bool row_recurrence =

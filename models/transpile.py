@@ -42,6 +42,7 @@ class OpType(IntEnum):
     MATMUL         = 10
     RMS_NORM       = 20
     LAYER_NORM     = 21
+    ADD_RMS_NORM   = 22
     SILU           = 30
     GELU           = 31
     TANH           = 32
@@ -63,6 +64,7 @@ class OpType(IntEnum):
     SIGMOID_EXACT  = 76
     EXP_EXACT      = 77
     GEMV_SPARSE_A  = 78
+    SIGMOID_MUL    = 79
     QUANTIZE_KV    = 80
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
@@ -244,7 +246,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op == OpType.CONSTANT:
         return _CONST4
 
-    if op in (OpType.RMS_NORM, OpType.LAYER_NORM,
+    if op in (OpType.RMS_NORM, OpType.LAYER_NORM, OpType.ADD_RMS_NORM,
               OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT,
               OpType.EXP, OpType.EXP_EXACT, OpType.SOFTPLUS,
               OpType.SWIGLU,
@@ -257,7 +259,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op in (OpType.ADD, OpType.MUL):
+    if op in (OpType.ADD, OpType.MUL, OpType.SIGMOID_MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
     if op in (OpType.MATMUL, OpType.GEMV_SPARSE_A):
@@ -454,6 +456,20 @@ class GraphBuilder:
         return self._add(OpType.RMS_NORM, [x, weight], sx,
                          prec=self._nodes[x].out_prec, f32=[eps])
 
+    def add_rms_norm(self, residual: int, update: int, weight: int,
+                     eps: float = 1e-6) -> int:
+        """In-place residual add plus RMSNorm.
+
+        The residual node remains the live residual-stream value; this op
+        updates its storage before producing the normalized output.
+        """
+        sr = self._nodes[residual].out_shape
+        su = self._nodes[update].out_shape
+        assert sr == su, f"add_rms_norm shape mismatch: {sr} vs {su}"
+        return self._add(
+            OpType.ADD_RMS_NORM, [residual, update, weight], sr,
+            prec=self._nodes[residual].out_prec, f32=[eps])
+
     def layer_norm(self, x: int, weight: int, bias: int,
                    eps: float = 1e-5) -> int:
         return self._add(OpType.LAYER_NORM, [x, weight, bias],
@@ -506,6 +522,15 @@ class GraphBuilder:
         out = tuple([sx[0] // 2] + sx[1:])
         return self._add(OpType.SWIGLU, [merged], out,
                          prec=self._nodes[merged].out_prec)
+
+    def sigmoid_mul(self, value: int, gate: int) -> int:
+        """Fused value * sigmoid(gate) with matching tensor shapes."""
+        sv = self._nodes[value].out_shape
+        sg = self._nodes[gate].out_shape
+        assert sv == sg, f"sigmoid_mul shape mismatch: {sv} vs {sg}"
+        return self._add(
+            OpType.SIGMOID_MUL, [value, gate], sv,
+            prec=self._nodes[value].out_prec)
 
     # ---- position encoding ----
 

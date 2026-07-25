@@ -14,6 +14,18 @@ struct TensorDesc {
     uint  offset;      // element offset into the bound buffer
 };
 
+struct AddRmsNormParams {
+    int   dim0;
+    int   rows;
+    uint  residual_offset;
+    uint  update_offset;
+    uint  out_offset;
+    int   residual_row_stride;
+    int   update_row_stride;
+    int   out_row_stride;
+    float eps;
+};
+
 // CONCAT along dim 0: copy one source's dim-0 slab into a dense output.
 // Source may be strided (view); output is dense over shape [out_shape0, s1, s2]
 // (shape[3]==1, the MLA case). Dispatched once per concat input.
@@ -291,6 +303,9 @@ struct GdnParams {
     uint  norm_offset;
     uint  state_offset;
     uint  out_offset;
+    int   a_row_stride;
+    int   b_row_stride;
+    int   z_row_stride;
 };
 
 // Depth-wise causal conv1d + silu (ShortConv). One thread per group.

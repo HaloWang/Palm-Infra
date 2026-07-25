@@ -213,6 +213,40 @@ int main() {
         delete[] x_buf; delete[] w_data; delete[] o_buf;
     }
 
+    // ---- fused residual add + RMSNorm -------------------------------------
+    {
+        const int D = 64, N = 3;
+        float residual_data[D * N], update_data[D * N], weight_data[D];
+        float expected_residual[D * N], expected_out[D * N], out_data[D * N];
+        fill_rand(residual_data, D * N);
+        fill_rand(update_data, D * N);
+        fill_rand(weight_data, D);
+        for (int i = 0; i < D * N; ++i)
+            expected_residual[i] = residual_data[i] + update_data[i];
+        ref_rms_norm(
+            expected_residual, weight_data, expected_out, D, N, 1e-6f);
+
+        Tensor residual = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, D, N, 1, 1,
+            residual_data);
+        Tensor update = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, D, N, 1, 1,
+            update_data);
+        Tensor weight = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, D, 1, 1, 1,
+            weight_data);
+        Tensor out = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, D, N, 1, 1,
+            out_data);
+        kernel_add_rms_norm(residual, update, weight, 1e-6f, out);
+
+        CHECK(check_approx(
+                  residual_data, expected_residual, D * N, 1e-6f),
+              "ADD_RMS_NORM updates residual");
+        CHECK(check_approx(out_data, expected_out, D * N, 1e-5f),
+              "ADD_RMS_NORM output");
+    }
+
     if (failures == 0) {
         printf("\nAll norm tests passed!\n");
     } else {
