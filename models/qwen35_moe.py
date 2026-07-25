@@ -25,7 +25,10 @@ from transpile import (
     write_quantized_weight_file_cpp,
 )
 from model_metadata import infer_hf_model_name
-from qwen35 import _build_full_attn_layer, _build_linear_attn_layer
+from qwen35 import (
+    _build_full_attn_layer, _build_linear_attn_layer,
+    _query_then_gate_rows,
+)
 
 
 def _as_fp32(dtype_str: str, arr: np.ndarray) -> np.ndarray:
@@ -217,6 +220,7 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int
     tc = cfg["text_config"]
     wanted = _required_weight_names(tc, num_layers)
     quant_counts = {"w4": 0, "w8": 0}
+    fused_projection_parts: dict[str, np.ndarray] = {}
 
     def save(name: str, data: np.ndarray,
              quantizable: bool = False,
@@ -243,6 +247,16 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int
         _write_weight_file(wpath, data)
 
     for wname, dtype_str, wdata in _selected_safetensors(model_dir, wanted):
+        if (".linear_attn.in_proj_qkv.weight" in wname
+                or ".linear_attn.in_proj_a.weight" in wname
+                or ".linear_attn.in_proj_b.weight" in wname
+                or ".linear_attn.in_proj_z.weight" in wname
+                or ".self_attn.q_proj.weight" in wname
+                or ".self_attn.k_proj.weight" in wname
+                or ".self_attn.v_proj.weight" in wname):
+            fused_projection_parts[wname] = _as_fp16(dtype_str, wdata)
+            continue
+
         if wname == "lm_head.weight":
             save("lm_head", _as_fp16(dtype_str, wdata),
                  quantizable=True, raw_name=wname)
@@ -287,6 +301,68 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int
 
         save(wname.replace(".", "_"), d,
              quantizable=quantizable, raw_name=wname)
+
+    for layer_idx in range(num_layers):
+        pfx = f"model.language_model.layers.{layer_idx}"
+        if tc["layer_types"][layer_idx] == "linear_attention":
+            lp = f"{pfx}.linear_attn"
+            names = [
+                f"{lp}.in_proj_qkv.weight",
+                f"{lp}.in_proj_a.weight",
+                f"{lp}.in_proj_b.weight",
+                f"{lp}.in_proj_z.weight",
+            ]
+            missing = [name for name in names
+                       if name not in fused_projection_parts]
+            if missing:
+                raise KeyError(
+                    "Missing linear-attention projection(s): "
+                    + ", ".join(missing)
+                )
+            merged = np.concatenate(
+                [fused_projection_parts.pop(name) for name in names], axis=0)
+            save(
+                f"model_language_model_layers_{layer_idx}_"
+                "linear_attn_in_proj_weight",
+                merged,
+                quantizable=True,
+                raw_name=f"{lp}.in_proj_qkvabz.weight",
+            )
+        else:
+            ap = f"{pfx}.self_attn"
+            names = [
+                f"{ap}.q_proj.weight",
+                f"{ap}.k_proj.weight",
+                f"{ap}.v_proj.weight",
+            ]
+            missing = [name for name in names
+                       if name not in fused_projection_parts]
+            if missing:
+                raise KeyError(
+                    "Missing full-attention projection(s): "
+                    + ", ".join(missing)
+                )
+            q_weight = _query_then_gate_rows(
+                fused_projection_parts.pop(names[0]),
+                tc["num_attention_heads"], tc["head_dim"])
+            merged = np.concatenate(
+                [q_weight,
+                 fused_projection_parts.pop(names[1]),
+                 fused_projection_parts.pop(names[2])],
+                axis=0)
+            save(
+                f"model_language_model_layers_{layer_idx}_"
+                "self_attn_qkv_proj_weight",
+                merged,
+                quantizable=True,
+                raw_name=f"{ap}.qkv_proj.weight",
+            )
+
+    if fused_projection_parts:
+        raise AssertionError(
+            "Unconsumed fused projection tensors: "
+            + ", ".join(sorted(fused_projection_parts))
+        )
 
     if quant != "fp16":
         print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
@@ -412,7 +488,8 @@ def _build_layer(g, x, layer_idx, weights_dir, tc,
                                              gs_in, gc_in, eps, seq_len,
                                              linear_num_heads, linear_k_dim,
                                              linear_v_dim, linear_num_v_heads,
-                                             conv_kernel, hidden_size)
+                                             conv_kernel, hidden_size,
+                                             is_prefill=is_prefill)
     else:
         attn_out = _build_full_attn_layer(g, x_normed, layer_idx, weights_dir,
                                            cos, sin, mask, ck_in, cv_in,

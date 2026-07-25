@@ -46,13 +46,20 @@ void reference_shortconv(const std::vector<float>& input,
 }
 
 void run_case(int groups, int seq_len, int kernel_size, int n_real,
-              ThreadPool* thread_pool, const char* label) {
+              ThreadPool* thread_pool, const char* label,
+              int input_row_padding = 0) {
     std::vector<float> input(groups * seq_len);
+    const int input_row_stride = groups + input_row_padding;
+    std::vector<float> input_storage(input_row_stride * seq_len, 123.f);
     std::vector<float> weights(groups * kernel_size);
     std::vector<float> state(groups * (kernel_size - 1));
     for (size_t i = 0; i < input.size(); ++i)
         input[i] =
             static_cast<float>(static_cast<int>((i * 7) % 19) - 9) * 0.03f;
+    for (int token = 0; token < seq_len; ++token)
+        for (int group = 0; group < groups; ++group)
+            input_storage[token * input_row_stride + group] =
+                input[token * groups + group];
     for (size_t i = 0; i < weights.size(); ++i)
         weights[i] =
             static_cast<float>(static_cast<int>((i * 5) % 13) - 6) * 0.02f;
@@ -66,8 +73,10 @@ void run_case(int groups, int seq_len, int kernel_size, int n_real,
                         seq_len, kernel_size, n_real);
 
     std::vector<float> output(groups * seq_len, -1.f);
-    Tensor input_tensor = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
-                                         groups, seq_len, 1, 1, input.data());
+    Tensor input_parent =
+        Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                       input_row_stride, seq_len, 1, 1, input_storage.data());
+    Tensor input_tensor = input_parent.view_2d(groups, seq_len);
     Tensor weight_tensor =
         Tensor::create(Precision::FP32, MemoryType::EXTERNAL, kernel_size,
                        groups, 1, 1, weights.data());
@@ -96,6 +105,7 @@ int main() {
     ThreadPool pool(4);
     run_case(8, 1, 4, 1, &pool, "decode k=4");
     run_case(7, 5, 4, 3, &pool, "padded prefill k=4");
+    run_case(7, 5, 4, 3, &pool, "strided prefill input", 5);
     run_case(5, 4, 3, 4, &pool, "generic kernel size");
 
     if (failures == 0)

@@ -18,6 +18,7 @@ void kernel_shortconv(const OpParams& params,
     const int kernel_size = graph_params::get_i32(params, 0, 4);
     const int groups = static_cast<int>(x.shape[0]);
     const int seq_len = static_cast<int>(x.shape[1]);
+    const size_t x_row_stride = x.stride[1] / sizeof(float);
 
     const float* x_data = x.ptr<float>();
     const float* weight_data = weight.ptr<float>();
@@ -55,7 +56,7 @@ void kernel_shortconv(const OpParams& params,
     // Transpose [seq, groups] into group-major staging storage while reading
     // the input sequentially.
     for (int token = 0; token < seq_len; ++token) {
-        const float* input_row = x_data + token * groups;
+        const float* input_row = x_data + token * x_row_stride;
         float* staged_row = staged.data() + prefix_len + token;
         for (int group = 0; group < groups; ++group)
             staged_row[group * total_len] = input_row[group];

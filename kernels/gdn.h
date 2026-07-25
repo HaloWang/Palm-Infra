@@ -72,3 +72,11 @@ void kernel_gdn_decode(const OpParams& params,
                        const std::vector<const Tensor*>& inputs,
                        std::vector<Tensor*>& outputs,
                        ThreadPool* thread_pool = nullptr);
+
+// Decode-only composition used by the CPU backend. Metal implements the same
+// contract as a single kernel to avoid materializing the post-convolution QKV.
+// Inputs append conv_weight and conv_state to the regular eight GDN inputs.
+void kernel_gdn_conv_decode(const OpParams& params,
+                            const std::vector<const Tensor*>& inputs,
+                            std::vector<Tensor*>& outputs,
+                            ThreadPool* thread_pool = nullptr);

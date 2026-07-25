@@ -445,15 +445,23 @@ int main() {
     // ---- SHORTCONV: depth-wise causal conv1d + silu (ksize=4) ----
     // Reference (mirrors execute.cpp): window = [state(3) | x(seq)]; per group g,
     // out[g,i] = silu(Σ_{k} win[i+k]*w[g,k]); state' = last 3 real x values.
-    auto run_shortconv = [&](int groups, int seq, const char* label) {
+    auto run_shortconv = [&](int groups, int seq, const char* label,
+                             int input_row_padding = 0) {
         const int ks = 4, pre = ks - 1;
-        Tensor X = make_dev(mb, Precision::FP32, groups, seq);   // data [seq, groups]
+        const int input_row_stride = groups + input_row_padding;
+        Tensor Xparent =
+            make_dev(mb, Precision::FP32, input_row_stride, seq);
+        Tensor X = Xparent.view_2d(groups, seq);
         Tensor W = make_dev(mb, Precision::FP32, groups, ks);
         Tensor ST = make_dev(mb, Precision::FP32, groups, pre);  // persistent state
         Tensor O = make_dev(mb, Precision::FP32, groups, seq);
-        std::vector<float> x(groups*seq), w(groups*ks), st(groups*pre);
+        std::vector<float> x(groups*seq), xp(input_row_stride*seq, 123.f);
+        std::vector<float> w(groups*ks), st(groups*pre);
         fill_rand(x.data(), x.size()); fill_rand(w.data(), w.size()); fill_rand(st.data(), st.size());
-        memcpy(X.data, x.data(), x.size()*4);
+        for (int s=0;s<seq;s++)
+            memcpy(xp.data() + s*input_row_stride, x.data() + s*groups,
+                   groups*sizeof(float));
+        memcpy(Xparent.data, xp.data(), xp.size()*sizeof(float));
         memcpy(W.data, w.data(), w.size()*4);
         memcpy(ST.data, st.data(), st.size()*4);
         std::vector<int> i32 = {ks, seq};   // kernel_size, n_real
@@ -476,6 +484,7 @@ int main() {
     };
     run_shortconv(64, 1, "SHORTCONV decode groups=64 seq=1");
     run_shortconv(48, 8, "SHORTCONV prefill groups=48 seq=8");
+    run_shortconv(48, 8, "SHORTCONV strided prefill input", 7);
     run_shortconv(6144, 4, "SHORTCONV groups=6144 seq=4 (prod width)");
 
     // ---- GATED_DELTANET_DECODE (seq=1): GDN recurrence + RMSNormGated ----
@@ -532,6 +541,76 @@ int main() {
         bool ok_out = close((const float*)O.data, ref.data(), zdim, 3e-3f, 3e-3f);
         bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 3e-3f, 3e-3f);
         CHECK(ok_out && ok_st, "GDN_DECODE H=4 K=128 V=128");
+    }
+
+    // ---- Decode ShortConv + GDN fusion: compare against the two-op path ----
+    // Cover both Qwen3.5 head layouts: one and two value heads per key head.
+    for (int repeat : {1, 2}) {
+        const int H = 2, VH = H*repeat, K = 128, Vd = 128, ks = 4;
+        const int qkv_dim = H*K;
+        const int qkv_total = 2*qkv_dim + VH*Vd;
+        const int zdim = VH*Vd;
+        const float scale = 1.0f/std::sqrt((float)K);
+
+        Tensor QKV = make_dev(mb, Precision::FP32, qkv_total, 1);
+        Tensor CW = make_dev(mb, Precision::FP32, qkv_total, ks);
+        Tensor CSref = make_dev(mb, Precision::FP32, qkv_total, ks-1);
+        Tensor CSfused = make_dev(mb, Precision::FP32, qkv_total, ks-1);
+        Tensor QKVC = make_dev(mb, Precision::FP32, qkv_total, 1);
+        Tensor A = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor B = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor Z = make_dev(mb, Precision::FP32, zdim, 1);
+        Tensor ALG = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor DTB = make_dev(mb, Precision::FP32, VH, 1);
+        Tensor NRM = make_dev(mb, Precision::FP32, Vd, 1);
+        Tensor STref = make_dev(mb, Precision::FP32, VH*K*Vd, 1);
+        Tensor STfused = make_dev(mb, Precision::FP32, VH*K*Vd, 1);
+        Tensor Oref = make_dev(mb, Precision::FP32, zdim, 1);
+        Tensor Ofused = make_dev(mb, Precision::FP32, zdim, 1);
+
+        std::vector<float> qkv(qkv_total), cw((size_t)qkv_total*ks);
+        std::vector<float> cs((size_t)qkv_total*(ks-1));
+        std::vector<float> a(VH), b(VH), z(zdim), alg(VH), dtb(VH),
+                           nrm(Vd), st((size_t)VH*K*Vd);
+        fill_rand(qkv.data(), qkv.size()); fill_rand(cw.data(), cw.size());
+        fill_rand(cs.data(), cs.size()); fill_rand(a.data(), a.size());
+        fill_rand(b.data(), b.size()); fill_rand(z.data(), z.size());
+        fill_rand(alg.data(), alg.size()); fill_rand(dtb.data(), dtb.size());
+        fill_rand(nrm.data(), nrm.size()); fill_rand(st.data(), st.size());
+        memcpy(QKV.data,qkv.data(),qkv.size()*4);
+        memcpy(CW.data,cw.data(),cw.size()*4);
+        memcpy(CSref.data,cs.data(),cs.size()*4);
+        memcpy(CSfused.data,cs.data(),cs.size()*4);
+        memcpy(A.data,a.data(),a.size()*4); memcpy(B.data,b.data(),b.size()*4);
+        memcpy(Z.data,z.data(),z.size()*4); memcpy(ALG.data,alg.data(),alg.size()*4);
+        memcpy(DTB.data,dtb.data(),dtb.size()*4); memcpy(NRM.data,nrm.data(),nrm.size()*4);
+        memcpy(STref.data,st.data(),st.size()*4);
+        memcpy(STfused.data,st.data(),st.size()*4);
+
+        metal_op(mb, OpType::SHORTCONV, {&QKV,&CW,&CSref}, QKVC,
+                 {ks, 1});
+        std::vector<int> i32 = {H, K, Vd, 1, 1, ks, 0, VH};
+        std::vector<float> f32 = {1e-6f, 1e-6f, scale};
+        metal_op(mb, OpType::GATED_DELTANET_DECODE,
+                 {&QKVC,&A,&B,&Z,&ALG,&DTB,&NRM,&STref},
+                 Oref, i32, f32);
+        metal_op(mb, OpType::GATED_DELTANET_CONV_DECODE,
+                 {&QKV,&A,&B,&Z,&ALG,&DTB,&NRM,&STfused,&CW,&CSfused},
+                 Ofused, i32, f32);
+
+        char label[96];
+        snprintf(label, sizeof(label),
+                 "GDN_CONV_DECODE repeat=%d output/state parity", repeat);
+        const bool ok_out =
+            close((const float*)Ofused.data, (const float*)Oref.data,
+                  zdim, 4e-3f, 4e-3f);
+        const bool ok_gdn =
+            close((const float*)STfused.data, (const float*)STref.data,
+                  (int)st.size(), 4e-3f, 4e-3f);
+        const bool ok_conv =
+            close((const float*)CSfused.data, (const float*)CSref.data,
+                  (int)cs.size(), 1e-6f, 1e-6f);
+        CHECK(ok_out && ok_gdn && ok_conv, label);
     }
 
     // ---- GATED_DELTANET_PREFILL (seq>1): recurrence over tokens ----
@@ -666,6 +745,53 @@ int main() {
             for(int i=0;i<D;i++) ref[r*D+i]=(float)(x[r*D+i]*inv*w[i]);
         }
         CHECK(close((const float*)O.data, ref.data(), D*rows, 1e-4f, 1e-3f), "RMS_NORM D=128 rows=8");
+    }
+
+    // ---- RMS_NORM_ROPE: strided Q/K view -> dense [D,S,H] ----
+    {
+        const int D=256, S=5, H=3, rows=S*H, rope=64, pad=7;
+        Tensor XP = make_dev(mb, Precision::FP32, D+pad, rows);
+        Tensor X = XP.view_2d(D, rows);
+        Tensor W = make_dev(mb, Precision::FP32, D, 1);
+        Tensor COS = make_dev(mb, Precision::FP32, rope/2, S);
+        Tensor SIN = make_dev(mb, Precision::FP32, rope/2, S);
+        Tensor O = make_dev3(mb, Precision::FP32, D, S, H);
+        std::vector<float> xp((size_t)(D+pad)*rows, 123.f);
+        std::vector<float> x((size_t)D*rows), w(D);
+        std::vector<float> cs((size_t)(rope/2)*S);
+        std::vector<float> sn((size_t)(rope/2)*S);
+        fill_rand(x.data(),x.size()); fill_rand(w.data(),w.size());
+        fill_rand(cs.data(),cs.size()); fill_rand(sn.data(),sn.size());
+        for(int r=0;r<rows;r++)
+            memcpy(xp.data()+(size_t)r*(D+pad),
+                   x.data()+(size_t)r*D, (size_t)D*4);
+        memcpy(XP.data,xp.data(),xp.size()*4);
+        memcpy(W.data,w.data(),w.size()*4);
+        memcpy(COS.data,cs.data(),cs.size()*4);
+        memcpy(SIN.data,sn.data(),sn.size()*4);
+        metal_op(mb, OpType::RMS_NORM_ROPE, {&X,&W,&COS,&SIN}, O,
+                 {rope,0}, {1e-6f});
+
+        std::vector<float> ref((size_t)D*rows);
+        for(int r=0;r<rows;r++){
+            double ss=0;
+            for(int d=0;d<D;d++)
+                ss+=(double)x[(size_t)r*D+d]*x[(size_t)r*D+d];
+            float scale=1.f/std::sqrt((float)(ss/D)+1e-6f);
+            int pos=r%S;
+            for(int i=0;i<rope/2;i++){
+                float x0=x[(size_t)r*D+i]*scale*w[i];
+                float x1=x[(size_t)r*D+i+rope/2]*scale*w[i+rope/2];
+                float c=cs[(size_t)pos*(rope/2)+i];
+                float s=sn[(size_t)pos*(rope/2)+i];
+                ref[(size_t)r*D+i]=x0*c-x1*s;
+                ref[(size_t)r*D+i+rope/2]=x1*c+x0*s;
+            }
+            for(int d=rope;d<D;d++)
+                ref[(size_t)r*D+d]=x[(size_t)r*D+d]*scale*w[d];
+        }
+        CHECK(close((const float*)O.data,ref.data(),D*rows,4e-4f,4e-4f),
+              "RMS_NORM_ROPE strided D=256 S=5 H=3");
     }
 
     // ---- ADD_RMS_NORM: update residual in place + normalized output -------
@@ -1152,6 +1278,14 @@ int main() {
         run_sdpa_cfg(S, past, 128, 128, 8, 2, 512, label);
     };
     run_sdpa128(1, 7, "SDPA decode hd=128 S=1 past=7");
+    run_sdpa_cfg(1, 7, 256, 256, 8, 2, 512,
+                 "SDPA decode hd=256 S=1 past=7");
+    run_sdpa_cfg(1, 255, 256, 256, 8, 2, 512,
+                 "SDPA decode hd=256 S=1 past=255");
+    run_sdpa_cfg(1, 511, 256, 256, 8, 2, 1024,
+                 "SDPA decode hd=256 S=1 past=511", 3e-3f);
+    run_sdpa_cfg(1, 1023, 256, 256, 8, 2, 1024,
+                 "SDPA decode hd=256 S=1 past=1023", 3e-3f);
     run_sdpa128(16, 0, "SDPA prefill hd=128 S=16 past=0");
     run_sdpa128(128, 0, "SDPA prefill hd=128 S=128 past=0");
     run_sdpa128(256, 0, "SDPA prefill hd=128 S=256 past=0");

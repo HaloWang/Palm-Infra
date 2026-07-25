@@ -307,7 +307,8 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
 // run_lmhead
 // ---------------------------------------------------------------------------
 
-int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
+int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
+                          bool finish_metal_graph) {
     if (!lm_head_weight_ || !lm_head_weight_->data)
         return 0;
 
@@ -340,8 +341,17 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens) {
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
 #ifdef MOLLM_METAL
-    if (metal_backend_ && lm_head_weight_->prec == Precision::FP16 &&
-        lm_head_weight_->device_data) {
+    if (finish_metal_graph) {
+        assert(metal_backend_ && hidden.device_data &&
+               lm_head_weight_->device_data);
+        as_metal(metal_backend_)
+            ->lm_head_gemv_device_and_end_graph(
+                hidden, (size_t)last_pos*(size_t)hidden_dim,
+                *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
+    } else if (metal_backend_ && lm_head_weight_->device_data &&
+        (lm_head_weight_->prec == Precision::FP16 ||
+         lm_head_weight_->prec == Precision::INT8 ||
+         lm_head_weight_->prec == Precision::INT4)) {
         as_metal(metal_backend_)
             ->lm_head_gemv(A.ptr<float>(), *lm_head_weight_, C.ptr<float>(),
                            vocab_size, hidden_dim);
@@ -398,8 +408,10 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
                            1, 1, logits.data() + p * vocab_size);
 
 #ifdef MOLLM_METAL
-        if (metal_backend_ && lm_head_weight_->prec == Precision::FP16 &&
-            lm_head_weight_->device_data) {
+        if (metal_backend_ && lm_head_weight_->device_data &&
+            (lm_head_weight_->prec == Precision::FP16 ||
+             lm_head_weight_->prec == Precision::INT8 ||
+             lm_head_weight_->prec == Precision::INT4)) {
             as_metal(metal_backend_)
                 ->lm_head_gemv(A.ptr<float>(), *lm_head_weight_, C.ptr<float>(),
                                vocab_size, hidden_dim);
@@ -457,7 +469,8 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos, Tensor& cos,
 
 Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
                             const Tensor& hidden, const Tensor& mask,
-                            const Tensor& cos, const Tensor& sin) {
+                            const Tensor& cos, const Tensor& sin,
+                            bool defer_metal_end) {
     if (moe_ssd_cache_)
         moe_ssd_cache_->begin_forward_pass();
     auto& tensors = graph.runtime.tensors;
@@ -511,7 +524,8 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
     execute_graph(exec_ctx);
 #ifdef MOLLM_METAL
     if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
-        metal_backend_->end_graph();
+        if (!defer_metal_end)
+            metal_backend_->end_graph();
 #endif
 
     if (!graph.graph_outputs.empty()) {
@@ -885,8 +899,19 @@ int LLMEngine::decode(int token_id) {
 
     Tensor mask = build_causal_mask(1, past_len_);
 
+    bool defer_metal_lmhead = false;
+#ifdef MOLLM_METAL
+    defer_metal_lmhead =
+        metal_backend_ && exec_ctx_decode_.backend == metal_backend_.get() &&
+        lm_head_weight_ && lm_head_weight_->device_data &&
+        (lm_head_weight_->prec == Precision::FP16 ||
+         lm_head_weight_->prec == Precision::INT8 ||
+         lm_head_weight_->prec == Precision::INT4);
+#endif
+
     mollm_set_matmul_profile_phase("decode_graph");
-    Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
+    Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
+                           defer_metal_lmhead);
 
     past_len_++;
 
@@ -899,7 +924,7 @@ int LLMEngine::decode(int token_id) {
     }
 
     mollm_set_matmul_profile_phase("decode_lmhead");
-    int token = run_lmhead(out);
+    int token = run_lmhead(out, 1, defer_metal_lmhead);
     mollm_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);

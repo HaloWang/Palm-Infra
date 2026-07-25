@@ -47,6 +47,13 @@ void prepare_execution(ExecContext& ctx) {
     auto& nodes = ctx.graph->nodes;
     const size_t N = nodes.size();
     ctx.release_queue.assign(N, {});
+    ctx.resolved_inputs.assign(N, {});
+    for (size_t i = 0; i < N; ++i) {
+        auto& resolved = ctx.resolved_inputs[i];
+        resolved.reserve(nodes[i].inputs.size());
+        for (uint32_t input_id : nodes[i].inputs)
+            resolved.push_back(&ctx.graph->runtime.tensors[input_id]);
+    }
     reset_profile_stats(ctx);
 
     // Stateful/cache-mutating graphs need a stronger storage dependency model:
@@ -58,7 +65,9 @@ void prepare_execution(ExecContext& ctx) {
         if (node.op_type == OpType::SDPA || node.op_type == OpType::SDPA_MLA ||
             node.op_type == OpType::GATED_DELTANET_PREFILL ||
             node.op_type == OpType::GATED_DELTANET_DECODE ||
+            node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||
             node.op_type == OpType::SHORTCONV ||
+            node.op_type == OpType::RMS_NORM_ROPE ||
             node.op_type == OpType::ADD_RMS_NORM) {
             return;
         }
@@ -366,10 +375,57 @@ void execute_graph(ExecContext& ctx) {
 
         // collect inputs before allocation so zero-copy views can avoid
         // acquiring a buffer they will immediately overwrite with borrowed data.
-        std::vector<const Tensor*> inputs;
-        inputs.reserve(node.inputs.size());
-        for (uint32_t inp_id : node.inputs) {
-            inputs.push_back(&tensors[inp_id]);
+        const std::vector<const Tensor*>& inputs = ctx.resolved_inputs[i];
+
+        // Static device graphs rebuild hundreds of zero-copy projection views
+        // on every decode token. Handle the metadata-only cases directly in
+        // the executor instead of crossing the virtual backend boundary. A
+        // non-contiguous RESHAPE still goes through the backend because it
+        // needs a materialization kernel.
+        bool inline_zero_copy_view = false;
+        if (device_resident && !has_dynamic && inputs.size() == 1 &&
+            inputs[0]) {
+            const Tensor& src = *inputs[0];
+            if (node.op_type == OpType::RESHAPE && src.is_contiguous()) {
+                const int64_t shape[4] = {
+                    out.shape[0], out.shape[1], out.shape[2], out.shape[3]
+                };
+                out = src;
+                for (int d = 0; d < 4; ++d) out.shape[d] = shape[d];
+                out.compute_strides();
+                out.device_data = src.device_data;
+                out.device_offset = src.device_offset;
+                inline_zero_copy_view = true;
+            } else if (node.op_type == OpType::PERMUTE) {
+                const int axis[4] = {
+                    graph_params::get_i32(node.params, 0, 0),
+                    graph_params::get_i32(node.params, 1, 1),
+                    graph_params::get_i32(node.params, 2, 2),
+                    graph_params::get_i32(node.params, 3, 3),
+                };
+                Tensor view = src;
+                for (int d = 0; d < 4; ++d) {
+                    view.shape[axis[d]] = src.shape[d];
+                    view.stride[axis[d]] = src.stride[d];
+                }
+                out = view;
+                out.device_data = src.device_data;
+                out.device_offset = src.device_offset;
+                inline_zero_copy_view = true;
+            } else if (node.op_type == OpType::SLICE) {
+                const int dim =
+                    graph_params::get_i32(node.params, 0, 0);
+                const int offset =
+                    graph_params::get_i32(node.params, 1, 0);
+                const int size = graph_params::get_i32(
+                    node.params, 2, (int)src.shape[dim]);
+                out = src;
+                out.device_data = src.device_data;
+                out.device_offset =
+                    src.device_offset + (size_t)offset * src.stride[dim];
+                out.shape[dim] = size;
+                inline_zero_copy_view = true;
+            }
         }
 
         // allocate output if needed
@@ -437,7 +493,8 @@ void execute_graph(ExecContext& ctx) {
         // (matmul, attention, MoE, norm, ...) without recording allocator and
         // liveness bookkeeping as fake compute work.
         const uint64_t trace_start = mollm_trace::now_ns();
-        ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+        if (!inline_zero_copy_view)
+            ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
         if (trace_start != 0) {
             const std::string args =
                 "{\"graph\":\"" + std::string(ctx.trace_label ? ctx.trace_label : "graph") +

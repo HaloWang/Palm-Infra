@@ -61,6 +61,9 @@ struct ExecContext {
 
     // liveness: release_queue[i] = nodes that can be freed after node i
     std::vector<std::vector<uint32_t>> release_queue;
+    // Node input Tensor addresses are stable after graph_load(). Resolve them
+    // once instead of allocating a temporary vector for every node/token.
+    std::vector<std::vector<const Tensor*>> resolved_inputs;
     std::vector<NodeProfileStat> profile_stats;
 };
 

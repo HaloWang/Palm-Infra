@@ -43,6 +43,7 @@ class OpType(IntEnum):
     RMS_NORM       = 20
     LAYER_NORM     = 21
     ADD_RMS_NORM   = 22
+    RMS_NORM_ROPE  = 23
     SILU           = 30
     GELU           = 31
     TANH           = 32
@@ -69,6 +70,7 @@ class OpType(IntEnum):
     DEQUANTIZE_KV  = 81
     GATED_DELTANET_DECODE  = 110
     GATED_DELTANET_PREFILL = 111
+    GATED_DELTANET_CONV_DECODE = 112
     MOE            = 120
     SHORTCONV      = 140
     RWKV7          = 150
@@ -259,6 +261,9 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.MOE):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
+    if op == OpType.RMS_NORM_ROPE:
+        return node.dim_expr
+
     if op in (OpType.ADD, OpType.MUL, OpType.SIGMOID_MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
@@ -293,7 +298,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op == OpType.GATED_DELTANET_PREFILL:
         return (_CONST, DimExpr.seq(), _CONST, _CONST)
 
-    if op == OpType.GATED_DELTANET_DECODE:
+    if op in (OpType.GATED_DELTANET_DECODE,
+              OpType.GATED_DELTANET_CONV_DECODE):
         return _CONST4
 
     # Default: don't propagate (conservative).
@@ -469,6 +475,23 @@ class GraphBuilder:
         return self._add(
             OpType.ADD_RMS_NORM, [residual, update, weight], sr,
             prec=self._nodes[residual].out_prec, f32=[eps])
+
+    def rms_norm_rope(self, x: int, weight: int, cos: int, sin: int,
+                      seq_len, heads: int, rope_dim: int = 64,
+                      interleave: bool = True, eps: float = 1e-6) -> int:
+        """Fuse per-head RMSNorm, dense materialization, and RoPE."""
+        dim = self._nodes[x].out_shape[0]
+        dynamic_seq = isinstance(seq_len, _SeqSymbol)
+        seq_static = seq_len.build_value if dynamic_seq else seq_len
+        nid = self._add(
+            OpType.RMS_NORM_ROPE, [x, weight, cos, sin],
+            (dim, seq_static, heads), prec=self._nodes[x].out_prec,
+            i32=[rope_dim, 1 if interleave else 0], f32=[eps])
+        if dynamic_seq:
+            self._nodes[nid].dim_expr = (
+                DimExpr.const(), DimExpr.seq(),
+                DimExpr.const(), DimExpr.const())
+        return nid
 
     def layer_norm(self, x: int, weight: int, bias: int,
                    eps: float = 1e-5) -> int:
@@ -824,6 +847,27 @@ class GraphBuilder:
                          i32=[num_heads, k_dim, v_dim, seq_len,
                               1 if use_qk_l2norm else 0, 4, 0, num_v_heads],
                          f32=[rms_eps, 1e-6, scale])
+
+    def gated_deltanet_conv_decode(
+            self, qkv: int, a_out: int, b_out: int, z_out: int,
+            A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,
+            conv_weight: int, conv_state: int,
+            num_heads: int, k_dim: int, v_dim: int,
+            num_v_heads: int = 0, conv_kernel: int = 4,
+            use_qk_l2norm: bool = True, rms_eps: float = 1e-6) -> int:
+        """Decode-only ShortConv + Gated DeltaNet + RMSNormGated fusion."""
+        if num_v_heads <= 0:
+            num_v_heads = num_heads
+        scale = float(k_dim ** -0.5)
+        return self._add(
+            OpType.GATED_DELTANET_CONV_DECODE,
+            [qkv, a_out, b_out, z_out, A_log, dt_bias, norm_weight,
+             gdn_state, conv_weight, conv_state],
+            (num_v_heads * v_dim, 1),
+            prec=Precision.FP32,
+            i32=[num_heads, k_dim, v_dim, 1,
+                 1 if use_qk_l2norm else 0, conv_kernel, 0, num_v_heads],
+            f32=[rms_eps, 1e-6, scale])
 
     def moe(self, hidden: int, router: int,
             experts_gate_up: int, experts_down: int,

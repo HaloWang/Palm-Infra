@@ -79,28 +79,40 @@ empty-context decode path. Both runtimes keep model weights on Metal.
 
 | Model | mollm Metal pp/tg | llama.cpp Metal pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | **8484.55** / 124.34 | 8181.36 / **135.13** | -8.0% |
+| Qwen3.5-0.8B | **9454.71** / **142.42** | 8181.36 / 135.13 | +5.4% |
 | Youtu-LLM-2B | **4994.05** / **61.67** | 3829.10 / 60.54 | +1.9% |
-| Qwen3.5-4B | 2021.33 / **30.55** | **2051.41** / 30.37 | +0.6% |
+| Qwen3.5-4B | **2321.66** / **31.62** | 2051.41 / 30.37 | +4.1% |
 | RWKV7-1.5B | **3703.60** / **79.43** | 3690.54 / 73.16 | +8.6% |
 
 ### W8
 
 | Model | mollm Metal W8 pp/tg | llama.cpp Metal Q8_0 pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | **9011.61** / 177.50 | 8570.11 / **200.54** | -11.5% |
+| Qwen3.5-0.8B | **9986.10** / **225.09** | 8570.11 / 200.54 | +12.2% |
 | Youtu-LLM-2B | **4840.48** / **98.89** | 3897.02 / 95.07 | +4.0% |
-| Qwen3.5-4B | 1966.32 / **51.97** | **2140.11** / 51.28 | +1.3% |
+| Qwen3.5-4B | **2554.39** / **57.85** | 2140.11 / 51.28 | +12.8% |
 | RWKV7-1.5B | 3536.47 / **120.44** | **3700.83** / 102.86 | +17.1% |
 
 ### W4
 
 | Model | mollm Metal W4 pp/tg | llama.cpp Metal Q4_0 pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | **9080.44** / 233.56 | 8875.59 / **251.99** | -7.3% |
+| Qwen3.5-0.8B | **9906.32** / **308.61** | 8875.59 / 251.99 | +22.5% |
 | Youtu-LLM-2B | 3929.00 / **153.77** | **4102.45** / 141.63 | +8.6% |
-| Qwen3.5-4B | 2170.91 / **77.28** | **2214.69** / 76.96 | +0.4% |
+| Qwen3.5-4B | **2378.60** / **95.36** | 2214.69 / 76.96 | +23.9% |
 | RWKV7-1.5B mixed W4 | 2962.41 / **151.40** | **3797.51** / 132.25 | +14.5% |
+
+Qwen3.5 row-concatenates projections that consume the same activation: MLP
+gate/up, full-attention Q/K/V, and linear-attention QKV/A/B/Z. The graph
+therefore performs one matmul and takes zero-copy slices instead of launching
+several smaller matmuls and rereading the activation. Residual addition is
+also fused with the following RMSNorm, and full attention fuses its sigmoid
+output gate. The linear-attention fusion removes two matmul dispatches from
+every Gated DeltaNet layer; strided ShortConv and GDN inputs consume the
+resulting views directly without a materializing copy. Decode further fuses
+ShortConv with Gated DeltaNet, while full attention fuses per-head RMSNorm,
+materialization, and RoPE. Quantized `lm_head` projection stays on Metal
+instead of falling back to CPU for every generated token.
 
 FP16 and W8 prefill cast each reused FP32 activation matrix to FP16 once, then
 use FP16-input tensor GEMM for activation-bearing projections. FP16 reads both
@@ -112,9 +124,8 @@ This reduces the activation working set and repeated device reads while
 retaining FP32 accumulation.
 K=128 Gated DeltaNet prefill keeps each state row in SIMD-group registers
 across the sequence, matching the recurrent structure used by llama.cpp.
-This makes Qwen3.5-0.8B FP16 and W8 prefill faster than llama.cpp, while Youtu
-FP16/W8 is also faster. Qwen3.5-4B FP16 prefill is now
-within about 1.5% of llama.cpp; its W8 prefill remains about 8% behind.
+This makes Qwen3.5-0.8B and Qwen3.5-4B faster than llama.cpp in both prefill
+and decode across all three tested precisions.
 
 RWKV7 prefill assigns one workgroup to each 64-wide head. Its 16 KiB FP32
 state matrix remains in threadgroup memory for the whole sequence, while each
@@ -142,7 +153,7 @@ On the pathological 512-token Youtu sample, default Metal PPL is now
 `82.5373` versus CPU `84.1760`, a -1.95% difference. The previous all-half
 path that produced a +7.71% gap is no longer used. Five repeated Metal runs
 produced identical CE/PPL. The balanced path
-also keeps 0.8B and 4B within -0.18% and -0.13% of their CPU PPL, respectively.
+also keeps 0.8B and 4B within -0.19% and -0.13% of their CPU PPL, respectively.
 Register-resident partials, scale staging, and dimension-selected cooperative
 tiles lift the Youtu prefill median from `3287.35` to `3929.00` tok/s (+19.5%).
 Youtu now trails llama.cpp prefill by 4.2%; decode remains 8.6% faster through
@@ -161,8 +172,10 @@ and 4096-token rows are earlier three-process medians used to show scaling.
 
 Youtu's `DK=192, DV=128` decode path fuses QK, online softmax, and P×V. At
 context 768 and above, 32 workgroups per head produce independent online
-softmax states and a second kernel combines them. Other attention shapes use
-the generic fallback.
+softmax states and a second kernel combines them. Qwen3.5's full-attention
+`DK=DV=256` decode uses the same single-pass online-softmax structure at
+short and medium contexts, avoiding the generic path's full score buffer and
+separate score, softmax, and value passes.
 
 Correctness gates include Metal operator parity at past lengths from 0 through
 1023 with `3e-3` tolerance, finite CPU/Metal CE and PPL, exact deterministic

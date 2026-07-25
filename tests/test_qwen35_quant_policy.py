@@ -3,10 +3,11 @@
 
 import os
 import sys
+import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "models"))
 
-from qwen35 import _quant_spec
+from qwen35 import _quant_spec, _query_then_gate_rows
 
 
 def check(actual, expected, msg):
@@ -21,12 +22,21 @@ def main():
     check(_quant_spec("w8g128", 1024), ("w8", 128), "w8g128 parses")
     check(_quant_spec("w4g128", 1024), ("w4", 128), "w4g128 parses")
 
+    q_rows = np.arange(8, dtype=np.float32).reshape(4, 2)
+    reordered = _query_then_gate_rows(q_rows, num_heads=2, head_dim=1)
+    check(reordered[:, 0].tolist(), [0.0, 4.0, 2.0, 6.0],
+          "q_proj rows group query heads before gate heads")
+
     check(_quant_spec("w4mixg128", 1024, "lm_head.weight"), ("w8", 128),
           "mixed W4 promotes explicit lm_head")
 
     qkv = "model.language_model.layers.4.linear_attn.in_proj_qkv.weight"
     check(_quant_spec("w4mixg128", 1024, qkv), ("w8", 128),
           "mixed W4 promotes linear-attention QKV")
+
+    qkvabz = "model.language_model.layers.4.linear_attn.in_proj_qkvabz.weight"
+    check(_quant_spec("w4mixg128", 1024, qkvabz), ("w8", 128),
+          "mixed W4 promotes merged linear-attention input projection")
 
     v_proj = "model.language_model.layers.7.self_attn.v_proj.weight"
     check(_quant_spec("w4mixg128", 1024, v_proj), ("w8", 128),

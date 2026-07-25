@@ -306,12 +306,14 @@ private:
                              Tensor& cos, Tensor& sin);
 
     /// Run lm_head on the last hidden state.
-    int run_lmhead(const Tensor& hidden, int n_tokens = 1);
+    int run_lmhead(const Tensor& hidden, int n_tokens = 1,
+                   bool finish_metal_graph = false);
 
     /// Feed inputs, run graph, extract output.
     Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
                      const Tensor& hidden, const Tensor& mask,
-                     const Tensor& cos, const Tensor& sin);
+                     const Tensor& cos, const Tensor& sin,
+                     bool defer_metal_end = false);
 
     /// Transactional public-load implementation and shared teardown path.
     bool load_impl(const EngineConfig& cfg);

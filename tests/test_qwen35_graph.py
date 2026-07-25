@@ -73,6 +73,12 @@ def main():
         "MLP no longer dispatches standalone SILU/MUL",
     )
     check(
+        sum(node.op_type == OpType.SHORTCONV for node in graph._nodes) == 1
+        and sum(node.op_type == OpType.GATED_DELTANET_PREFILL
+                for node in graph._nodes) == 1,
+        "prefill keeps separate ShortConv and GDN recurrence",
+    )
+    check(
         sum(node.op_type == OpType.ADD_RMS_NORM
             for node in graph._nodes) == 2,
         "each layer fuses both residual add + RMSNorm pairs",
@@ -82,15 +88,18 @@ def main():
         "Qwen3.5 residual stream has no standalone ADD",
     )
     check(
-        any(name.endswith("linear_attn_in_proj_ab_weight.weights")
+        any(name.endswith("linear_attn_in_proj_weight.weights")
             for name in constants),
-        "Qwen3.5 linear attention uses a merged A/B gate weight",
+        "Qwen3.5 linear attention uses one merged input projection weight",
     )
     check(
-        not any(name.endswith("linear_attn_in_proj_a_weight.weights")
+        not any(name.endswith("linear_attn_in_proj_qkv_weight.weights")
+                or name.endswith("linear_attn_in_proj_a_weight.weights")
                 or name.endswith("linear_attn_in_proj_b_weight.weights")
+                or name.endswith("linear_attn_in_proj_ab_weight.weights")
+                or name.endswith("linear_attn_in_proj_z_weight.weights")
                 for name in constants),
-        "Qwen3.5 graph has no separate GDN A/B projection weights",
+        "Qwen3.5 graph has no separate linear-attention input projections",
     )
 
     full_graph = build_graph(
@@ -119,9 +128,36 @@ def main():
         "Qwen3.5 full attention fuses sigmoid and multiply",
     )
     check(
+        sum(node.op_type == OpType.RMS_NORM_ROPE
+            for node in full_graph._nodes) == 2
+        and not any(node.op_type == OpType.ROTARY_EMBED
+                    for node in full_graph._nodes),
+        "full attention fuses Q/K RMSNorm, materialization, and RoPE",
+    )
+    check(
         not any(node.op_type == OpType.SIGMOID
                 for node in full_graph._nodes),
         "Qwen3.5 full attention has no standalone sigmoid",
+    )
+    check(
+        sum(node.op_type == OpType.CONTIGUOUS
+            for node in full_graph._nodes) == 0,
+        "full attention should not require standalone materialization",
+    )
+
+    decode_graph = build_graph(
+        ".", tiny_cfg(), seq_len=1, n_ctx=64, is_prefill=False
+    )
+    check(
+        sum(node.op_type == OpType.GATED_DELTANET_CONV_DECODE
+            for node in decode_graph._nodes) == 1,
+        "decode fuses ShortConv with the GDN recurrence",
+    )
+    check(
+        not any(node.op_type in (
+            OpType.SHORTCONV, OpType.GATED_DELTANET_DECODE)
+            for node in decode_graph._nodes),
+        "decode has no standalone ShortConv or GDN dispatch",
     )
 
     print("Qwen3.5 graph tests passed")

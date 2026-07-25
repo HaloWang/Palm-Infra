@@ -11,6 +11,7 @@
 #include "kernels/shortconv.h"
 
 #include <cstdio>
+#include <vector>
 
 // ---------------------------------------------------------------------------
 // CPUBackend::dispatch — kernel dispatcher for CPU (ARM NEON) backend.
@@ -57,6 +58,26 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::RMS_NORM_ROPE:
+        if (inputs.size() >= 4 && output) {
+            const int dim = (int)output->shape[0];
+            const int seq = (int)output->shape[1];
+            const int heads = (int)output->shape[2];
+            std::vector<float> normalized(
+                (size_t)dim * (size_t)seq * (size_t)heads);
+            Tensor tmp = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                dim, seq, heads, 1, normalized.data());
+            kernel_rms_norm(
+                *inputs[0], *inputs[1],
+                graph_params::get_f32(params, 0, 1e-6f), tmp);
+            kernel_rope(
+                tmp, *inputs[2], *inputs[3],
+                graph_params::get_i32(params, 0, dim),
+                graph_params::get_i32(params, 1, 1) != 0, *output);
+        }
+        break;
+
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };
@@ -71,6 +92,11 @@ void CPUBackend::dispatch(const GraphNode& node,
     case OpType::GATED_DELTANET_DECODE: {
         std::vector<Tensor*> gdn_outs = { output };
         kernel_gdn_decode(params, inputs, gdn_outs, thread_pool);
+        break;
+    }
+    case OpType::GATED_DELTANET_CONV_DECODE: {
+        std::vector<Tensor*> gdn_outs = { output };
+        kernel_gdn_conv_decode(params, inputs, gdn_outs, thread_pool);
         break;
     }
     case OpType::MOE: {

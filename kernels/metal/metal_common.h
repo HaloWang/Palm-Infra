@@ -145,6 +145,23 @@ struct RmsNormParams {
     float eps;
 };
 
+struct RmsNormRopeParams {
+    int   dim0;
+    int   rows;
+    int   seq_len;
+    int   heads;
+    int   rope_dim;
+    int   interleave;
+    uint  x_offset;
+    uint  w_offset;
+    uint  cos_offset;
+    uint  sin_offset;
+    uint  out_offset;
+    int   x_row_stride;
+    int   out_row_stride;
+    float eps;
+};
+
 // Layer norm over dim0 (innermost). rows = product of dims 1..3.
 struct LayerNormParams {
     int   dim0;
@@ -306,6 +323,9 @@ struct GdnParams {
     int   a_row_stride;
     int   b_row_stride;
     int   z_row_stride;
+    uint  conv_weight_offset;
+    uint  conv_state_offset;
+    int   conv_kernel;
 };
 
 // Depth-wise causal conv1d + silu (ShortConv). One thread per group.
@@ -321,6 +341,7 @@ struct ShortConvParams {
     int  kernel_size;      // e.g. 4
     int  n_real;           // real (non-padded) positions to process
     uint x_offset;         // element offsets into each bound buffer
+    uint x_row_stride;     // elements between consecutive token rows
     uint w_offset;
     uint state_offset;
     uint out_offset;

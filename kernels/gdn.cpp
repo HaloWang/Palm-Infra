@@ -1,4 +1,5 @@
 #include "kernels/gdn.h"
+#include "kernels/shortconv.h"
 
 #include <algorithm>
 #include <cmath>
@@ -249,4 +250,33 @@ void kernel_gdn_decode(const OpParams& params,
     // Fallback: reuse prefill scalar path
     kernel_gdn_prefill(params, inputs, outputs, thread_pool);
 #endif
+}
+
+void kernel_gdn_conv_decode(const OpParams& params,
+                            const std::vector<const Tensor*>& inputs,
+                            std::vector<Tensor*>& outputs,
+                            ThreadPool* thread_pool) {
+    if (inputs.size() < 10 || outputs.empty()) return;
+
+    const int num_heads = graph_params::get_i32(params, 0, 16);
+    const int k_dim = graph_params::get_i32(params, 1, 128);
+    const int v_dim = graph_params::get_i32(params, 2, 128);
+    const int num_v_heads =
+        graph_params::get_i32(params, 7, num_heads);
+    const int qkv_total =
+        2 * num_heads * k_dim + num_v_heads * v_dim;
+
+    std::vector<float> convolved((size_t)qkv_total);
+    Tensor qkv_conv = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, qkv_total, 1, 1, 1,
+        convolved.data());
+    OpParams conv_params;
+    conv_params.i32 = {graph_params::get_i32(params, 5, 4), 1};
+    kernel_shortconv(
+        conv_params, {inputs[0], inputs[8], inputs[9]}, qkv_conv, thread_pool);
+
+    std::vector<const Tensor*> gdn_inputs = {
+        &qkv_conv, inputs[1], inputs[2], inputs[3], inputs[4],
+        inputs[5], inputs[6], inputs[7]};
+    kernel_gdn_decode(params, gdn_inputs, outputs, thread_pool);
 }

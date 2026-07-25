@@ -2284,6 +2284,66 @@ kernel void rms_norm_f32(
     }
 }
 
+// Q/K normalization and RoPE share the same per-(head,position) row. Reading
+// the original strided view and writing the final dense SDPA layout here
+// replaces RMSNorm, materialization, and RoPE with one dispatch.
+kernel void rms_norm_rope_f32(
+    device const float*          X    [[buffer(0)]],
+    device const float*          W    [[buffer(1)]],
+    device float*                O    [[buffer(2)]],
+    constant RmsNormRopeParams&  p    [[buffer(3)]],
+    device const float*          COS  [[buffer(4)]],
+    device const float*          SIN  [[buffer(5)]],
+    uint row                           [[threadgroup_position_in_grid]],
+    uint tid                           [[thread_position_in_threadgroup]],
+    uint tcount                        [[threads_per_threadgroup]])
+{
+    if ((int)row >= p.rows) return;
+    device const float* x =
+        X + p.x_offset + row*(uint)p.x_row_stride;
+    device const float* w = W + p.w_offset;
+    device float* o =
+        O + p.out_offset + row*(uint)p.out_row_stride;
+
+    uint lane = tid & 31u;
+    uint sg = tid >> 5;
+    uint nsg = (tcount + 31u) >> 5;
+    float partial = 0.0f;
+    const int d4 = p.dim0 & ~3;
+    device const float4* x4 = (device const float4*)x;
+    for (int q = (int)tid; q < (d4 >> 2); q += (int)tcount) {
+        const float4 v = x4[q];
+        partial += v.x*v.x + v.y*v.y + v.z*v.z + v.w*v.w;
+    }
+    for (int d = d4 + (int)tid; d < p.dim0; d += (int)tcount)
+        partial += x[d]*x[d];
+    partial = simd_sum(partial);
+    threadgroup float sums[32];
+    if (lane == 0) sums[sg] = partial;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total =
+        simd_sum(lane < nsg ? sums[lane] : 0.0f);
+    const float scale = rsqrt(total/(float)p.dim0 + p.eps);
+
+    const int half_dim = p.rope_dim/2;
+    const int pos = (int)row % p.seq_len;
+    if ((int)tid < half_dim) {
+        const int d0 = p.interleave ? 2*(int)tid : (int)tid;
+        const int d1 = p.interleave ? d0+1 : d0+half_dim;
+        const float x0 = x[d0]*scale*w[d0];
+        const float x1 = x[d1]*scale*w[d1];
+        const float c =
+            COS[p.cos_offset + (uint)(pos*half_dim+(int)tid)];
+        const float s =
+            SIN[p.sin_offset + (uint)(pos*half_dim+(int)tid)];
+        o[d0] = x0*c - x1*s;
+        o[d1] = x1*c + x0*s;
+    }
+    for (int d = p.rope_dim + (int)tid;
+         d < p.dim0; d += (int)tcount)
+        o[d] = x[d]*scale*w[d];
+}
+
 // Residual add + RMSNorm. The residual stream is updated in place and the
 // normalized value is written separately for the following projection.
 kernel void add_rms_norm_f32(
@@ -2958,7 +3018,7 @@ kernel void shortconv_f32(
 
     device const float* w = W + p.w_offset + (uint)g * (uint)ks;
     device float* cs = STATE + p.state_offset + (uint)g * (uint)pre;
-    device const float* x = X + p.x_offset;      // layout [seq, groups]: x[s*groups+g]
+    device const float* x = X + p.x_offset;
     device float* o = O + p.out_offset + (uint)g * (uint)seq;
 
     // Load state prefix into a register window [win(pre)]. At position i the
@@ -2968,7 +3028,7 @@ kernel void shortconv_f32(
     for (int p_ = 0; p_ < pre; p_++) { win[p_] = cs[p_]; st0[p_] = cs[p_]; }
 
     for (int i = 0; i < seq; i++) {
-        float xi = x[(uint)i * (uint)p.groups + (uint)g];
+        float xi = x[(uint)i * p.x_row_stride + (uint)g];
         float sum = 0.0f;
         for (int k = 0; k < pre; k++) sum += win[k] * w[k];
         sum += xi * w[pre];
@@ -2983,7 +3043,7 @@ kernel void shortconv_f32(
     for (int p_ = 0; p_ < pre; p_++) {
         int j = nreal + p_;                 // position in the [state|x] window
         cs[p_] = (j < pre) ? st0[j]
-                           : x[(uint)(j - pre) * (uint)p.groups + (uint)g];
+                           : x[(uint)(j - pre) * p.x_row_stride + (uint)g];
     }
 }
 
@@ -2998,6 +3058,174 @@ inline float gdn_softplus(float x) {
     if (x > 20.0f) return x;
     if (x < -20.0f) return exp(x);
     return log(1.0f + exp(x));
+}
+
+// Decode-only ShortConv + GDN fusion. A threadgroup owns one key head and all
+// value heads that share it (one for 0.8B, two for 4B). This ownership is
+// important: q/k convolution state is shared by those value heads and must be
+// advanced exactly once.
+kernel void gdn_conv_decode_f32(
+    device const float*   QKV    [[buffer(0)]],
+    device const float*   A      [[buffer(1)]],
+    device const float*   B      [[buffer(2)]],
+    device const float*   Z      [[buffer(5)]],
+    device const float*   ALOG   [[buffer(6)]],
+    device const float*   DTB    [[buffer(7)]],
+    device const float*   NORMW  [[buffer(8)]],
+    device float*         STATE  [[buffer(9)]],
+    device const float*   CONVW  [[buffer(10)]],
+    device float*         CONVS  [[buffer(11)]],
+    device float*         O      [[buffer(4)]],
+    constant GdnParams&   p      [[buffer(3)]],
+    threadgroup float*    sh     [[threadgroup(0)]],
+    uint  kh                     [[threadgroup_position_in_grid]],
+    uint  tid                    [[thread_position_in_threadgroup]])
+{
+    const int K = p.k_dim, V = p.v_dim;
+    const int repeat = p.num_v_heads / p.num_heads;
+    const int qkv_dim = p.num_heads * K;
+    const int qkv_total = 2*qkv_dim + p.num_v_heads*V;
+    const int pre = p.conv_kernel - 1;
+    const uint lane = tid & 31u;
+    const uint qk_nsg = ((uint)K + 31u) >> 5;
+    const uint v_nsg = ((uint)V + 31u) >> 5;
+
+    // sq/sk are shared by every value head attached to this key head.
+    threadgroup float* sq = sh;
+    threadgroup float* sk = sq + K;
+    threadgroup float* qred = sk + K;
+    threadgroup float* kred = qred + qk_nsg;
+    threadgroup float* ared = kred + qk_nsg;
+
+    // Q and K channels have one owner each. Decode ShortConv is the dot of
+    // three saved samples plus the current sample, followed by SiLU.
+    if ((int)tid < K) {
+        const int d = (int)tid;
+        const int qch = (int)kh*K + d;
+        const int kch = qkv_dim + (int)kh*K + d;
+        float qsum = 0.0f, ksum = 0.0f;
+        for (int i = 0; i < pre; ++i) {
+            qsum += CONVS[p.conv_state_offset + (uint)(qch*pre+i)] *
+                    CONVW[p.conv_weight_offset +
+                          (uint)(qch*p.conv_kernel+i)];
+            ksum += CONVS[p.conv_state_offset + (uint)(kch*pre+i)] *
+                    CONVW[p.conv_weight_offset +
+                          (uint)(kch*p.conv_kernel+i)];
+        }
+        const float qx = QKV[p.qkv_offset + (uint)qch];
+        const float kx = QKV[p.qkv_offset + (uint)kch];
+        qsum += qx * CONVW[p.conv_weight_offset +
+                           (uint)(qch*p.conv_kernel+pre)];
+        ksum += kx * CONVW[p.conv_weight_offset +
+                           (uint)(kch*p.conv_kernel+pre)];
+        sq[d] = qsum / (1.0f + exp(-qsum));
+        sk[d] = ksum / (1.0f + exp(-ksum));
+        for (int i = 0; i < pre-1; ++i) {
+            CONVS[p.conv_state_offset + (uint)(qch*pre+i)] =
+                CONVS[p.conv_state_offset + (uint)(qch*pre+i+1)];
+            CONVS[p.conv_state_offset + (uint)(kch*pre+i)] =
+                CONVS[p.conv_state_offset + (uint)(kch*pre+i+1)];
+        }
+        if (pre > 0) {
+            CONVS[p.conv_state_offset + (uint)(qch*pre+pre-1)] = qx;
+            CONVS[p.conv_state_offset + (uint)(kch*pre+pre-1)] = kx;
+        }
+    }
+
+    // Each remaining thread owns one value channel and its convolution state.
+    const int rv = (int)tid / V;
+    const int dv = (int)tid - rv*V;
+    const int vh = (int)kh*repeat + rv;
+    const int vch = 2*qkv_dim + vh*V + dv;
+    float vsum = 0.0f;
+    for (int i = 0; i < pre; ++i)
+        vsum += CONVS[p.conv_state_offset + (uint)(vch*pre+i)] *
+                CONVW[p.conv_weight_offset +
+                      (uint)(vch*p.conv_kernel+i)];
+    const float vx = QKV[p.qkv_offset + (uint)vch];
+    vsum += vx * CONVW[p.conv_weight_offset +
+                       (uint)(vch*p.conv_kernel+pre)];
+    const float vv = vsum / (1.0f + exp(-vsum));
+    for (int i = 0; i < pre-1; ++i)
+        CONVS[p.conv_state_offset + (uint)(vch*pre+i)] =
+            CONVS[p.conv_state_offset + (uint)(vch*pre+i+1)];
+    if (pre > 0)
+        CONVS[p.conv_state_offset + (uint)(vch*pre+pre-1)] = vx;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Normalize q/k using only the first K threads. The reduction order is the
+    // same as the standalone decode kernel for K=128.
+    float qss = 0.0f, kss = 0.0f;
+    if ((int)tid < K) {
+        qss = sq[tid]*sq[tid];
+        kss = sk[tid]*sk[tid];
+    }
+    qss = simd_sum(qss);
+    kss = simd_sum(kss);
+    if ((int)tid < K && lane == 0) {
+        const uint sg = tid >> 5;
+        qred[sg] = qss;
+        kred[sg] = kss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float qtotal = simd_sum(lane < qk_nsg ? qred[lane] : 0.0f);
+    const float ktotal = simd_sum(lane < qk_nsg ? kred[lane] : 0.0f);
+    float qinv = 0.0f, kinv = 0.0f;
+    if (lane == 0) {
+        qinv = 1.0f / sqrt(qtotal + p.l2_eps);
+        kinv = 1.0f / sqrt(ktotal + p.l2_eps);
+    }
+    qinv = simd_shuffle(qinv, 0);
+    kinv = simd_shuffle(kinv, 0);
+    if ((int)tid < K) {
+        sq[tid] *= qinv;
+        sk[tid] *= kinv;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float gexp = 0.0f, beta = 0.0f;
+    if (lane == 0) {
+        const float ah = A[p.a_offset + (uint)vh];
+        const float bh = B[p.b_offset + (uint)vh];
+        const float sp =
+            gdn_softplus(ah + DTB[p.dtb_offset + (uint)vh]);
+        gexp = exp((-exp(ALOG[p.Alog_offset + (uint)vh])) * sp);
+        beta = 1.0f / (1.0f + exp(-bh));
+    }
+    gexp = simd_shuffle(gexp, 0);
+    beta = simd_shuffle(beta, 0);
+    device float* state_h =
+        STATE + p.state_offset + (uint)(vh*K*V);
+
+    float kv = 0.0f, attn_decay = 0.0f, qk = 0.0f;
+    for (int dk = 0; dk < K; ++dk) {
+        const float r = state_h[dk*V + dv] * gexp;
+        kv += r * sk[dk];
+        attn_decay += r * sq[dk];
+        qk += sk[dk] * sq[dk];
+    }
+    const float delta = (vv - kv) * beta;
+    for (int dk = 0; dk < K; ++dk)
+        state_h[dk*V + dv] =
+            state_h[dk*V + dv] * gexp + sk[dk] * delta;
+    const float attn = (attn_decay + delta*qk) * p.scale;
+
+    const float part = simd_sum(attn*attn);
+    const uint vsg = (uint)dv >> 5;
+    if (lane == 0)
+        ared[(uint)rv*v_nsg + vsg] = part;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = simd_sum(
+        lane < v_nsg ? ared[(uint)rv*v_nsg + lane] : 0.0f);
+    float rms = 0.0f;
+    if (lane == 0)
+        rms = 1.0f / sqrt(total/(float)V + p.rms_eps);
+    rms = simd_shuffle(rms, 0);
+    const float normed = attn*rms*NORMW[p.norm_offset + (uint)dv];
+    const float z = Z[p.z_offset + (uint)(vh*V+dv)];
+    O[p.out_offset + (uint)(vh*V+dv)] =
+        normed * (z/(1.0f + exp(-z)));
+    (void)qkv_total;
 }
 
 kernel void gdn_decode_f32(
@@ -4286,6 +4514,166 @@ kernel void sdpa_decode_192_128_reduce_f32(
         acc += ((device const float4*)(PARTIAL + base))[d4] * exp(mp - Mf);
     }
     out4[d4] = acc * inv;
+}
+
+// ---------------------------------------------------------------------------
+// SDPA decode fast path for Qwen3.5 full-attention heads (DK=DV=256).
+//
+// This is the 256-wide counterpart of sdpa_decode_192_128_f32. Eight SIMD
+// groups independently traverse 32-key tiles and keep an online-softmax output
+// accumulator. The final merge touches only eight partial states, avoiding the
+// generic kernel's full score buffer and separate score/softmax/value passes.
+//
+// grid: threadgroups = num_heads, threads/tg = 256 (8 SIMD groups).
+// ---------------------------------------------------------------------------
+kernel void sdpa_decode_256_256_f32(
+    device const float*   Q       [[buffer(0)]],
+    device const half*    KC      [[buffer(1)]],
+    device const half*    VC      [[buffer(2)]],
+    device float*         O       [[buffer(4)]],
+    device const float*   MASK    [[buffer(5)]],
+    constant SdpaParams&  p       [[buffer(3)]],
+    uint   h                      [[threadgroup_position_in_grid]],
+    ushort lane                   [[thread_index_in_simdgroup]],
+    ushort sg                     [[simdgroup_index_in_threadgroup]])
+{
+    constexpr short DK = 256;
+    constexpr short DV = 256;
+    constexpr short C = 32;
+    constexpr short NL = 16;
+    constexpr short NSG = 8;
+
+    const short tx = lane & 15;
+    const short ty = lane >> 4;
+    const int heads_per_group = p.num_heads / p.num_kv_heads;
+    const int kv_h = int(h) / heads_per_group;
+    const int key_limit =
+        min(p.dst_seqlen,
+            p.causal ? p.past_seqlen + 1 : p.dst_seqlen);
+
+    device const float* q =
+        Q + p.q_offset + h * p.q_stride_head;
+    device const half* Kh = KC + p.k_cache_offset
+        + (uint)kv_h * ((uint)DK * (uint)p.max_seq_len);
+    device const half* Vh = VC + p.v_cache_offset
+        + (uint)kv_h * ((uint)DV * (uint)p.max_seq_len);
+
+    threadgroup float4 q4[DK / 4];
+    threadgroup float scores[NSG * C];
+    threadgroup float4 og[NSG * (DV / 4)];
+    threadgroup float state_m[NSG];
+    threadgroup float state_s[NSG];
+
+    const short ti = sg * 32 + lane;
+    if (ti < DK / 4)
+        q4[ti] = ((device const float4*)q)[ti];
+    for (short i = ti; i < NSG * (DV / 4); i += NSG * 32)
+        og[i] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float M = -INFINITY;
+    float S = 0.0f;
+
+    for (int ic = int(sg) * C; ic < key_limit; ic += NSG * C) {
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int key = ic + 2 * cc + ty;
+            float dotqk = 0.0f;
+            if (key < key_limit) {
+                device const half4* k4 =
+                    (device const half4*)(Kh + (uint)key * (uint)DK);
+                #pragma unroll
+                for (short ii = 0; ii < DK / 4 / NL; ++ii) {
+                    const short d4 = ii * NL + tx;
+                    dotqk += dot(q4[d4], float4(k4[d4]));
+                }
+            }
+            const float even_sum =
+                simd_sum(ty == 0 ? dotqk : 0.0f);
+            const float odd_sum =
+                simd_sum(ty == 1 ? dotqk : 0.0f);
+            if (lane == 0)
+                scores[sg * C + 2 * cc] = even_sum;
+            if (lane == 16)
+                scores[sg * C + 2 * cc + 1] = odd_sum;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        const int key = ic + lane;
+        float score = key < key_limit
+            ? scores[sg * C + lane] * p.scale
+            : -INFINITY;
+        if (p.has_mask && key < key_limit)
+            score += MASK[p.mask_offset + (uint)key];
+
+        const float Mnew = simd_max(max(M, score));
+        const float corr = exp(M - Mnew);
+        const float weight = exp(score - Mnew);
+        S = S * corr + simd_sum(weight);
+        M = Mnew;
+        scores[sg * C + lane] = weight;
+
+        if (ty == 0) {
+            #pragma unroll
+            for (short block = 0; block < DV / 4 / NL; ++block)
+                og[sg * (DV / 4) + block * NL + tx] *= corr;
+        }
+        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+        float4 lo[DV / 4 / NL];
+        #pragma unroll
+        for (short block = 0; block < DV / 4 / NL; ++block)
+            lo[block] = 0.0f;
+        #pragma unroll
+        for (short cc = 0; cc < C / 2; ++cc) {
+            const int vkey = ic + 2 * cc + ty;
+            if (vkey < key_limit) {
+                device const half4* v4 =
+                    (device const half4*)(Vh + (uint)vkey * (uint)DV);
+                const float w = scores[sg * C + 2 * cc + ty];
+                #pragma unroll
+                for (short block = 0; block < DV / 4 / NL; ++block)
+                    lo[block] +=
+                        float4(v4[block * NL + tx]) * w;
+            }
+        }
+        #pragma unroll
+        for (short block = 0; block < DV / 4 / NL; ++block) {
+            lo[block].x += simd_shuffle_down(lo[block].x, 16);
+            lo[block].y += simd_shuffle_down(lo[block].y, 16);
+            lo[block].z += simd_shuffle_down(lo[block].z, 16);
+            lo[block].w += simd_shuffle_down(lo[block].w, 16);
+            if (ty == 0)
+                og[sg * (DV / 4) + block * NL + tx] += lo[block];
+        }
+    }
+
+    if (lane == 0) {
+        state_m[sg] = M;
+        state_s[sg] = S;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (sg == 0) {
+        const float mlane =
+            lane < NSG ? state_m[lane] : -INFINITY;
+        const float Mf = simd_max(mlane);
+        const float alane =
+            lane < NSG ? exp(state_m[lane] - Mf) : 0.0f;
+        const float denom = simd_sum(
+            lane < NSG ? state_s[lane] * alane : 0.0f);
+        const float inv = denom > 0.0f ? 1.0f / denom : 0.0f;
+        device float4* out4 = (device float4*)(
+            O + p.o_offset + h * p.o_stride_head);
+        for (short d4 = lane; d4 < DV / 4; d4 += 32) {
+            float4 acc = 0.0f;
+            #pragma unroll
+            for (short s = 0; s < NSG; ++s)
+                acc += og[s * (DV / 4) + d4]
+                     * exp(state_m[s] - Mf);
+            out4[d4] = acc * inv;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

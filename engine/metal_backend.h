@@ -102,7 +102,19 @@ public:
     void lm_head_gemv(const float* a_host, const Tensor& weight,
                       float* out_host, int N, int K, int activation = 0);
 
+    /// Append lm_head GEMV to the currently open graph command stream, reading
+    /// the graph output directly from its device buffer. This closes and waits
+    /// for the graph, then copies logits to `out_host` for sampling.
+    void lm_head_gemv_device_and_end_graph(
+        const Tensor& a, size_t a_element_offset, const Tensor& weight,
+        float* out_host, int N, int K, int activation = 0);
+
 private:
+    void lm_head_gemv_impl(void* a_device, size_t a_byte_offset,
+                           const Tensor& weight, float* out_host,
+                           int N, int K, int activation,
+                           bool finish_open_graph);
+
     /// Debug: flush the current command buffer (commit+wait) so intermediate
     /// device buffers become host-readable. No-op unless MOLLM_METAL_SYNC_EACH.
     void sync_point();

@@ -68,6 +68,7 @@ enum class OpType : uint32_t {
     RMS_NORM   = 20,
     LAYER_NORM = 21,
     ADD_RMS_NORM = 22,  // residual += update; out = rms_norm(residual)
+    RMS_NORM_ROPE = 23, // Q/K RMSNorm + materialize + RoPE
 
     // activations
     SILU = 30,
@@ -111,6 +112,7 @@ enum class OpType : uint32_t {
     // FLASH_ATTN         = 100,
     GATED_DELTANET_DECODE  = 110,
     GATED_DELTANET_PREFILL = 111,
+    GATED_DELTANET_CONV_DECODE = 112,
     MOE                 = 120,
     // MOE_COMBINE        = 121,
     // GATED_ATTENTION    = 130,
@@ -130,6 +132,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::RMS_NORM: return "RMS_NORM";
     case OpType::LAYER_NORM: return "LAYER_NORM";
     case OpType::ADD_RMS_NORM: return "ADD_RMS_NORM";
+    case OpType::RMS_NORM_ROPE: return "RMS_NORM_ROPE";
     case OpType::SILU: return "SILU";
     case OpType::GELU: return "GELU";
     case OpType::TANH: return "TANH";
@@ -156,6 +159,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::DEQUANTIZE_KV: return "DEQUANTIZE_KV";
     case OpType::GATED_DELTANET_DECODE: return "GATED_DELTANET_DECODE";
     case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
+    case OpType::GATED_DELTANET_CONV_DECODE: return "GATED_DELTANET_CONV_DECODE";
     case OpType::MOE: return "MOE";
     case OpType::SHORTCONV: return "SHORTCONV";
     case OpType::RWKV7: return "RWKV7";
