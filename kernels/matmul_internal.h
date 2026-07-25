@@ -134,4 +134,5 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
                           int act_n_begin, int act_n_len, MatmulTimer& timer);
 void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
                            ThreadPool* thread_pool, Activation act,
-                           int act_n_begin, int act_n_len, MatmulTimer& timer);
+                           int act_n_begin, int act_n_len, MatmulTimer& timer,
+                           bool force_fp32_acc = false);

@@ -59,6 +59,8 @@ void mollm_print_matmul_shape_profile(const char* title, int top_n);
 // only output columns in [act_n_begin, act_n_begin + act_n_len) get the
 // activation applied; the rest are written raw. Set act_n_len = -1 for
 // "apply to whole N" (fast path, no per-column check).
+// `force_fp32_acc` selects FP32 accumulation for this call without changing
+// the process-wide matmul configuration.
 //
 // kernel_matmul_fp32 dispatches to the best available implementation
 // (NEON SIMD for ARM, scalar fallback otherwise).
@@ -67,7 +69,8 @@ void mollm_print_matmul_shape_profile(const char* title, int top_n);
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool = nullptr,
                         Activation act = Activation::NONE, int act_n_begin = 0,
-                        int act_n_len = -1);
+                        int act_n_len = -1,
+                        bool force_fp32_acc = false);
 
 void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool = nullptr);

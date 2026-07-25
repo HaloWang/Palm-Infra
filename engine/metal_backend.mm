@@ -2,7 +2,9 @@
 #include "graph/metal_pool.h"
 #include "graph/graph.h"
 #include "graph/mmap_file.h"
+#include "kernels/matmul.h"
 #include "kernels/moe.h"
+#include "kernels/moe_routing.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/metal/metal_common.h"
 #include "kernels/trace.h"
@@ -338,6 +340,68 @@ struct MetalBackend::Impl {
                 found->second.ready_value,
             });
         }
+        return true;
+    }
+
+    bool finish_ssd_prefix(int layer, const char* error_context) {
+        [enc endEncoding];
+        enc = nil;
+        const uint64_t wait_start = mollm_trace::now_ns();
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        const uint64_t wait_end = mollm_trace::now_ns();
+        const std::string args =
+            "{\"layer\":" + std::to_string(layer) + "}";
+        mollm_trace::record_duration(
+            "metal.ssd", "prefix_wait", wait_start, wait_end, args,
+            "thread_state_iowait");
+        const double gpu_seconds = cmd.GPUEndTime - cmd.GPUStartTime;
+        if (gpu_seconds > 0.0 && wait_end != 0) {
+            const uint64_t gpu_ns =
+                static_cast<uint64_t>(gpu_seconds * 1e9);
+            mollm_trace::record_duration(
+                "metal.ssd", "prefix_gpu",
+                wait_end > gpu_ns ? wait_end - gpu_ns : 0,
+                wait_end, args, "thread_state_running");
+        }
+        if (cmd.status == MTLCommandBufferStatusError) {
+            NSError* error = cmd.error;
+            fprintf(stderr, "MetalBackend: %s failed: %s\n", error_context,
+                    error ? error.localizedDescription.UTF8String : "?");
+            cmd = nil;
+            return false;
+        }
+        cmd = nil;
+        return true;
+    }
+
+    bool route_moe_on_cpu(const Tensor& input, const Tensor& router,
+                          const Tensor* bias,
+                          const mollm::detail::MoeRoutingParams& routing,
+                          ThreadPool* thread_pool, void* indices_handle,
+                          void* weights_handle) {
+        if (!router.data)
+            return false;
+        const int seq = static_cast<int>(input.shape[1]);
+        std::vector<float> logits(
+            static_cast<size_t>(seq) * routing.num_experts);
+        Tensor output = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, routing.num_experts,
+            seq, 1, 1, logits.data());
+        kernel_matmul_fp32(input, router, output, thread_pool,
+                          Activation::NONE, 0, -1, true);
+        std::vector<int> indices;
+        std::vector<float> weights;
+        const float* bias_data =
+            bias && bias->data ? bias->ptr<float>() : nullptr;
+        if (!mollm::detail::select_moe_routes(
+                logits.data(), seq, bias_data, routing, indices, weights)) {
+            return false;
+        }
+        std::memcpy(MetalBufferPool::contents(indices_handle), indices.data(),
+                    indices.size() * sizeof(int));
+        std::memcpy(MetalBufferPool::contents(weights_handle), weights.data(),
+                    weights.size() * sizeof(float));
         return true;
     }
 
@@ -2820,13 +2884,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             const Impl::SsdMoeLayerInfo* predicted_layer = nullptr;
             void* predicted_idx_h = nullptr;
             void* predicted_tw_h = nullptr;
-            void* predicted_logits_h = nullptr;
-            id<MTLBuffer> predicted_idx = nil;
-            id<MTLBuffer> predicted_tw = nil;
-            id<MTLBuffer> predicted_logits = nil;
             size_t predicted_idx_bytes = 0;
             size_t predicted_tw_bytes = 0;
-            size_t predicted_logits_bytes = 0;
             if (ssd_w4 && impl_->ssd_cross_layer_prefetch) {
                 auto next = impl_->ssd_moe_layers.find(
                     ssd_gate->spec.layer + 1);
@@ -2846,20 +2905,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                         (size_t)seq * predicted_layer->top_k * sizeof(int);
                     predicted_tw_bytes =
                         (size_t)seq * predicted_layer->top_k * sizeof(float);
-                    predicted_logits_bytes =
-                        (size_t)seq * predicted_layer->experts * sizeof(float);
                     predicted_idx_h =
                         impl_->pool->acquire(predicted_idx_bytes);
                     predicted_tw_h =
                         impl_->pool->acquire(predicted_tw_bytes);
-                    predicted_logits_h =
-                        impl_->pool->acquire(predicted_logits_bytes);
-                    predicted_idx =
-                        (__bridge id<MTLBuffer>)predicted_idx_h;
-                    predicted_tw =
-                        (__bridge id<MTLBuffer>)predicted_tw_h;
-                    predicted_logits =
-                        (__bridge id<MTLBuffer>)predicted_logits_h;
                 }
             }
             MoeW4Params mp{};
@@ -2873,93 +2922,102 @@ void MetalBackend::dispatch(const GraphNode& node,
             size_t gu_rows=(size_t)num_experts*2*intermediate;
             size_t down_rows=(size_t)num_experts*hidden_size;
 
-            MatmulParams router_mp{};
-            router_mp.M = seq;
-            router_mp.N = num_experts;
-            router_mp.K = hidden_size;
-            router_mp.a_offset = eoffset(x);
-            router_mp.b_offset = 0;
-            router_mp.c_offset = 0;
-            router_mp.a_row_stride = estride(x, 1);
-            router_mp.b_row_stride = hidden_size;
-            router_mp.c_row_stride = num_experts;
-            router_mp.activation = 0;
-            router_mp.act_n_begin = 0;
-            router_mp.act_n_len = -1;
-            [enc setComputePipelineState:
-                     impl_->pipeline("gemv_f32a_f16b_f32c")];
-            [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&router) offset:router.device_offset atIndex:1];
-            [enc setBuffer:logits offset:0 atIndex:2];
-            [enc setBytes:&router_mp length:sizeof(router_mp) atIndex:3];
-            [enc dispatchThreadgroups:MTLSizeMake((num_experts + 7) / 8,1,1)
-                threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-            [enc setComputePipelineState:impl_->pipeline(
-                router_score_func == 0 ? "moe_select_softmax"
-                                       : "moe_select_sigmoid")];
-            [enc setBuffer:logits offset:0 atIndex:0];[enc setBuffer:idx offset:0 atIndex:1];
-            [enc setBuffer:tw offset:0 atIndex:2];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
-            if (bias) {
-                [enc setBuffer:buf_of(bias) offset:bias->device_offset atIndex:4];
-            }
-            [enc dispatchThreadgroups:MTLSizeMake(((NSUInteger)seq+63)/64,1,1)
-                threadsPerThreadgroup:MTLSizeMake(64,1,1)];
+            if (ssd_w4) {
+                // Direct MTLIO submission needs host-visible route IDs. On
+                // UMA, routing this tiny GEMV on the CPU avoids a separate GPU
+                // router command and writes directly into the Shared buffers
+                // consumed by the expert kernels.
+                if (!impl_->finish_ssd_prefix(
+                        ssd_gate->spec.layer, "pre-router command")) {
+                    break;
+                }
+                enc = nil;
 
-            if (predicted_layer) {
-                MatmulParams predicted_router_mp{};
-                predicted_router_mp.M = seq;
-                predicted_router_mp.N = predicted_layer->experts;
-                predicted_router_mp.K = hidden_size;
-                predicted_router_mp.a_offset = eoffset(x);
-                predicted_router_mp.b_offset = 0;
-                predicted_router_mp.c_offset = 0;
-                predicted_router_mp.a_row_stride = estride(x, 1);
-                predicted_router_mp.b_row_stride = hidden_size;
-                predicted_router_mp.c_row_stride =
-                    predicted_layer->experts;
-                predicted_router_mp.activation = 0;
-                predicted_router_mp.act_n_begin = 0;
-                predicted_router_mp.act_n_len = -1;
+                const auto* input_bytes =
+                    static_cast<const uint8_t*>([buf_of(&x) contents]) +
+                    x.device_offset;
+                Tensor cpu_input = Tensor::create(
+                    Precision::FP32, MemoryType::EXTERNAL,
+                    hidden_size, seq, 1, 1,
+                    const_cast<uint8_t*>(input_bytes));
+                const uint64_t cpu_router_start =
+                    mollm_trace::now_ns();
+                mollm::detail::MoeRoutingParams routing;
+                routing.num_experts = num_experts;
+                routing.top_k = top_k;
+                routing.score_func = router_score_func;
+                routing.normalize_topk = norm_topk;
+                routing.num_groups = std::max(1, n_group);
+                routing.topk_groups = std::max(1, topk_group);
+                routing.scaling_factor = routed_scale;
+                bool routed = impl_->route_moe_on_cpu(
+                    cpu_input, router, bias, routing, thread_pool,
+                    idx_h, tw_h);
+                if (routed && predicted_layer) {
+                    routing.num_experts = predicted_layer->experts;
+                    routing.top_k = predicted_layer->top_k;
+                    routing.score_func = predicted_layer->score_func;
+                    routing.normalize_topk = predicted_layer->norm_topk;
+                    routing.num_groups = predicted_layer->n_group;
+                    routing.topk_groups = predicted_layer->topk_group;
+                    routing.scaling_factor =
+                        predicted_layer->routed_scale;
+                    routed = impl_->route_moe_on_cpu(
+                        cpu_input, *predicted_layer->router,
+                        predicted_layer->bias, routing, thread_pool,
+                        predicted_idx_h, predicted_tw_h);
+                }
+                if (!routed) {
+                    fprintf(stderr,
+                            "MetalBackend: CPU SSD router failed in layer %d\n",
+                            ssd_gate->spec.layer);
+                    break;
+                }
+                mollm_trace::record_duration(
+                    "metal.ssd", "cpu_router",
+                    cpu_router_start, mollm_trace::now_ns(),
+                    "{\"layer\":" +
+                        std::to_string(ssd_gate->spec.layer) + "}",
+                    "thread_state_running");
+            }
+
+            if (!ssd_w4) {
+                MatmulParams router_mp{};
+                router_mp.M = seq;
+                router_mp.N = num_experts;
+                router_mp.K = hidden_size;
+                router_mp.a_offset = eoffset(x);
+                router_mp.b_offset = 0;
+                router_mp.c_offset = 0;
+                router_mp.a_row_stride = estride(x, 1);
+                router_mp.b_row_stride = hidden_size;
+                router_mp.c_row_stride = num_experts;
+                router_mp.activation = 0;
+                router_mp.act_n_begin = 0;
+                router_mp.act_n_len = -1;
                 [enc setComputePipelineState:
                          impl_->pipeline("gemv_f32a_f16b_f32c")];
                 [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(predicted_layer->router)
-                        offset:predicted_layer->router->device_offset
+                [enc setBuffer:buf_of(&router)
+                        offset:router.device_offset
                        atIndex:1];
-                [enc setBuffer:predicted_logits offset:0 atIndex:2];
-                [enc setBytes:&predicted_router_mp
-                       length:sizeof(predicted_router_mp)
+                [enc setBuffer:logits offset:0 atIndex:2];
+                [enc setBytes:&router_mp
+                       length:sizeof(router_mp)
                       atIndex:3];
                 [enc dispatchThreadgroups:
-                         MTLSizeMake(
-                             (predicted_layer->experts + 7) / 8, 1, 1)
+                         MTLSizeMake((num_experts + 7) / 8, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-                MoeW4Params predicted_mp{};
-                predicted_mp.hidden = hidden_size;
-                predicted_mp.experts = predicted_layer->experts;
-                predicted_mp.top_k = predicted_layer->top_k;
-                predicted_mp.intermediate =
-                    predicted_layer->intermediate;
-                predicted_mp.seq_len = seq;
-                predicted_mp.n_group = predicted_layer->n_group;
-                predicted_mp.topk_group = predicted_layer->topk_group;
-                predicted_mp.norm_topk = predicted_layer->norm_topk;
-                predicted_mp.routed_scale =
-                    predicted_layer->routed_scale;
                 [enc setComputePipelineState:impl_->pipeline(
-                    predicted_layer->score_func == 0
-                        ? "moe_select_softmax"
-                        : "moe_select_sigmoid")];
-                [enc setBuffer:predicted_logits offset:0 atIndex:0];
-                [enc setBuffer:predicted_idx offset:0 atIndex:1];
-                [enc setBuffer:predicted_tw offset:0 atIndex:2];
-                [enc setBytes:&predicted_mp
-                       length:sizeof(predicted_mp)
-                      atIndex:3];
-                if (predicted_layer->bias) {
-                    [enc setBuffer:buf_of(predicted_layer->bias)
-                            offset:predicted_layer->bias->device_offset
+                    router_score_func == 0 ? "moe_select_softmax"
+                                           : "moe_select_sigmoid")];
+                [enc setBuffer:logits offset:0 atIndex:0];
+                [enc setBuffer:idx offset:0 atIndex:1];
+                [enc setBuffer:tw offset:0 atIndex:2];
+                [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                if (bias) {
+                    [enc setBuffer:buf_of(bias)
+                            offset:bias->device_offset
                            atIndex:4];
                 }
                 [enc dispatchThreadgroups:
@@ -2969,48 +3027,6 @@ void MetalBackend::dispatch(const GraphNode& node,
 
 #ifdef MOLLM_METAL_TENSOR
             if (ssd_w4) {
-                // Exact route IDs are produced on the GPU. The synchronous
-                // prototype closes this prefix so the CPU can schedule direct
-                // Metal I/O; expert compute resumes in a fresh command buffer.
-                [enc endEncoding];
-                impl_->enc = nil;
-                const uint64_t prefix_wait_start =
-                    mollm_trace::now_ns();
-                [impl_->cmd commit];
-                [impl_->cmd waitUntilCompleted];
-                const uint64_t prefix_wait_end =
-                    mollm_trace::now_ns();
-                mollm_trace::record_duration(
-                    "metal.ssd", "prefix_wait", prefix_wait_start,
-                    prefix_wait_end,
-                    "{\"layer\":" +
-                        std::to_string(ssd_gate->spec.layer) + "}",
-                    "thread_state_iowait");
-                const double gpu_seconds =
-                    impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime;
-                if (gpu_seconds > 0.0 && prefix_wait_end != 0) {
-                    const uint64_t gpu_ns =
-                        static_cast<uint64_t>(gpu_seconds * 1e9);
-                    mollm_trace::record_duration(
-                        "metal.ssd", "prefix_gpu",
-                        prefix_wait_end > gpu_ns
-                            ? prefix_wait_end - gpu_ns
-                            : 0,
-                        prefix_wait_end,
-                        "{\"layer\":" +
-                            std::to_string(ssd_gate->spec.layer) + "}",
-                        "thread_state_running");
-                }
-                if (impl_->cmd.status == MTLCommandBufferStatusError) {
-                    NSError* e = impl_->cmd.error;
-                    fprintf(stderr,
-                            "MetalBackend: SSD router command failed: %s\n",
-                            e ? e.localizedDescription.UTF8String : "?");
-                    impl_->cmd = nil;
-                    break;
-                }
-                impl_->cmd = nil;
-
                 const int* exact_routes =
                     static_cast<const int*>(MetalBufferPool::contents(idx_h));
                 std::vector<int> experts(exact_routes,
@@ -3066,8 +3082,6 @@ void MetalBackend::dispatch(const GraphNode& node,
                         predicted_idx_h, predicted_idx_bytes);
                     impl_->pool->release(
                         predicted_tw_h, predicted_tw_bytes);
-                    impl_->pool->release(
-                        predicted_logits_h, predicted_logits_bytes);
                     predicted_layer = nullptr;
                 }
 

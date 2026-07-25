@@ -9,7 +9,8 @@ bool g_mollm_force_fp32_acc = false;
 
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool, Activation act,
-                        int act_n_begin, int act_n_len) {
+                        int act_n_begin, int act_n_len,
+                        bool force_fp32_acc) {
     MatmulTimer timer;
 
     switch (B.prec) {
@@ -23,7 +24,7 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     default:
         matmul_dispatch_dense(A, B, C, thread_pool, act, act_n_begin, act_n_len,
-                              timer);
+                              timer, force_fp32_acc);
         return;
     }
 }

@@ -898,7 +898,7 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C, int M,
 void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
                            ThreadPool* thread_pool, Activation act,
                            int act_n_begin, int act_n_len,
-                           MatmulTimer& _timer) {
+                           MatmulTimer& _timer, bool force_fp32_acc) {
     int M = (int)A.shape[1];
     int K = (int)A.shape[0];
     int N = (int)B.shape[0];
@@ -986,7 +986,8 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
                           g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
     bool use_fp16_acc =
-        g_matmul_config.use_fp16_accumulate && !g_mollm_force_fp32_acc;
+        g_matmul_config.use_fp16_accumulate && !g_mollm_force_fp32_acc &&
+        !force_fp32_acc;
 
     // Select lane-FMA kernel based on accumulation mode.
     // `act`/`act_n_begin`/`act_n_len` are in local shard coords (caller already
