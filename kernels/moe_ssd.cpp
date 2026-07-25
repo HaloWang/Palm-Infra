@@ -2,6 +2,7 @@
 #include "kernels/moe_ssd_internal.h"
 
 #include "graph/mmap_file.h"
+#include "kernels/matmul.h"
 #include "kernels/trace.h"
 
 #include <algorithm>
@@ -203,8 +204,14 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
                      spec.weight_ref.c_str());
         return false;
     }
+    const bool has_embedded_bg128_scales =
+        spec.precision == Precision::INT4 &&
+        (spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
+        spec.group_size == 128 && spec.cols % 128 == 0 &&
+        matmul_int4_q4dot_kernel_available();
     if ((spec.precision == Precision::INT8 || spec.precision == Precision::INT4) &&
-        (spec.group_size == 0 || spec.groups_per_row == 0 || spec.scales_bytes == 0)) {
+        (spec.group_size == 0 || spec.groups_per_row == 0 ||
+         (spec.scales_bytes == 0 && !has_embedded_bg128_scales))) {
         std::fprintf(stderr, "MoE SSD: quantized expert %s lacks scale metadata\n",
                      spec.weight_ref.c_str());
         return false;

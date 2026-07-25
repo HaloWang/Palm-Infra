@@ -1019,7 +1019,11 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     const auto* b_q4_g128 =
         reinterpret_cast<const Q4B8G128Block*>(B.q4_g128_data);
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;
-    if (!scales || group_size <= 0 || groups_per_row <= 0) {
+    const bool has_embedded_bg128_scales =
+        B.is_q4_g128_packed && b_q4_g128 && group_size == 128 &&
+        K % 128 == 0 && matmul_int4_q4dot_kernel_available();
+    if ((!scales && !has_embedded_bg128_scales) || group_size <= 0 ||
+        groups_per_row <= 0) {
         timer.set_shape("int4_invalid_scales", M, N, K, group_size,
                         groups_per_row, false, false, n_threads);
         return;

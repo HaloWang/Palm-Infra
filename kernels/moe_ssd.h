@@ -33,7 +33,9 @@ struct MoeSsdTensorSpec {
     uint64_t data_offset = 0;       // absolute package-file offset
     uint64_t data_bytes = 0;        // per-expert bytes
     uint64_t scales_offset = 0;     // absolute package-file offset
-    uint64_t scales_bytes = 0;      // per-expert bytes
+    // Per-expert sidecar bytes. May be zero for BG128 data, whose blocks
+    // already embed the scales consumed by the direct q4-dot kernels.
+    uint64_t scales_bytes = 0;
 };
 
 class MoeSsdCache;

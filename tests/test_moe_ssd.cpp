@@ -1,3 +1,5 @@
+#include "graph/mmap_file.h"
+#include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
 
 #include <cstdio>
@@ -62,6 +64,52 @@ int main() {
         check(!cache.add_source(overflowing), "reject overflowing expert extent");
         check(cache.find_source("overflowing") == nullptr,
               "overflowing source is not registered");
+    }
+
+    // Direct BG128 blocks carry their own scales. The SSD cache should accept
+    // a source without a duplicate scale sidecar and expose a tensor that
+    // dispatches through the embedded-scale kernels.
+    const std::string bg128_path = "/tmp/mollm_test_moe_ssd_bg128.bin";
+    if (matmul_int4_q4dot_kernel_available()) {
+        constexpr size_t block_bytes = 544;
+        std::vector<uint8_t> bg128_contents(2 * block_bytes);
+        {
+            std::ofstream out(bg128_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bg128_contents.data()),
+                      static_cast<std::streamsize>(bg128_contents.size()));
+        }
+        auto bg128_spec = [&](const char* name, uint64_t offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 1;
+            out.rows = 8;
+            out.cols = 128;
+            out.precision = Precision::INT4;
+            out.flags = MappedFile::FLAG_INT4_BG128;
+            out.group_size = 128;
+            out.groups_per_row = 1;
+            out.data_offset = offset;
+            out.data_bytes = block_bytes;
+            return out;
+        };
+
+        MoeSsdCache cache;
+        check(cache.open(bg128_path, 2 * block_bytes),
+              "open embedded-scale BG128 cache");
+        check(cache.add_source(bg128_spec("bg128_gate", 0)) &&
+                  cache.add_source(bg128_spec("bg128_down", block_bytes)),
+              "add BG128 sources without scale sidecars");
+        const MoeSsdTensorSource* gate = cache.find_source("bg128_gate");
+        const MoeSsdTensorSource* down = cache.find_source("bg128_down");
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "load embedded-scale BG128 expert");
+        check(gu.scales == nullptr && dw.scales == nullptr &&
+                  gu.is_q4_g128_packed && dw.is_q4_g128_packed,
+              "BG128 expert tensors omit redundant sidecars");
+        check(cache.stats().bytes_read == 2 * block_bytes,
+              "BG128 cache reads only embedded-scale data");
     }
 
     {
@@ -368,6 +416,7 @@ int main() {
     }
 
     std::remove(path.c_str());
+    std::remove(bg128_path.c_str());
     if (failures == 0) std::printf("All MoE SSD cache tests passed!\n");
     return failures == 0 ? 0 : 1;
 }

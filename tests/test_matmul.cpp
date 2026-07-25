@@ -528,6 +528,8 @@ int main() {
 
         kernel_matmul_fp32(A, B, C_repack);
         B.q4_g128_data = q4_g128;
+        B.is_q4_g128_packed = true;
+        B.scales = nullptr;
         kernel_matmul_fp32(A, B, C_bg128);
         ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
 
@@ -592,7 +594,9 @@ int main() {
             weights.push_back(Tensor::create(
                 Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1,
                 bg128[i]));
-            weights.back().scales = scales[i].data();
+            // BG128 blocks embed their scales; SSD-loaded experts intentionally
+            // omit the redundant scale sidecar.
+            weights.back().scales = nullptr;
             weights.back().group_size = 128;
             weights.back().groups_per_row = 1;
             weights.back().is_q4_g128_packed = true;
@@ -668,6 +672,8 @@ int main() {
 
         kernel_matmul_fp32(A, B, C_repack);
         B.q4_g128_data = q4_g128;
+        B.is_q4_g128_packed = true;
+        B.scales = nullptr;
         kernel_matmul_fp32(A, B, C_bg128);
         ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
 

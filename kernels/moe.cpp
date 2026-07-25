@@ -88,7 +88,9 @@ static inline float load_weight_at(const Tensor& t, int64_t row, int col, int K)
     int groups_per_row = t.groups_per_row > 0 ? (int)t.groups_per_row : 1;
     int group = col / group_size;
     const float* scales = t.scales;
-    if (!scales) return 0.0f;
+    const bool has_embedded_bg128_scales =
+        t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data;
+    if (!scales && !has_embedded_bg128_scales) return 0.0f;
 
     if (t.prec == Precision::INT8) {
         const int8_t* q = static_cast<const int8_t*>(t.data);
@@ -98,9 +100,9 @@ static inline float load_weight_at(const Tensor& t, int64_t row, int col, int K)
     if (t.prec == Precision::INT4) {
         const uint8_t* q = static_cast<const uint8_t*>(t.data);
         uint8_t byte = 0;
-        float scale = scales[row * groups_per_row + group];
+        float scale = 0.0f;
 
-        if (t.is_q4_g128_packed && t.q4_g128_data) {
+        if (has_embedded_bg128_scales) {
             constexpr int BG128_BLOCK_BYTES = 544;
             const uint8_t* bg = static_cast<const uint8_t*>(t.q4_g128_data);
             int lane = (int)(row & 7);
@@ -112,11 +114,13 @@ static inline float load_weight_at(const Tensor& t, int64_t row, int col, int K)
             std::memcpy(&scale, block + (size_t)lane * sizeof(float), sizeof(float));
             byte = block[32 + ((qgi * 8 + lane) * 16) + ((col & 31) >> 1)];
         } else if (t.is_q4_repacked) {
+            scale = scales[row * groups_per_row + group];
             int k_blocks = (K + 31) / 32;
             size_t qidx = (((size_t)(row / 8) * k_blocks + (size_t)(col / 32)) * 8 +
                            (size_t)(row & 7)) * 16 + (size_t)((col & 31) >> 1);
             byte = q[qidx];
         } else {
+            scale = scales[row * groups_per_row + group];
             int row_stride = (K + 1) / 2;
             byte = q[(size_t)row * row_stride + (size_t)(col >> 1)];
         }
