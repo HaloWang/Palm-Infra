@@ -2022,7 +2022,7 @@ kernel void moe_shared_scale_f16(
         scale[0] = 1.0f / (1.0f + exp(-sum));
 }
 
-kernel void moe_shared_down_add_w4(
+kernel void moe_shared_down_w4(
     device const float* inter [[buffer(0)]],
     device const uchar* down_w [[buffer(1)]],
     device float* output [[buffer(2)]],
@@ -2037,7 +2037,15 @@ kernel void moe_shared_down_add_w4(
         down_scales + (ulong)row * p.down_groups_per_row,
         p.intermediate, lane);
     if (lane == 0)
-        output[p.output_offset + row] += value * scale[0];
+        output[p.output_offset + row] = value * scale[0];
+}
+
+kernel void add_inplace_f32(
+    device float* target [[buffer(0)]],
+    device const float* update [[buffer(1)]],
+    constant uint& count [[buffer(3)]],
+    uint i [[thread_position_in_grid]]) {
+    if (i < count) target[i] += update[i];
 }
 
 kernel void moe_gate_up_w4(
