@@ -405,6 +405,175 @@ struct MetalBackend::Impl {
         return true;
     }
 
+    struct SsdSharedExpertWork {
+        void* qx = nullptr;
+        void* sx = nullptr;
+        void* intermediate = nullptr;
+        void* qintermediate = nullptr;
+        void* qintermediate_scale = nullptr;
+        void* scale = nullptr;
+        void* output = nullptr;
+        size_t qx_bytes = 0;
+        size_t sx_bytes = 0;
+        size_t intermediate_bytes = 0;
+        size_t qintermediate_bytes = 0;
+        size_t output_bytes = 0;
+        uint64_t ready_value = 0;
+    };
+
+    bool submit_ssd_shared_expert(
+        const Tensor& x, const Tensor& gate, const Tensor& up,
+        const Tensor& down, const Tensor& scale_weight, int hidden,
+        int intermediate, int seq, int layer, SsdSharedExpertWork& work) {
+        if (gate.prec != Precision::INT4 ||
+            up.prec != Precision::INT4 ||
+            down.prec != Precision::INT4 ||
+            scale_weight.prec != Precision::FP16 ||
+            !x.device_data || !gate.device_data || !up.device_data ||
+            !down.device_data || !scale_weight.device_data) {
+            return false;
+        }
+
+        work.qx_bytes = static_cast<size_t>(seq) * hidden;
+        work.sx_bytes = static_cast<size_t>(seq) * sizeof(float);
+        work.intermediate_bytes =
+            static_cast<size_t>(intermediate) * sizeof(float);
+        work.qintermediate_bytes =
+            static_cast<size_t>(intermediate) * sizeof(int8_t);
+        work.output_bytes = static_cast<size_t>(hidden) * sizeof(float);
+        work.qx = pool->acquire(work.qx_bytes);
+        work.sx = pool->acquire(work.sx_bytes);
+        work.intermediate = pool->acquire(work.intermediate_bytes);
+        work.qintermediate = pool->acquire(work.qintermediate_bytes);
+        work.qintermediate_scale = pool->acquire(sizeof(float));
+        work.scale = pool->acquire(sizeof(float));
+        work.output = pool->acquire(work.output_bytes);
+
+        id<MTLBuffer> x_buffer = (__bridge id<MTLBuffer>)x.device_data;
+        id<MTLBuffer> gate_buffer = (__bridge id<MTLBuffer>)gate.device_data;
+        id<MTLBuffer> up_buffer = (__bridge id<MTLBuffer>)up.device_data;
+        id<MTLBuffer> down_buffer = (__bridge id<MTLBuffer>)down.device_data;
+        id<MTLBuffer> scale_weight_buffer =
+            (__bridge id<MTLBuffer>)scale_weight.device_data;
+        id<MTLBuffer> qx = (__bridge id<MTLBuffer>)work.qx;
+        id<MTLBuffer> sx = (__bridge id<MTLBuffer>)work.sx;
+        id<MTLBuffer> hidden_values =
+            (__bridge id<MTLBuffer>)work.intermediate;
+        id<MTLBuffer> qhidden =
+            (__bridge id<MTLBuffer>)work.qintermediate;
+        id<MTLBuffer> qhidden_scale =
+            (__bridge id<MTLBuffer>)work.qintermediate_scale;
+        id<MTLBuffer> scale = (__bridge id<MTLBuffer>)work.scale;
+        id<MTLBuffer> output = (__bridge id<MTLBuffer>)work.output;
+
+        MoeSharedW4Params params{};
+        params.hidden = hidden;
+        params.intermediate = intermediate;
+        params.gate_groups_per_row = static_cast<int>(gate.groups_per_row);
+        params.up_groups_per_row = static_cast<int>(up.groups_per_row);
+        params.down_groups_per_row = static_cast<int>(down.groups_per_row);
+        params.hidden_offset =
+            static_cast<uint>(x.device_offset / sizeof(float));
+
+        id<MTLCommandBuffer> shared_cmd =
+            [ssd_shared_compute_queue commandBuffer];
+        shared_cmd.label = @"mollm shared SSD expert";
+        id<MTLComputeCommandEncoder> shared_enc =
+            [shared_cmd computeCommandEncoder];
+        shared_enc.label = @"mollm shared expert";
+
+        QuantActParams xq{};
+        xq.M = seq;
+        xq.K = hidden;
+        xq.a_offset = params.hidden_offset;
+        xq.a_row_stride =
+            static_cast<int>(x.stride[1] / sizeof(float));
+        [shared_enc setComputePipelineState:pipeline("quantize_act_i8")];
+        [shared_enc setBuffer:x_buffer offset:0 atIndex:0];
+        [shared_enc setBuffer:qx offset:0 atIndex:2];
+        [shared_enc setBytes:&xq length:sizeof(xq) atIndex:3];
+        [shared_enc setBuffer:sx offset:0 atIndex:4];
+        [shared_enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+        [shared_enc dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+
+        [shared_enc setComputePipelineState:
+                        pipeline("moe_shared_gate_up_w4_i8")];
+        [shared_enc setBuffer:qx offset:0 atIndex:0];
+        [shared_enc setBuffer:gate_buffer offset:gate.device_offset atIndex:1];
+        [shared_enc setBuffer:hidden_values offset:0 atIndex:2];
+        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
+        [shared_enc
+            setBuffer:gate_buffer
+               offset:gate.device_offset +
+                      static_cast<size_t>(intermediate) * hidden / 2
+              atIndex:4];
+        [shared_enc setBuffer:up_buffer offset:up.device_offset atIndex:5];
+        [shared_enc
+            setBuffer:up_buffer
+               offset:up.device_offset +
+                      static_cast<size_t>(intermediate) * hidden / 2
+              atIndex:6];
+        [shared_enc setBuffer:sx offset:0 atIndex:7];
+        [shared_enc dispatchThreadgroups:MTLSizeMake(intermediate, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        [shared_enc setComputePipelineState:
+                        pipeline("moe_shared_scale_f16")];
+        [shared_enc setBuffer:x_buffer offset:0 atIndex:0];
+        [shared_enc setBuffer:scale_weight_buffer
+                       offset:scale_weight.device_offset
+                      atIndex:1];
+        [shared_enc setBuffer:scale offset:0 atIndex:2];
+        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
+        [shared_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+
+        QuantActParams iq{};
+        iq.M = 1;
+        iq.K = intermediate;
+        iq.a_row_stride = intermediate;
+        [shared_enc setComputePipelineState:pipeline("quantize_act_i8")];
+        [shared_enc setBuffer:hidden_values offset:0 atIndex:0];
+        [shared_enc setBuffer:qhidden offset:0 atIndex:2];
+        [shared_enc setBytes:&iq length:sizeof(iq) atIndex:3];
+        [shared_enc setBuffer:qhidden_scale offset:0 atIndex:4];
+        [shared_enc setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+        [shared_enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+
+        [shared_enc setComputePipelineState:
+                        pipeline("moe_shared_down_w4_i8")];
+        [shared_enc setBuffer:qhidden offset:0 atIndex:0];
+        [shared_enc setBuffer:down_buffer offset:down.device_offset atIndex:1];
+        [shared_enc setBuffer:output offset:0 atIndex:2];
+        [shared_enc setBytes:&params length:sizeof(params) atIndex:3];
+        [shared_enc
+            setBuffer:down_buffer
+               offset:down.device_offset +
+                      static_cast<size_t>(hidden) * intermediate / 2
+              atIndex:4];
+        [shared_enc setBuffer:scale offset:0 atIndex:5];
+        [shared_enc setBuffer:qhidden_scale offset:0 atIndex:6];
+        [shared_enc dispatchThreadgroups:MTLSizeMake(hidden, 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+        [shared_enc endEncoding];
+
+        work.ready_value = ++ssd_shared_compute_event_value;
+        [shared_cmd encodeSignalEvent:ssd_shared_compute_event
+                                value:work.ready_value];
+        const uint64_t start = mollm_trace::now_ns();
+        [shared_cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+            mollm_trace::record_duration(
+                "metal.ssd", "shared_expert", start,
+                mollm_trace::now_ns(),
+                "{\"layer\":" + std::to_string(layer) + "}",
+                "thread_state_running");
+        }];
+        [shared_cmd commit];
+        return true;
+    }
+
     id<MTLComputePipelineState> pipeline(const char* name) {
         std::string key(name);
         auto it = pipelines.find(key);
@@ -2886,6 +3055,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             void* predicted_tw_h = nullptr;
             size_t predicted_idx_bytes = 0;
             size_t predicted_tw_bytes = 0;
+            Impl::SsdSharedExpertWork shared_work;
             if (ssd_w4 && impl_->ssd_cross_layer_prefetch) {
                 auto next = impl_->ssd_moe_layers.find(
                     ssd_gate->spec.layer + 1);
@@ -2940,6 +3110,17 @@ void MetalBackend::dispatch(const GraphNode& node,
                     Precision::FP32, MemoryType::EXTERNAL,
                     hidden_size, seq, 1, 1,
                     const_cast<uint8_t*>(input_bytes));
+                if (has_shared &&
+                    !impl_->submit_ssd_shared_expert(
+                        x, *inputs[4], *inputs[5], *inputs[6], *inputs[7],
+                        hidden_size, shared_intermediate, seq,
+                        ssd_gate->spec.layer, shared_work)) {
+                    fprintf(stderr,
+                            "MetalBackend: unsupported shared expert "
+                            "weight format in layer %d\n",
+                            ssd_gate->spec.layer);
+                    break;
+                }
                 const uint64_t cpu_router_start =
                     mollm_trace::now_ns();
                 mollm::detail::MoeRoutingParams routing;
@@ -3095,184 +3276,22 @@ void MetalBackend::dispatch(const GraphNode& node,
                 id<MTLBuffer> qx = (__bridge id<MTLBuffer>)qx_h;
                 id<MTLBuffer> sx = (__bridge id<MTLBuffer>)sx_h;
                 bool x_quantized = false;
-                void* shared_qx_h = nullptr;
-                void* shared_sx_h = nullptr;
-                void* shared_inter_h = nullptr;
-                void* shared_qinter_h = nullptr;
-                void* shared_qinter_scale_h = nullptr;
-                void* shared_scale_h = nullptr;
-                void* shared_output_h = nullptr;
-                size_t shared_inter_bytes = 0;
-                size_t shared_qinter_bytes = 0;
-                size_t shared_output_bytes = 0;
-                id<MTLBuffer> shared_output = nil;
-                uint64_t shared_ready_value = 0;
-                if (has_shared) {
-                    const Tensor& shared_gate = *inputs[4];
-                    const Tensor& shared_up = *inputs[5];
-                    const Tensor& shared_down = *inputs[6];
-                    const Tensor& shared_scale_weight = *inputs[7];
-                    if (shared_gate.prec != Precision::INT4 ||
-                        shared_up.prec != Precision::INT4 ||
-                        shared_down.prec != Precision::INT4 ||
-                        shared_scale_weight.prec != Precision::FP16 ||
-                        !shared_gate.device_data || !shared_up.device_data ||
-                        !shared_down.device_data ||
-                        !shared_scale_weight.device_data) {
-                        fprintf(stderr,
-                                "MetalBackend: unsupported shared expert "
-                                "weight format in layer %d\n",
-                                ssd_gate->spec.layer);
-                        break;
-                    }
-                    shared_inter_bytes =
-                        (size_t)shared_intermediate * sizeof(float);
-                    shared_qinter_bytes =
-                        (size_t)shared_intermediate * sizeof(int8_t);
-                    shared_output_bytes =
-                        (size_t)hidden_size * sizeof(float);
-                    shared_inter_h =
-                        impl_->pool->acquire(shared_inter_bytes);
-                    shared_qinter_h =
-                        impl_->pool->acquire(shared_qinter_bytes);
-                    shared_qinter_scale_h =
-                        impl_->pool->acquire(sizeof(float));
-                    shared_scale_h = impl_->pool->acquire(sizeof(float));
-                    shared_output_h =
-                        impl_->pool->acquire(shared_output_bytes);
-                    id<MTLBuffer> shared_inter =
-                        (__bridge id<MTLBuffer>)shared_inter_h;
-                    shared_qx_h = impl_->pool->acquire(qx_bytes);
-                    shared_sx_h = impl_->pool->acquire(sx_bytes);
-                    id<MTLBuffer> shared_qx =
-                        (__bridge id<MTLBuffer>)shared_qx_h;
-                    id<MTLBuffer> shared_sx =
-                        (__bridge id<MTLBuffer>)shared_sx_h;
-                    id<MTLBuffer> shared_qinter =
-                        (__bridge id<MTLBuffer>)shared_qinter_h;
-                    id<MTLBuffer> shared_qinter_scale =
-                        (__bridge id<MTLBuffer>)shared_qinter_scale_h;
-                    id<MTLBuffer> shared_scale =
-                        (__bridge id<MTLBuffer>)shared_scale_h;
-                    shared_output =
-                        (__bridge id<MTLBuffer>)shared_output_h;
-                    MoeSharedW4Params smp{};
-                    smp.hidden = hidden_size;
-                    smp.intermediate = shared_intermediate;
-                    smp.gate_groups_per_row =
-                        (int)shared_gate.groups_per_row;
-                    smp.up_groups_per_row = (int)shared_up.groups_per_row;
-                    smp.down_groups_per_row =
-                        (int)shared_down.groups_per_row;
-                    smp.hidden_offset = (uint)eoffset(x);
-                    smp.output_offset = 0;
-
-                    id<MTLCommandBuffer> routed_cmd = impl_->cmd;
-                    impl_->cmd =
-                        [impl_->ssd_shared_compute_queue commandBuffer];
-                    impl_->cmd.label = @"mollm shared SSD expert";
-                    impl_->enc = [impl_->cmd computeCommandEncoder];
-                    impl_->enc.label = @"mollm shared expert";
-                    enc = impl_->enc;
-                    QuantActParams xq{};
-                    xq.M = seq;
-                    xq.K = hidden_size;
-                    xq.a_offset = (uint)eoffset(x);
-                    xq.a_row_stride = estride(x, 1);
-                    [enc setComputePipelineState:
-                             impl_->pipeline("quantize_act_i8")];
-                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                    [enc setBuffer:shared_qx offset:0 atIndex:2];
-                    [enc setBytes:&xq length:sizeof(xq) atIndex:3];
-                    [enc setBuffer:shared_sx offset:0 atIndex:4];
-                    [enc setThreadgroupMemoryLength:8 * sizeof(float)
-                                            atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-                    [enc setComputePipelineState:
-                             impl_->pipeline("moe_shared_gate_up_w4_i8")];
-                    [enc setBuffer:shared_qx offset:0 atIndex:0];
-                    [enc setBuffer:buf_of(&shared_gate)
-                            offset:shared_gate.device_offset
-                           atIndex:1];
-                    [enc setBuffer:shared_inter offset:0 atIndex:2];
-                    [enc setBytes:&smp length:sizeof(smp) atIndex:3];
-                    [enc setBuffer:buf_of(&shared_gate)
-                            offset:shared_gate.device_offset +
-                                   (size_t)shared_intermediate *
-                                       hidden_size / 2
-                           atIndex:4];
-                    [enc setBuffer:buf_of(&shared_up)
-                            offset:shared_up.device_offset
-                           atIndex:5];
-                    [enc setBuffer:buf_of(&shared_up)
-                            offset:shared_up.device_offset +
-                                   (size_t)shared_intermediate *
-                                       hidden_size / 2
-                           atIndex:6];
-                    [enc setBuffer:shared_sx offset:0 atIndex:7];
-                    [enc dispatchThreadgroups:
-                             MTLSizeMake(shared_intermediate, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-                    [enc setComputePipelineState:
-                             impl_->pipeline("moe_shared_scale_f16")];
-                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                    [enc setBuffer:buf_of(&shared_scale_weight)
-                            offset:shared_scale_weight.device_offset
-                           atIndex:1];
-                    [enc setBuffer:shared_scale offset:0 atIndex:2];
-                    [enc setBytes:&smp length:sizeof(smp) atIndex:3];
-                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-
-                    QuantActParams iq{};
-                    iq.M = 1;
-                    iq.K = shared_intermediate;
-                    iq.a_offset = 0;
-                    iq.a_row_stride = shared_intermediate;
-                    [enc setComputePipelineState:
-                             impl_->pipeline("quantize_act_i8")];
-                    [enc setBuffer:shared_inter offset:0 atIndex:0];
-                    [enc setBuffer:shared_qinter offset:0 atIndex:2];
-                    [enc setBytes:&iq length:sizeof(iq) atIndex:3];
-                    [enc setBuffer:shared_qinter_scale offset:0 atIndex:4];
-                    [enc setThreadgroupMemoryLength:8 * sizeof(float)
-                                            atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-
-                    [enc setComputePipelineState:
-                             impl_->pipeline("moe_shared_down_w4_i8")];
-                    [enc setBuffer:shared_qinter offset:0 atIndex:0];
-                    [enc setBuffer:buf_of(&shared_down)
-                            offset:shared_down.device_offset
-                           atIndex:1];
-                    [enc setBuffer:shared_output offset:0 atIndex:2];
-                    [enc setBytes:&smp length:sizeof(smp) atIndex:3];
-                    [enc setBuffer:buf_of(&shared_down)
-                            offset:shared_down.device_offset +
-                                   (size_t)hidden_size *
-                                       shared_intermediate / 2
-                           atIndex:4];
-                    [enc setBuffer:shared_scale offset:0 atIndex:5];
-                    [enc setBuffer:shared_qinter_scale offset:0 atIndex:6];
-                    [enc dispatchThreadgroups:MTLSizeMake(hidden_size, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
-                    [enc endEncoding];
-                    impl_->enc = nil;
-                    shared_ready_value =
-                        ++impl_->ssd_shared_compute_event_value;
-                    [impl_->cmd
-                        encodeSignalEvent:impl_->ssd_shared_compute_event
-                                    value:shared_ready_value];
-                    // Shared and routed experts are independent until their
-                    // outputs are combined. Run the shared expert on a second
-                    // compute queue while routed weights arrive and the routed
-                    // expert kernels execute.
-                    [impl_->cmd commit];
-                    impl_->cmd = routed_cmd;
-                }
+                void* shared_qx_h = shared_work.qx;
+                void* shared_sx_h = shared_work.sx;
+                void* shared_inter_h = shared_work.intermediate;
+                void* shared_qinter_h = shared_work.qintermediate;
+                void* shared_qinter_scale_h =
+                    shared_work.qintermediate_scale;
+                void* shared_scale_h = shared_work.scale;
+                void* shared_output_h = shared_work.output;
+                size_t shared_inter_bytes =
+                    shared_work.intermediate_bytes;
+                size_t shared_qinter_bytes =
+                    shared_work.qintermediate_bytes;
+                size_t shared_output_bytes = shared_work.output_bytes;
+                id<MTLBuffer> shared_output =
+                    (__bridge id<MTLBuffer>)shared_output_h;
+                uint64_t shared_ready_value = shared_work.ready_value;
                 const uint64_t completed_io =
                     impl_->ssd_io_event.signaledValue;
                 std::vector<int> ordered_selections;
