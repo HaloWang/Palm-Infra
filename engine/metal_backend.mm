@@ -76,6 +76,7 @@ struct MetalBackend::Impl {
         id<MTLBuffer> down = nil;
         size_t gate_up_offset = 0;
         size_t down_offset = 0;
+        uint64_t ready_value = 0;
     };
     id<MTLIOCommandQueue> ssd_io_queue = nil;
     id<MTLIOFileHandle> ssd_file = nil;
@@ -331,6 +332,7 @@ struct MetalBackend::Impl {
                 found->second.down,
                 found->second.gate_up_offset,
                 found->second.down_offset,
+                found->second.ready_value,
             });
         }
         return true;
@@ -3234,9 +3236,43 @@ void MetalBackend::dispatch(const GraphNode& node,
                     impl_->cmd = [impl_->queue commandBuffer];
                     impl_->cmd.label = @"mollm routed SSD experts";
                 }
-                if (experts_ready != 0) {
-                    [impl_->cmd encodeWaitForEvent:impl_->ssd_io_event
-                                            value:experts_ready];
+                const uint64_t completed_io =
+                    impl_->ssd_io_event.signaledValue;
+                std::vector<int> ordered_selections;
+                ordered_selections.reserve(selections);
+                for (int selection = 0; selection < selections;
+                     ++selection) {
+                    if (expert_views[selection].ready_value <=
+                        completed_io) {
+                        ordered_selections.push_back(selection);
+                    }
+                }
+                const int observed_ready =
+                    static_cast<int>(ordered_selections.size());
+                constexpr int kMinimumReadyToSplit = 4;
+                int ready_selections =
+                    observed_ready >= kMinimumReadyToSplit
+                        ? observed_ready
+                        : 0;
+                if (ready_selections == 0) {
+                    ordered_selections.clear();
+                    for (int selection = 0; selection < selections;
+                         ++selection) {
+                        ordered_selections.push_back(selection);
+                    }
+                    if (experts_ready != 0) {
+                        [impl_->cmd
+                            encodeWaitForEvent:impl_->ssd_io_event
+                                         value:experts_ready];
+                    }
+                } else {
+                    for (int selection = 0; selection < selections;
+                         ++selection) {
+                        if (expert_views[selection].ready_value >
+                            completed_io) {
+                            ordered_selections.push_back(selection);
+                        }
+                    }
                 }
                 impl_->enc = [impl_->cmd computeCommandEncoder];
                 impl_->enc.label = @"mollm Metal SSD expert";
@@ -3248,23 +3284,34 @@ void MetalBackend::dispatch(const GraphNode& node,
                     (size_t)selections * hidden_size * sizeof(float);
                 const size_t slot_offsets_bytes =
                     (size_t)selections * 2 * sizeof(uint64_t);
+                const size_t selection_indices_bytes =
+                    (size_t)selections * sizeof(uint32_t);
                 void* qi_h = impl_->pool->acquire(qi_bytes);
                 void* si_h = impl_->pool->acquire(si_bytes);
                 void* selected_h = impl_->pool->acquire(selected_bytes);
                 void* slot_offsets_h =
                     impl_->pool->acquire(slot_offsets_bytes);
+                void* selection_indices_h =
+                    impl_->pool->acquire(selection_indices_bytes);
                 id<MTLBuffer> qi = (__bridge id<MTLBuffer>)qi_h;
                 id<MTLBuffer> si = (__bridge id<MTLBuffer>)si_h;
                 id<MTLBuffer> selected =
                     (__bridge id<MTLBuffer>)selected_h;
                 id<MTLBuffer> slot_offsets =
                     (__bridge id<MTLBuffer>)slot_offsets_h;
+                id<MTLBuffer> selection_indices =
+                    (__bridge id<MTLBuffer>)selection_indices_h;
                 auto* slot_offsets_data = static_cast<uint64_t*>(
                     MetalBufferPool::contents(slot_offsets_h));
-                for (int selection = 0; selection < selections; ++selection) {
-                    slot_offsets_data[selection] =
+                auto* selection_indices_data = static_cast<uint32_t*>(
+                    MetalBufferPool::contents(selection_indices_h));
+                for (int ordered = 0; ordered < selections; ++ordered) {
+                    const int selection = ordered_selections[ordered];
+                    selection_indices_data[ordered] =
+                        static_cast<uint32_t>(selection);
+                    slot_offsets_data[ordered] =
                         expert_views[selection].gate_up_offset;
-                    slot_offsets_data[selections + selection] =
+                    slot_offsets_data[selections + ordered] =
                         expert_views[selection].down_offset;
                 }
 
@@ -3296,6 +3343,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                                           id<MTLBuffer> activation_scale,
                                           id<MTLBuffer> weight,
                                           size_t slot_offsets_offset,
+                                          size_t selection_indices_offset,
+                                          int group_selections,
                                           int N, int K,
                                           int groups_per_row,
                                           int activation_rows,
@@ -3303,7 +3352,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                           id<MTLBuffer> dst,
                                           int dst_stride) {
                     SelectedW4A8Params sp{};
-                    sp.selections = selections;
+                    sp.selections = group_selections;
                     sp.N = N;
                     sp.K = K;
                     sp.c_offset = 0;
@@ -3324,16 +3373,52 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:slot_offsets
                             offset:slot_offsets_offset
                            atIndex:6];
+                    [enc setBuffer:selection_indices
+                            offset:selection_indices_offset
+                           atIndex:7];
                     [enc dispatchThreadgroups:
-                             MTLSizeMake((N + 3) / 4, 1, selections)
+                             MTLSizeMake((N + 3) / 4, 1,
+                                         group_selections)
                         threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
                 };
 
-                selected_bg128(
-                    qx, sx, expert_views[0].gate_up, 0,
-                    2 * intermediate, hidden_size,
-                    ssd_gate->spec.groups_per_row, seq, top_k,
-                    merged, 2 * intermediate);
+                if (ready_selections > 0) {
+                    selected_bg128(
+                        qx, sx, expert_views[0].gate_up, 0, 0,
+                        ready_selections,
+                        2 * intermediate, hidden_size,
+                        ssd_gate->spec.groups_per_row, seq, top_k,
+                        merged, 2 * intermediate);
+                }
+                const int pending_selections =
+                    selections - ready_selections;
+                if (pending_selections > 0 &&
+                    ready_selections > 0) {
+                    [enc endEncoding];
+                    impl_->enc = nil;
+                    if (experts_ready != 0) {
+                        [impl_->cmd
+                            encodeWaitForEvent:impl_->ssd_io_event
+                                         value:experts_ready];
+                    }
+                    impl_->enc =
+                        [impl_->cmd computeCommandEncoder];
+                    impl_->enc.label =
+                        @"mollm pending Metal SSD expert";
+                    enc = impl_->enc;
+                }
+                if (pending_selections > 0) {
+                    selected_bg128(
+                        qx, sx, expert_views[0].gate_up,
+                        (size_t)ready_selections *
+                            sizeof(uint64_t),
+                        (size_t)ready_selections *
+                            sizeof(uint32_t),
+                        pending_selections,
+                        2 * intermediate, hidden_size,
+                        ssd_gate->spec.groups_per_row, seq, top_k,
+                        merged, 2 * intermediate);
+                }
 
                 [enc setComputePipelineState:
                          impl_->pipeline("moe_swiglu_selected")];
@@ -3341,7 +3426,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 const NSUInteger sw_n =
                     (NSUInteger)selections * intermediate;
-                [enc dispatchThreadgroups:MTLSizeMake((sw_n + 255) / 256, 1, 1)
+                [enc dispatchThreadgroups:
+                         MTLSizeMake((sw_n + 255) / 256, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 quantize(merged, 0, selections, intermediate,
                          2 * intermediate, qi, si);
@@ -3349,6 +3435,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 selected_bg128(
                     qi, si, expert_views[0].down,
                     (size_t)selections * sizeof(uint64_t),
+                    0, selections,
                     hidden_size, intermediate,
                     ssd_down->spec.groups_per_row, selections, 1,
                     selected, hidden_size);
@@ -3395,6 +3482,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                     {selected_h, selected_bytes});
                 impl_->pending_free.push_back(
                     {slot_offsets_h, slot_offsets_bytes});
+                impl_->pending_free.push_back(
+                    {selection_indices_h, selection_indices_bytes});
                 impl_->pending_free.push_back({idx_h, idx_bytes});
                 impl_->pending_free.push_back({tw_h, tw_bytes});
                 impl_->pending_free.push_back({logits_h, logits_bytes});

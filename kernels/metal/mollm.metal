@@ -1270,6 +1270,7 @@ kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
     device float* C [[buffer(2)]], constant SelectedW4A8Params& p [[buffer(3)]],
     device const float* SCALE_A [[buffer(4)]],
     device const ulong* weight_offsets [[buffer(6)]],
+    device const uint* selection_indices [[buffer(7)]],
     uint3 tg [[threadgroup_position_in_grid]],
     ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]]) {
@@ -1277,7 +1278,8 @@ kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
     const int row = (int)tg.x * 4 + (int)sg;
     if (sel >= p.selections || row >= p.N) return;
 
-    const int ar = sel / max(p.activation_repeat, 1);
+    const int output_sel = (int)selection_indices[sel];
+    const int ar = output_sel / max(p.activation_repeat, 1);
     device const int8_t* activation = A + (ulong)ar * p.K;
     device const uint8_t* weight = B + weight_offsets[sel];
     const int channel = row & 7;
@@ -1313,7 +1315,7 @@ kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
         }
     }
     if (lane == 0) {
-        C[p.c_offset + (ulong)sel * p.c_row_stride + row] =
+        C[p.c_offset + (ulong)output_sel * p.c_row_stride + row] =
             sum * SCALE_A[ar];
     }
 }
