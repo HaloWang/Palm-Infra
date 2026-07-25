@@ -70,6 +70,22 @@ MoeSsdCache::~MoeSsdCache() {
     if (fd_ >= 0) close(fd_);
 }
 
+bool MoeSsdCache::clear_resident() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!io_jobs_.empty() || !low_priority_io_jobs_.empty()) return false;
+    for (const auto& entry : entries_) {
+        if (entry->is_loading()) return false;
+    }
+    entries_.clear();
+    entry_locations_.clear();
+    layer_entries_.clear();
+    layer_resident_bytes_.clear();
+    pending_predictions_.clear();
+    resident_bytes_ = 0;
+    active_layer_ = -1;
+    return true;
+}
+
 void MoeSsdCache::stop_io_workers() {
     {
         std::lock_guard<std::mutex> lock(mutex_);

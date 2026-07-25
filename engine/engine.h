@@ -105,6 +105,9 @@ struct EngineConfig {
     // Expert buffers are anonymous memory. On macOS, wiring them prevents the
     // VM compressor from turning old cache hits into expensive decompressions.
     bool lock_moe_ssd_cache = kDefaultLockMoeSsdCache;
+    // Experimental full-Metal decode for SSD-offloaded MoE packages. Expert
+    // weights are loaded directly into Shared Metal buffers.
+    bool metal_ssd_full = false;
     // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
     std::string trace_path;
 

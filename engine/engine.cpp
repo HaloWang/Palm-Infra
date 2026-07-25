@@ -616,7 +616,8 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         // Small-M GPU kernels plus one GPU→CPU synchronization per MoE layer
         // lose to the CPU path. Drop dense Metal copies before CPU work so UMA
         // pressure cannot slow the SSD expert kernels.
-        release_metal_prefill_weights();
+        if (!cfg_.metal_ssd_full)
+            release_metal_prefill_weights();
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
@@ -634,8 +635,14 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
                                       exec_ctx_prefill_.backend);
             invalidate_workspace_key(exec_ctx_prefill_);
         }
-        if (!short_ssd_cpu_prefill)
+        if (!short_ssd_cpu_prefill && !cfg_.metal_ssd_full)
             release_metal_prefill_weights();
+        if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
+            !moe_ssd_cache_->clear_resident()) {
+            fprintf(stderr,
+                    "Engine: warning: CPU expert cache was still busy after "
+                    "prefill\n");
+        }
         exec_ctx_prefill_.backend = saved_prefill_backend;
     };
 
@@ -698,7 +705,8 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
         (n < metal_ssd_prefill_min_tokens() ||
          (!metal_weights_ready && !metal_ssd_reload_weights()));
     if (short_ssd_cpu_prefill) {
-        release_metal_prefill_weights();
+        if (!cfg_.metal_ssd_full)
+            release_metal_prefill_weights();
         release_graph_temporaries(graph_prefill_, saved_prefill_backend);
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
@@ -786,8 +794,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
                                   exec_ctx_prefill_.backend);
         invalidate_workspace_key(exec_ctx_prefill_);
     }
-    if (!short_ssd_cpu_prefill)
+    if (!short_ssd_cpu_prefill && !cfg_.metal_ssd_full)
         release_metal_prefill_weights();
+    if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
+        !moe_ssd_cache_->clear_resident()) {
+        fprintf(stderr,
+                "Engine: warning: CPU expert cache was still busy after "
+                "prefill\n");
+    }
     exec_ctx_prefill_.backend = saved_prefill_backend;
     return copied;
 }

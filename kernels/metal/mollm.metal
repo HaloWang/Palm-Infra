@@ -1259,7 +1259,7 @@ kernel void gemm_selected_w4a8_i8a_i4b_f32c(
             int ch=(int)(flatrow%8);device const float* bsc=(device const float*)(B+(nt*p.groups_per_row+g)*BG128_BYTES);
             facc[i]+=(float)si[i]*bsc[ch];}}threadgroup_barrier(mem_flags::mem_threadgroup);}
     int ar=sel/max(p.activation_repeat,1);
-    for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N)C[(ulong)sel*p.c_row_stride+gn]=facc[i]*SCALE_A[ar];}
+    for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N)C[p.c_offset+(ulong)sel*p.c_row_stride+gn]=facc[i]*SCALE_A[ar];}
 }
 #endif // MOLLM_METAL_TENSOR
 
@@ -1854,21 +1854,6 @@ kernel void gemv_w4_f32a_i4b_f32c(
     }
 }
 
-// Correctness-oriented fully-GPU MoE path for Qwen/Youtu W4-G128 experts.
-kernel void moe_router_logits_f16(
-    device const float* x [[buffer(0)]], device const half* router [[buffer(1)]],
-    device float* logits [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
-    threadgroup float* sh [[threadgroup(0)]], uint2 tg [[threadgroup_position_in_grid]],
-    ushort lane [[thread_index_in_simdgroup]], ushort sg [[simdgroup_index_in_threadgroup]],
-    ushort nsg [[simdgroups_per_threadgroup]]) {
-    int e=(int)tg.x,t=(int)tg.y;if(e>=p.experts||t>=p.seq_len)return;
-    device const float* a=x+p.hidden_offset+(ulong)t*p.hidden_row_stride;
-    device const half* w=router+(ulong)e*p.hidden;float sum=0.0f;
-    for(int h=(int)sg*32+(int)lane;h<p.hidden;h+=(int)nsg*32)sum+=a[h]*(float)w[h];
-    sum=simd_sum(sum);if(lane==0)sh[sg]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
-    if(sg==0){float z=lane<nsg?sh[lane]:0.0f;z=simd_sum(z);if(lane==0)logits[(ulong)t*p.experts+e]=z;}
-}
-
 kernel void moe_select_sigmoid(
     device const float* logits [[buffer(0)]], device int* top_idx [[buffer(1)]],
     device float* top_w [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
@@ -1888,6 +1873,45 @@ kernel void moe_select_sigmoid(
     float sum=0.0f;for(int k=0;k<p.top_k;k++){chosen[k]=1.0f/(1.0f+exp(-lp[indices[k]]));sum+=chosen[k];}
     float mul=p.routed_scale*((p.norm_topk&&sum>0.0f)?1.0f/sum:1.0f);
     for(int k=0;k<p.top_k;k++){top_idx[t*p.top_k+k]=indices[k];top_w[t*p.top_k+k]=chosen[k]*mul;}
+}
+
+kernel void moe_select_softmax(
+    device const float* logits [[buffer(0)]], device int* top_idx [[buffer(1)]],
+    device float* top_w [[buffer(2)]], constant MoeW4Params& p [[buffer(3)]],
+    uint t [[thread_position_in_grid]]) {
+    if (t >= (uint)p.seq_len) return;
+    device const float* lp = logits + (ulong)t * p.experts;
+    float chosen[16];
+    int indices[16];
+    for (int k = 0; k < p.top_k; ++k) {
+        chosen[k] = -INFINITY;
+        indices[k] = 0;
+    }
+    for (int e = 0; e < p.experts; ++e) {
+        const float value = lp[e];
+        for (int k = 0; k < p.top_k; ++k) {
+            if (value > chosen[k]) {
+                for (int j = p.top_k - 1; j > k; --j) {
+                    chosen[j] = chosen[j - 1];
+                    indices[j] = indices[j - 1];
+                }
+                chosen[k] = value;
+                indices[k] = e;
+                break;
+            }
+        }
+    }
+    const float maximum = chosen[0];
+    float sum = 0.0f;
+    for (int k = 0; k < p.top_k; ++k) {
+        chosen[k] = exp(chosen[k] - maximum);
+        sum += chosen[k];
+    }
+    const float inverse = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (int k = 0; k < p.top_k; ++k) {
+        top_idx[t * p.top_k + k] = indices[k];
+        top_w[t * p.top_k + k] = chosen[k] * inverse;
+    }
 }
 
 // Legacy fused router retained as a simple reference implementation.
@@ -1940,6 +1964,80 @@ inline float moe_w4_dot(device const float* a, device const uchar* w,
         if(lo>=8)lo-=16;if(hi>=8)hi-=16;int k=kb*2;
         sum += a[k]*(float)lo*scales[k/128] + a[k+1]*(float)hi*scales[(k+1)/128];}
     return simd_sum(sum);
+}
+
+// Dense W4 weights are decoded once by wrap_weight_int4_g128(). It flips each
+// nibble's sign bit, so the Metal-side representation is offset-binary [0,15]
+// with zero at 8 rather than native two's-complement int4.
+inline float moe_w4_dot_offset_binary(
+    device const float* a, device const uchar* w,
+    device const float* scales, int K, ushort lane) {
+    float sum = 0.0f;
+    for (int kb = (int)lane; kb < K / 2; kb += 32) {
+        const uchar q = w[kb];
+        const int k = kb * 2;
+        sum += a[k] * ((float)(q & 15) - 8.0f) * scales[k / 128];
+        sum += a[k + 1] * ((float)(q >> 4) - 8.0f) *
+               scales[(k + 1) / 128];
+    }
+    return simd_sum(sum);
+}
+
+kernel void moe_shared_gate_up_w4(
+    device const float* x [[buffer(0)]],
+    device const uchar* gate_w [[buffer(1)]],
+    device float* inter [[buffer(2)]],
+    constant MoeSharedW4Params& p [[buffer(3)]],
+    device const float* gate_scales [[buffer(4)]],
+    device const uchar* up_w [[buffer(5)]],
+    device const float* up_scales [[buffer(6)]],
+    uint row [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    if (row >= (uint)p.intermediate) return;
+    device const float* hidden = x + p.hidden_offset;
+    float gate = moe_w4_dot_offset_binary(
+        hidden, gate_w + (ulong)row * (p.hidden / 2),
+        gate_scales + (ulong)row * p.gate_groups_per_row,
+        p.hidden, lane);
+    float up = moe_w4_dot_offset_binary(
+        hidden, up_w + (ulong)row * (p.hidden / 2),
+        up_scales + (ulong)row * p.up_groups_per_row,
+        p.hidden, lane);
+    if (lane == 0)
+        inter[row] = (gate / (1.0f + exp(-gate))) * up;
+}
+
+kernel void moe_shared_scale_f16(
+    device const float* x [[buffer(0)]],
+    device const half* weight [[buffer(1)]],
+    device float* scale [[buffer(2)]],
+    constant MoeSharedW4Params& p [[buffer(3)]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    float sum = 0.0f;
+    device const float* hidden = x + p.hidden_offset;
+    for (int k = lane; k < p.hidden; k += 32)
+        sum += hidden[k] * (float)weight[k];
+    sum = simd_sum(sum);
+    if (lane == 0)
+        scale[0] = 1.0f / (1.0f + exp(-sum));
+}
+
+kernel void moe_shared_down_add_w4(
+    device const float* inter [[buffer(0)]],
+    device const uchar* down_w [[buffer(1)]],
+    device float* output [[buffer(2)]],
+    constant MoeSharedW4Params& p [[buffer(3)]],
+    device const float* down_scales [[buffer(4)]],
+    device const float* scale [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]]) {
+    if (row >= (uint)p.hidden) return;
+    float value = moe_w4_dot_offset_binary(
+        inter, down_w + (ulong)row * (p.intermediate / 2),
+        down_scales + (ulong)row * p.down_groups_per_row,
+        p.intermediate, lane);
+    if (lane == 0)
+        output[p.output_offset + row] += value * scale[0];
 }
 
 kernel void moe_gate_up_w4(

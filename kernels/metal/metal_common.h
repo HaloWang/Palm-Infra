@@ -114,6 +114,7 @@ struct SelectedW4A8Params {
     int selections;
     int N;
     int K;
+    int c_offset;
     int c_row_stride;
     int group_size;
     int groups_per_row;
@@ -292,6 +293,16 @@ struct MoeW4Params {
     int output_row_stride;
     int gu_groups_per_row;
     int down_groups_per_row;
+};
+
+struct MoeSharedW4Params {
+    int hidden;
+    int intermediate;
+    int gate_groups_per_row;
+    int up_groups_per_row;
+    int down_groups_per_row;
+    uint hidden_offset;
+    uint output_offset;
 };
 
 // Fused Gated Delta Rule (GDN) linear-attention core for Qwen3.5.

@@ -274,6 +274,29 @@ int main() {
               "global pool evicts one layer-zero LRU entry");
     }
 
+    // A backend handoff may discard CPU-resident payloads while retaining the
+    // registered package sources and I/O workers for later prefill calls.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16, 1), "open clear-resident cache");
+        check(cache.add_source(spec("clear_gate", 0)) &&
+              cache.add_source(spec("clear_down", 6 * sizeof(uint16_t))),
+              "add clear-resident sources");
+        const MoeSsdTensorSource* gate = cache.find_source("clear_gate");
+        const MoeSsdTensorSource* down = cache.find_source("clear_down");
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "populate clear-resident cache");
+        check(cache.stats().resident_bytes == 8,
+              "clear-resident cache is populated");
+        check(cache.clear_resident(), "clear completed expert payloads");
+        check(cache.stats().resident_bytes == 0 &&
+              !cache.contains(gate, down, 0),
+              "clear removes residency but keeps source lookup valid");
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "reload after clear-resident");
+    }
+
     // Cross-layer prediction feedback trims only a consistently inaccurate
     // tail rank. Use a zero-entry prefetch window so this test exercises the
     // policy without generating irrelevant I/O.

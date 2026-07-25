@@ -35,6 +35,7 @@ struct CliCommonOptions {
     bool ssd_cross_layer_prefetch = true;   // next-layer predictor (with global pool)
     int ssd_shallow_cache_layers = 0;  // early MoE layers with priority cache quota
     bool ssd_global_cache = true;   // dynamically shared cache capacity across layers
+    bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
 
     // Sampling

@@ -71,6 +71,11 @@ public:
     /// True when hybrid copy mode currently owns at least one dense weight.
     bool has_weight_copies() const;
 
+    /// Configure the full-Metal SSD expert cache. Metal I/O loads package
+    /// ranges directly into Shared buffers consumed by routed-expert kernels.
+    bool configure_moe_ssd_io(const std::string& package_path,
+                              size_t capacity_bytes, int max_commands_in_flight);
+
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).
     void wrap_weight(Tensor& t);

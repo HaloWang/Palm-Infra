@@ -173,6 +173,10 @@ public:
 
     size_t capacity_bytes() const { return capacity_bytes_; }
     size_t layer_capacity_bytes(int layer) const;
+    // Release completed expert payloads while keeping source metadata, worker
+    // threads, and statistics alive. Used when decode switches to a separate
+    // Metal-resident expert cache after CPU prefill.
+    bool clear_resident();
     Stats stats() const;
     void reset_stats();
 

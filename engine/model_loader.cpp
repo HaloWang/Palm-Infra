@@ -642,6 +642,13 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    if (cfg_.metal_ssd_full &&
+        (cfg_.device != Device::METAL || cfg_.moe_ssd_cache_bytes == 0)) {
+        fprintf(stderr,
+                "Engine: --metal-ssd-full requires --device metal and "
+                "--ssd-cache-mb\n");
+        return false;
+    }
     mollm_trace::start(cfg_.trace_path);
     mollm_trace::set_thread_name("main");
     if (cfg_.moe_ssd_cache_bytes != 0) {
@@ -656,7 +663,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.trace_label = "decode";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
     exec_ctx_decode_.moe_cross_layer_prefetch =
-        cfg_.moe_ssd_global_cache && cfg_.moe_ssd_cross_layer_prefetch;
+        !cfg_.metal_ssd_full && cfg_.moe_ssd_global_cache &&
+        cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
     metal_backend_.reset();
@@ -675,7 +683,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             // layer throttles the routed matmuls on UMA. Keep Metal for the
             // large prefill matrices and use the established CPU SSD pipeline
             // (including cross-layer prefetch) for token generation.
-            exec_ctx_decode_.backend = cfg_.moe_ssd_cache_bytes != 0
+            exec_ctx_decode_.backend =
+                cfg_.moe_ssd_cache_bytes != 0 && !cfg_.metal_ssd_full
                 ? static_cast<Backend*>(&cpu_backend_)
                 : metal_backend_.get();
             // The Metal backend wraps the weight region via
@@ -728,9 +737,21 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     if (metal_backend_ && package_weights_base_ && package_weights_size_) {
         if (moe_ssd_cache_) {
             as_metal(metal_backend_)->enable_weight_copy_mode();
-            fprintf(stderr,
-                    "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
-                    "prefill and uses CPU decode; experts remain mmap-backed\n");
+            if (cfg_.metal_ssd_full) {
+                if (!as_metal(metal_backend_)
+                         ->configure_moe_ssd_io(
+                             cfg_.package_path, cfg_.moe_ssd_cache_bytes,
+                             cfg_.moe_ssd_io_workers)) {
+                    return false;
+                }
+                fprintf(stderr,
+                        "Engine: full-Metal SSD decode enabled; experts load "
+                        "directly into Shared Metal buffers\n");
+            } else {
+                fprintf(stderr,
+                        "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
+                        "prefill and uses CPU decode; experts remain mmap-backed\n");
+            }
         } else {
             if (!as_metal(metal_backend_)
                      ->register_weight_region(

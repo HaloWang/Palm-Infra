@@ -144,6 +144,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             opts.ssd_global_cache = true;
         } else if (arg == "--no-ssd-global-cache") {
             opts.ssd_global_cache = false;
+        } else if (arg == "--metal-ssd-full") {
+            opts.metal_ssd_full = true;
         } else if (arg == "--trace") {
             if (!require_value(argc, argv, i, "--trace", value, error)) return false;
             opts.trace_path = value;
@@ -240,6 +242,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --ssd-shallow-cache-layers <int>  Favor the first N MoE layers in the RAM cache\n");
     std::printf("  --ssd-global-cache      Shared capacity pool across MoE layers (default)\n");
     std::printf("  --no-ssd-global-cache   Use legacy equal per-layer cache (also disables prefetch)\n");
+    std::printf("  --metal-ssd-full        Experimental full-Metal decode with direct Metal I/O\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
@@ -279,6 +282,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
                                          opts.ssd_cross_layer_prefetch;
     cfg.moe_ssd_shallow_cache_layers = opts.ssd_shallow_cache_layers;
     cfg.moe_ssd_global_cache = opts.ssd_global_cache;
+    cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
     cfg.lock_dense_weights = opts.lock_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;

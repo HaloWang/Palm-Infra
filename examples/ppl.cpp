@@ -28,6 +28,7 @@ struct Options {
     bool prepend_bos = false;
     bool tokenize_only = false;
     bool decode_token_by_token = false;
+    bool metal_ssd_full = false;
     Device device = Device::CPU;
 };
 
@@ -59,6 +60,7 @@ void print_usage(const char* argv0) {
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
+    std::printf("  --metal-ssd-full      Experimental full-Metal SSD decode\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --dump-token-loss <path.csv>  Write position,target,CE rows\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
@@ -140,6 +142,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
                 error = "invalid value for --ssd-io-workers";
                 return false;
             }
+        } else if (arg == "--metal-ssd-full") {
+            opts.metal_ssd_full = true;
         } else if (arg == "--trace") {
             if (!require_value("--trace", value)) return false;
             opts.trace_path = value;
@@ -226,6 +230,7 @@ int main(int argc, char** argv) {
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
+    cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
     cfg.device = opts.device;
     if (!engine.load(cfg)) {
