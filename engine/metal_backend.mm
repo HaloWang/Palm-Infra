@@ -81,6 +81,7 @@ struct MetalBackend::Impl {
     id<MTLIOFileHandle> ssd_file = nil;
     id<MTLSharedEvent> ssd_io_event = nil;
     uint64_t ssd_io_event_value = 0;
+    bool ssd_cross_layer_prefetch = true;
     std::unordered_map<uint64_t, SsdExpertBuffers> ssd_experts;
     id<MTLBuffer> ssd_arena = nil;
     size_t ssd_slot_bytes = 0;
@@ -784,7 +785,8 @@ bool MetalBackend::has_weight_copies() const {
 
 bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
                                         size_t capacity_bytes,
-                                        int max_commands_in_flight) {
+                                        int max_commands_in_flight,
+                                        bool cross_layer_prefetch) {
     if (!impl_->ok || package_path.empty() || capacity_bytes == 0)
         return false;
     if (@available(macOS 13.0, *)) {
@@ -819,6 +821,7 @@ bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
             return false;
         }
         impl_->ssd_capacity_bytes = capacity_bytes;
+        impl_->ssd_cross_layer_prefetch = cross_layer_prefetch;
         impl_->ssd_experts.reserve(
             std::min<size_t>(capacity_bytes / (1024 * 1024), 8192));
         fprintf(stderr,
@@ -2814,7 +2817,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             size_t predicted_idx_bytes = 0;
             size_t predicted_tw_bytes = 0;
             size_t predicted_logits_bytes = 0;
-            if (ssd_w4) {
+            if (ssd_w4 && impl_->ssd_cross_layer_prefetch) {
                 auto next = impl_->ssd_moe_layers.find(
                     ssd_gate->spec.layer + 1);
                 if (next != impl_->ssd_moe_layers.end() &&
@@ -2961,8 +2964,33 @@ void MetalBackend::dispatch(const GraphNode& node,
                 // Metal I/O; expert compute resumes in a fresh command buffer.
                 [enc endEncoding];
                 impl_->enc = nil;
+                const uint64_t prefix_wait_start =
+                    mollm_trace::now_ns();
                 [impl_->cmd commit];
                 [impl_->cmd waitUntilCompleted];
+                const uint64_t prefix_wait_end =
+                    mollm_trace::now_ns();
+                mollm_trace::record_duration(
+                    "metal.ssd", "prefix_wait", prefix_wait_start,
+                    prefix_wait_end,
+                    "{\"layer\":" +
+                        std::to_string(ssd_gate->spec.layer) + "}",
+                    "thread_state_iowait");
+                const double gpu_seconds =
+                    impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime;
+                if (gpu_seconds > 0.0 && prefix_wait_end != 0) {
+                    const uint64_t gpu_ns =
+                        static_cast<uint64_t>(gpu_seconds * 1e9);
+                    mollm_trace::record_duration(
+                        "metal.ssd", "prefix_gpu",
+                        prefix_wait_end > gpu_ns
+                            ? prefix_wait_end - gpu_ns
+                            : 0,
+                        prefix_wait_end,
+                        "{\"layer\":" +
+                            std::to_string(ssd_gate->spec.layer) + "}",
+                        "thread_state_running");
+                }
                 if (impl_->cmd.status == MTLCommandBufferStatusError) {
                     NSError* e = impl_->cmd.error;
                     fprintf(stderr,
@@ -2979,6 +3007,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                          exact_routes + seq * top_k);
                 std::vector<Impl::SsdExpertView> expert_views;
                 uint64_t experts_ready = 0;
+                const uint64_t demand_start = mollm_trace::now_ns();
                 if (!impl_->acquire_ssd_experts(
                         ssd_gate->spec, ssd_down->spec, experts,
                         expert_views, experts_ready)) {
@@ -2988,6 +3017,12 @@ void MetalBackend::dispatch(const GraphNode& node,
                             ssd_gate->spec.layer);
                     break;
                 }
+                mollm_trace::record_duration(
+                    "metal.ssd", "demand_schedule", demand_start,
+                    mollm_trace::now_ns(),
+                    "{\"layer\":" +
+                        std::to_string(ssd_gate->spec.layer) + "}",
+                    "good");
 
                 if (predicted_layer) {
                     const int* predicted_routes =
@@ -3002,11 +3037,21 @@ void MetalBackend::dispatch(const GraphNode& node,
                     // Demand I/O was submitted first. This speculative command
                     // waits behind it on the I/O queue, then overlaps the
                     // current layer's expert compute.
+                    const uint64_t prefetch_start =
+                        mollm_trace::now_ns();
                     impl_->acquire_ssd_experts(
                         predicted_layer->gate_up->spec,
                         predicted_layer->down->spec,
                         predicted_experts, predicted_views,
                         predicted_ready, true);
+                    mollm_trace::record_duration(
+                        "metal.ssd", "prefetch_schedule", prefetch_start,
+                        mollm_trace::now_ns(),
+                        "{\"layer\":" +
+                            std::to_string(
+                                predicted_layer->gate_up->spec.layer) +
+                            "}",
+                        "rail_load");
                     impl_->pool->release(
                         predicted_idx_h, predicted_idx_bytes);
                     impl_->pool->release(

@@ -741,7 +741,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 if (!as_metal(metal_backend_)
                          ->configure_moe_ssd_io(
                              cfg_.package_path, cfg_.moe_ssd_cache_bytes,
-                             cfg_.moe_ssd_io_workers)) {
+                             cfg_.moe_ssd_io_workers,
+                             cfg_.moe_ssd_cross_layer_prefetch)) {
                     return false;
                 }
                 fprintf(stderr,
