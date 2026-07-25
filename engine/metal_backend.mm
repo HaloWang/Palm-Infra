@@ -82,6 +82,9 @@ struct MetalBackend::Impl {
     id<MTLIOFileHandle> ssd_file = nil;
     id<MTLSharedEvent> ssd_io_event = nil;
     uint64_t ssd_io_event_value = 0;
+    id<MTLCommandQueue> ssd_shared_compute_queue = nil;
+    id<MTLSharedEvent> ssd_shared_compute_event = nil;
+    uint64_t ssd_shared_compute_event_value = 0;
     bool ssd_cross_layer_prefetch = true;
     std::unordered_map<uint64_t, SsdExpertBuffers> ssd_experts;
     id<MTLBuffer> ssd_arena = nil;
@@ -813,13 +816,18 @@ bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
             impl_->ssd_file = [impl_->device newIOHandleWithURL:url
                                                            error:&error];
         impl_->ssd_io_event = [impl_->device newSharedEvent];
+        impl_->ssd_shared_compute_queue = [impl_->device newCommandQueue];
+        impl_->ssd_shared_compute_event = [impl_->device newSharedEvent];
         if (!impl_->ssd_io_queue || !impl_->ssd_file ||
-            !impl_->ssd_io_event) {
+            !impl_->ssd_io_event || !impl_->ssd_shared_compute_queue ||
+            !impl_->ssd_shared_compute_event) {
             fprintf(stderr, "MetalBackend: Metal SSD I/O setup failed: %s\n",
                     error ? error.localizedDescription.UTF8String : "?");
             impl_->ssd_io_queue = nil;
             impl_->ssd_file = nil;
             impl_->ssd_io_event = nil;
+            impl_->ssd_shared_compute_queue = nil;
+            impl_->ssd_shared_compute_event = nil;
             return false;
         }
         impl_->ssd_capacity_bytes = capacity_bytes;
@@ -3073,6 +3081,8 @@ void MetalBackend::dispatch(const GraphNode& node,
                 id<MTLBuffer> qx = (__bridge id<MTLBuffer>)qx_h;
                 id<MTLBuffer> sx = (__bridge id<MTLBuffer>)sx_h;
                 bool x_quantized = false;
+                void* shared_qx_h = nullptr;
+                void* shared_sx_h = nullptr;
                 void* shared_inter_h = nullptr;
                 void* shared_qinter_h = nullptr;
                 void* shared_qinter_scale_h = nullptr;
@@ -3082,6 +3092,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 size_t shared_qinter_bytes = 0;
                 size_t shared_output_bytes = 0;
                 id<MTLBuffer> shared_output = nil;
+                uint64_t shared_ready_value = 0;
                 if (has_shared) {
                     const Tensor& shared_gate = *inputs[4];
                     const Tensor& shared_up = *inputs[5];
@@ -3117,6 +3128,12 @@ void MetalBackend::dispatch(const GraphNode& node,
                         impl_->pool->acquire(shared_output_bytes);
                     id<MTLBuffer> shared_inter =
                         (__bridge id<MTLBuffer>)shared_inter_h;
+                    shared_qx_h = impl_->pool->acquire(qx_bytes);
+                    shared_sx_h = impl_->pool->acquire(sx_bytes);
+                    id<MTLBuffer> shared_qx =
+                        (__bridge id<MTLBuffer>)shared_qx_h;
+                    id<MTLBuffer> shared_sx =
+                        (__bridge id<MTLBuffer>)shared_sx_h;
                     id<MTLBuffer> shared_qinter =
                         (__bridge id<MTLBuffer>)shared_qinter_h;
                     id<MTLBuffer> shared_qinter_scale =
@@ -3136,6 +3153,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                     smp.hidden_offset = (uint)eoffset(x);
                     smp.output_offset = 0;
 
+                    id<MTLCommandBuffer> routed_cmd = impl_->cmd;
+                    impl_->cmd =
+                        [impl_->ssd_shared_compute_queue commandBuffer];
+                    impl_->cmd.label = @"mollm shared SSD expert";
                     impl_->enc = [impl_->cmd computeCommandEncoder];
                     impl_->enc.label = @"mollm shared expert";
                     enc = impl_->enc;
@@ -3147,18 +3168,16 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setComputePipelineState:
                              impl_->pipeline("quantize_act_i8")];
                     [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                    [enc setBuffer:qx offset:0 atIndex:2];
+                    [enc setBuffer:shared_qx offset:0 atIndex:2];
                     [enc setBytes:&xq length:sizeof(xq) atIndex:3];
-                    [enc setBuffer:sx offset:0 atIndex:4];
+                    [enc setBuffer:shared_sx offset:0 atIndex:4];
                     [enc setThreadgroupMemoryLength:8 * sizeof(float)
                                             atIndex:0];
                     [enc dispatchThreadgroups:MTLSizeMake(seq, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
-                    x_quantized = true;
-
                     [enc setComputePipelineState:
                              impl_->pipeline("moe_shared_gate_up_w4_i8")];
-                    [enc setBuffer:qx offset:0 atIndex:0];
+                    [enc setBuffer:shared_qx offset:0 atIndex:0];
                     [enc setBuffer:buf_of(&shared_gate)
                             offset:shared_gate.device_offset
                            atIndex:1];
@@ -3177,7 +3196,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                                    (size_t)shared_intermediate *
                                        hidden_size / 2
                            atIndex:6];
-                    [enc setBuffer:sx offset:0 atIndex:7];
+                    [enc setBuffer:shared_sx offset:0 atIndex:7];
                     [enc dispatchThreadgroups:
                              MTLSizeMake(shared_intermediate, 1, 1)
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
@@ -3228,13 +3247,17 @@ void MetalBackend::dispatch(const GraphNode& node,
                         threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
                     [enc endEncoding];
                     impl_->enc = nil;
-                    // Submit the independent shared expert immediately. Metal
-                    // I/O is already running on its own queue; the routed
-                    // command below waits for that I/O without stalling this
-                    // shared-expert command.
+                    shared_ready_value =
+                        ++impl_->ssd_shared_compute_event_value;
+                    [impl_->cmd
+                        encodeSignalEvent:impl_->ssd_shared_compute_event
+                                    value:shared_ready_value];
+                    // Shared and routed experts are independent until their
+                    // outputs are combined. Run the shared expert on a second
+                    // compute queue while routed weights arrive and the routed
+                    // expert kernels execute.
                     [impl_->cmd commit];
-                    impl_->cmd = [impl_->queue commandBuffer];
-                    impl_->cmd.label = @"mollm routed SSD experts";
+                    impl_->cmd = routed_cmd;
                 }
                 const uint64_t completed_io =
                     impl_->ssd_io_event.signaledValue;
@@ -3451,6 +3474,14 @@ void MetalBackend::dispatch(const GraphNode& node,
                     threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
 
                 if (has_shared) {
+                    [enc endEncoding];
+                    impl_->enc = nil;
+                    [impl_->cmd
+                        encodeWaitForEvent:impl_->ssd_shared_compute_event
+                                   value:shared_ready_value];
+                    impl_->enc = [impl_->cmd computeCommandEncoder];
+                    impl_->enc.label = @"mollm combine SSD experts";
+                    enc = impl_->enc;
                     const uint count = (uint)hidden_size;
                     [enc setComputePipelineState:
                              impl_->pipeline("add_inplace_f32")];
@@ -3464,6 +3495,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                         threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                     impl_->pending_free.push_back(
                         {shared_inter_h, shared_inter_bytes});
+                    impl_->pending_free.push_back(
+                        {shared_qx_h, qx_bytes});
+                    impl_->pending_free.push_back(
+                        {shared_sx_h, sx_bytes});
                     impl_->pending_free.push_back(
                         {shared_qinter_h, shared_qinter_bytes});
                     impl_->pending_free.push_back(
