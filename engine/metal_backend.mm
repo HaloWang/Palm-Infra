@@ -563,12 +563,23 @@ struct MetalBackend::Impl {
         [shared_cmd encodeSignalEvent:ssd_shared_compute_event
                                 value:work.ready_value];
         const uint64_t start = mollm_trace::now_ns();
-        [shared_cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
+        [shared_cmd addCompletedHandler:^(id<MTLCommandBuffer> completed) {
+            const uint64_t end = mollm_trace::now_ns();
+            const std::string args =
+                "{\"layer\":" + std::to_string(layer) + "}";
             mollm_trace::record_duration(
-                "metal.ssd", "shared_expert", start,
-                mollm_trace::now_ns(),
-                "{\"layer\":" + std::to_string(layer) + "}",
+                "metal.ssd", "shared_expert", start, end, args,
                 "thread_state_running");
+            const double gpu_seconds =
+                completed.GPUEndTime - completed.GPUStartTime;
+            if (gpu_seconds > 0.0 && end != 0) {
+                const uint64_t gpu_ns =
+                    static_cast<uint64_t>(gpu_seconds * 1e9);
+                mollm_trace::record_duration(
+                    "metal.ssd", "shared_expert_gpu",
+                    end > gpu_ns ? end - gpu_ns : 0, end, args,
+                    "thread_state_running");
+            }
         }];
         [shared_cmd commit];
         return true;
