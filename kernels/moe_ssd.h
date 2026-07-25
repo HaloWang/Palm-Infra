@@ -165,6 +165,13 @@ public:
                   const MoeSsdTensorSource* down,
                   int expert) const;
 
+    // Unlike contains(), this is false while an asynchronous read is still
+    // in flight. It lets compute choose an optimization that must borrow
+    // several already-materialized expert pairs without introducing I/O wait.
+    bool is_ready(const MoeSsdTensorSource* gate_up,
+                  const MoeSsdTensorSource* down,
+                  int expert) const;
+
     // Drop a pair once its borrowed Tensor views are no longer in use. This
     // lets a small cache slide its async prefetch window forward.
     bool release(const MoeSsdTensorSource* gate_up,

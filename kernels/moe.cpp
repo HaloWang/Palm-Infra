@@ -578,6 +578,138 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     std::vector<float> routed_inter((size_t)max_count * (size_t)intermediate_size);
     std::vector<float> down_out((size_t)max_count * (size_t)hidden_size);
 
+    // Batch whichever decode experts are already materialized in RAM. Each
+    // GEMV remains sharded across the full thread pool, while the batch pays
+    // one dispatch barrier instead of one per expert. Experts still loading
+    // are deliberately excluded: their reads continue in parallel with this
+    // work and fall through to the streaming path below. Results are scattered
+    // later in expert-id order, preserving the original accumulation order.
+    std::vector<int> batched_experts;
+    std::vector<int> batched_slots;
+    std::vector<float> batch_down_out;
+    const bool can_batch_ready_decode =
+        use_ssd && seq_len == 1 && thread_pool &&
+        thread_pool->num_threads() > 1 && selected_experts.size() > 1;
+    if (can_batch_ready_decode) {
+        batched_slots.assign(num_experts, -1);
+        for (int expert : selected_experts) {
+            if (counts[expert] == 1 &&
+                gate_up_source->cache->is_ready(
+                    gate_up_source, down_source, expert)) {
+                batched_experts.push_back(expert);
+            }
+        }
+    }
+    if (batched_experts.size() > 1) {
+        const size_t batch = batched_experts.size();
+        std::vector<Tensor> gate_up_weights(batch);
+        std::vector<Tensor> down_weights(batch);
+        for (size_t i = 0; i < batch; ++i) {
+            if (!gate_up_source->cache->acquire(
+                    gate_up_source, down_source, batched_experts[i],
+                    gate_up_weights[i], down_weights[i])) {
+                std::fprintf(stderr, "MOE: failed to page in expert %d\n",
+                             batched_experts[i]);
+                return;
+            }
+            batched_slots[batched_experts[i]] = (int)i;
+        }
+
+        std::vector<float> batch_gate_up_out(
+            batch * (size_t)(2 * intermediate_size));
+        std::vector<float> batch_inter(
+            batch * (size_t)intermediate_size);
+        batch_down_out.resize(batch * (size_t)hidden_size);
+        Tensor hidden_one = make_fp32_tensor(
+            const_cast<float*>(x_data), hidden_size, 1);
+        std::vector<Tensor> gate_inputs(batch, hidden_one);
+        std::vector<Tensor> gate_outputs;
+        gate_outputs.reserve(batch);
+        for (size_t i = 0; i < batch; ++i) {
+            gate_outputs.push_back(make_fp32_tensor(
+                batch_gate_up_out.data() +
+                    i * (size_t)(2 * intermediate_size),
+                2 * intermediate_size, 1));
+        }
+
+        const std::string batch_trace_args =
+            mollm_trace::enabled()
+                ? "{\"layer\":" +
+                      std::to_string(gate_up_source->spec.layer) +
+                      ",\"experts\":" + std::to_string(batch) + "}"
+                : std::string();
+        if (profile) stage_start = moe_profile_now();
+        {
+            mollm_trace::ScopedEvent trace_batch(
+                "compute", "moe.routed_gate_up_batch", batch_trace_args);
+            if (!kernel_matmul_int4_gemv_batch(
+                    gate_inputs, gate_up_weights, gate_outputs, thread_pool)) {
+                for (size_t i = 0; i < batch; ++i) {
+                    kernel_matmul_fp32(
+                        gate_inputs[i], gate_up_weights[i], gate_outputs[i],
+                        thread_pool);
+                }
+            }
+            for (size_t i = 0; i < batch; ++i) {
+                float* gate_up = batch_gate_up_out.data() +
+                    i * (size_t)(2 * intermediate_size);
+                apply_swiglu(
+                    gate_up, gate_up + intermediate_size,
+                    batch_inter.data() + i * (size_t)intermediate_size,
+                    1, intermediate_size, 2 * intermediate_size,
+                    2 * intermediate_size, intermediate_size);
+            }
+        }
+        if (profile)
+            moe_profile_add(MoeProfileStage::RoutedGateUp, stage_start);
+
+        std::vector<Tensor> down_inputs;
+        std::vector<Tensor> down_outputs;
+        down_inputs.reserve(batch);
+        down_outputs.reserve(batch);
+        for (size_t i = 0; i < batch; ++i) {
+            down_inputs.push_back(make_fp32_tensor(
+                batch_inter.data() + i * (size_t)intermediate_size,
+                intermediate_size, 1));
+            down_outputs.push_back(make_fp32_tensor(
+                batch_down_out.data() + i * (size_t)hidden_size,
+                hidden_size, 1));
+        }
+        if (profile) stage_start = moe_profile_now();
+        {
+            mollm_trace::ScopedEvent trace_batch(
+                "compute", "moe.routed_down_batch", batch_trace_args);
+            if (!kernel_matmul_int4_gemv_batch(
+                    down_inputs, down_weights, down_outputs, thread_pool)) {
+                for (size_t i = 0; i < batch; ++i) {
+                    kernel_matmul_fp32(
+                        down_inputs[i], down_weights[i], down_outputs[i],
+                        thread_pool);
+                }
+            }
+        }
+        if (profile)
+            moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
+    }
+
+    auto advance_stream_window = [&](int expert) {
+        if (!use_ssd || !stream_ssd_window) return;
+        gate_up_source->cache->release(
+            gate_up_source, down_source, expert);
+        auto next = std::upper_bound(
+            selected_experts.begin(), selected_experts.end(), expert);
+        for (; next != selected_experts.end(); ++next) {
+            if (!gate_up_source->cache->contains(
+                    gate_up_source, down_source, *next)) {
+                // Submit one exact replacement. Passing every remaining route
+                // could evict a nearer ready expert while reserving the tail.
+                gate_up_source->cache->request_many(
+                    gate_up_source, down_source, {*next});
+                break;
+            }
+        }
+    };
+
     for (int e = 0; e < num_experts; e++) {
         int count = counts[e];
         if (count == 0) continue;
@@ -588,6 +720,24 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                                 (use_ssd ? ",\"layer\":" +
                                                std::to_string(gate_up_source->spec.layer)
                                          : std::string()) + "}";
+        }
+        const int batched_slot =
+            batched_slots.empty() ? -1 : batched_slots[e];
+        if (batched_slot >= 0) {
+            if (profile) stage_start = moe_profile_now();
+            const int route = offsets[e];
+            const float weight = route_weights[route];
+            const float* src = batch_down_out.data() +
+                (size_t)batched_slot * hidden_size;
+            float* dst =
+                out_data + (int64_t)route_tokens[route] * ldo;
+            for (int d = 0; d < hidden_size; ++d)
+                dst[d] += weight * src[d];
+            if (profile)
+                moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
+
+            advance_stream_window(e);
+            continue;
         }
         if (profile) stage_start = moe_profile_now();
         {
@@ -669,20 +819,8 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (profile) moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
         }
 
-        if (use_ssd && stream_ssd_window) {
-            // Weight views are no longer used. Advance the bounded cache
-            // window immediately so this read overlaps the next ready expert.
-            gate_up_source->cache->release(gate_up_source, down_source, e);
-            auto next = std::upper_bound(selected_experts.begin(), selected_experts.end(), e);
-            for (; next != selected_experts.end(); ++next) {
-                if (!gate_up_source->cache->contains(gate_up_source, down_source, *next)) {
-                    // Submit one exact replacement. Passing every remaining
-                    // route would let request_many evict already-ready near
-                    // future experts while trying to reserve the far tail.
-                    gate_up_source->cache->request_many(gate_up_source, down_source, {*next});
-                    break;
-                }
-            }
-        }
+        // Weight views are no longer used. Advance a bounded cache immediately
+        // so its replacement read overlaps the next ready expert.
+        advance_stream_window(e);
     }
 }

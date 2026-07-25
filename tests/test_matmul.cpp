@@ -539,6 +539,87 @@ int main() {
         delete[] q4_g128;
     }
 
+    // Several independent expert GEMVs can share one thread-pool dispatch.
+    // Compare the batched path against the regular production kernel, including
+    // the common MoE gate/up case where every expert sees the same activation.
+    if (matmul_int4_q4dot_kernel_available()) {
+        constexpr int batch = 3;
+        constexpr int M = 1;
+        constexpr int K = 128;
+        constexpr int N = 64;
+        std::vector<float> input0(K), input1(K);
+        for (int k = 0; k < K; ++k) {
+            input0[k] = ((k * 7) % 29 - 14) * 0.015625f;
+            input1[k] = ((k * 11) % 31 - 15) * 0.0125f;
+        }
+
+        std::vector<std::vector<uint8_t>> packed(
+            batch, std::vector<uint8_t>((size_t)N * K / 2, 0));
+        std::vector<std::vector<float>> scales(
+            batch, std::vector<float>(N));
+        std::vector<uint8_t*> q4dot(batch, nullptr);
+        std::vector<uint8_t*> bg128(batch, nullptr);
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs;
+        std::vector<Tensor> weights;
+        std::vector<Tensor> outputs;
+        inputs.reserve(batch);
+        weights.reserve(batch);
+        outputs.reserve(batch);
+        for (int i = 0; i < batch; ++i) {
+            for (int n = 0; n < N; ++n) {
+                scales[i][n] = 0.006f + 0.00025f * ((n + i) % 9);
+                for (int k = 0; k < K; ++k) {
+                    int q = ((n * 13 + k * 5 + i * 3) % 15) - 7;
+                    size_t index = (size_t)n * (K / 2) + k / 2;
+                    if (k & 1)
+                        packed[i][index] |= (uint8_t)((q & 15) << 4);
+                    else
+                        packed[i][index] |= (uint8_t)(q & 15);
+                }
+            }
+            q4dot[i] =
+                pack_b_q4dot_int4_full(packed[i].data(), N, K, K);
+            bg128[i] = pack_b_q4dot_g128_full(
+                q4dot[i], scales[i].data(), N, K, 1);
+
+            float* input = i < 2 ? input0.data() : input1.data();
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, input));
+            weights.push_back(Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1,
+                bg128[i]));
+            weights.back().scales = scales[i].data();
+            weights.back().group_size = 128;
+            weights.back().groups_per_row = 1;
+            weights.back().is_q4_g128_packed = true;
+            weights.back().q4_g128_data = bg128[i];
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1,
+                actual[i].data()));
+
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(inputs.back(), weights.back(), reference);
+        }
+
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_int4_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "INT4 BG128 batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(check_approx(
+                      actual[i].data(), expected[i].data(), N, 1e-5f),
+                  "INT4 BG128 batched GEMV matches individual GEMV");
+            delete[] q4dot[i];
+            delete[] bg128[i];
+        }
+    }
+
     {
         int M = 8, K = 128, N = 13;
         uint32_t group_size = 128;

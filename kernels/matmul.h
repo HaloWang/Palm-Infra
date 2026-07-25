@@ -72,6 +72,15 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         int act_n_len = -1,
                         bool force_fp32_acc = false);
 
+// Execute several M=1 INT4 GEMVs in one thread-pool dispatch. Every GEMV
+// still uses all workers (each worker owns the same output-row shard across
+// the batch), avoiding the loss of per-GEMV parallelism while amortizing
+// dispatch barriers. Returns false when a tensor/layout is unsupported.
+bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool);
+
 void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool = nullptr);
 

@@ -270,6 +270,93 @@ static void matmul_int4_q8dot_neon_gemv_g128_range(
     }
 }
 
+bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool) {
+    const size_t batch = inputs.size();
+    if (batch < 2 || weights.size() != batch || outputs.size() != batch ||
+        !thread_pool || thread_pool->num_threads() < 2) {
+        return false;
+    }
+
+    const int K = (int)inputs[0].shape[0];
+    const int N = (int)weights[0].shape[0];
+    if (K <= 0 || N <= 0 || K % 128 != 0) return false;
+
+    struct BatchScratch {
+        std::vector<Q4GemvScratch> quantized_inputs;
+        std::vector<size_t> input_indices;
+        std::vector<const Q4B8G128Block*> packed_weights;
+        std::vector<float*> output_data;
+    };
+    static thread_local BatchScratch batch_scratch;
+    batch_scratch.quantized_inputs.resize(batch);
+    batch_scratch.input_indices.resize(batch);
+    batch_scratch.packed_weights.resize(batch);
+    batch_scratch.output_data.resize(batch);
+    for (size_t i = 0; i < batch; ++i) {
+        const Tensor& input = inputs[i];
+        const Tensor& weight = weights[i];
+        Tensor& output = outputs[i];
+        if (input.prec != Precision::FP32 || input.shape[0] != K ||
+            input.shape[1] != 1 || weight.prec != Precision::INT4 ||
+            weight.shape[0] != N || weight.shape[1] != K ||
+            weight.group_size != 128 || !weight.is_q4_g128_packed ||
+            !weight.q4_g128_data || output.prec != Precision::FP32 ||
+            output.shape[0] != N || output.shape[1] != 1) {
+            return false;
+        }
+        batch_scratch.packed_weights[i] =
+            reinterpret_cast<const Q4B8G128Block*>(weight.q4_g128_data);
+        batch_scratch.output_data[i] = output.ptr<float>();
+    }
+
+    MatmulTimer timer;
+    timer.set_shape("q4dot_gemv_bg128_batch", (int)batch, N, K, 128,
+                    K / 128, true, false, thread_pool->num_threads());
+    for (size_t i = 0; i < batch; ++i) {
+        const Tensor& input = inputs[i];
+        size_t input_index = i;
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (inputs[previous].data == input.data &&
+                inputs[previous].stride[1] == input.stride[1]) {
+                input_index = batch_scratch.input_indices[previous];
+                break;
+            }
+        }
+        batch_scratch.input_indices[i] = input_index;
+        if (input_index == i) {
+            Q4GemvScratch& quantized =
+                batch_scratch.quantized_inputs[input_index];
+            quantize_a_q8_blocks_even_odd(
+                input.ptr<float>(), K, quantized.qA_even, quantized.qA_odd,
+                quantized.a_scales);
+        }
+    }
+
+    int n_chunk = std::max(N / (thread_pool->num_threads() * 8), 64);
+    n_chunk = ((n_chunk + 7) / 8) * 8;
+    const Q4GemvScratch* quantized_inputs =
+        batch_scratch.quantized_inputs.data();
+    const size_t* input_indices = batch_scratch.input_indices.data();
+    const Q4B8G128Block* const* packed_weights =
+        batch_scratch.packed_weights.data();
+    float* const* output_data = batch_scratch.output_data.data();
+    thread_pool->parallel_for(
+        0, N, n_chunk, [&](int, int n_begin, int n_end) {
+            for (size_t i = 0; i < batch; ++i) {
+                const Q4GemvScratch& quantized =
+                    quantized_inputs[input_indices[i]];
+                matmul_int4_q8dot_neon_gemv_g128_range(
+                    quantized.qA_even.data(), quantized.qA_odd.data(),
+                    quantized.a_scales.data(), packed_weights[i],
+                    output_data[i], K, n_begin, n_end);
+            }
+        });
+    return true;
+}
+
 static void matmul_int4_q8dot_neon_4x8_range(
     const int8_t* qA, const float* a_scales, const uint8_t* B,
     const uint8_t* B_repack, const float* scales, int group_size,
@@ -869,6 +956,15 @@ static void matmul_int4_q8dot_neon_4x8_repacked_i8mm_range(
 }
 
 #endif
+#endif
+
+#if !(HAS_NEON && defined(__ARM_FEATURE_DOTPROD))
+bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>&,
+                                   const std::vector<Tensor>&,
+                                   std::vector<Tensor>&,
+                                   ThreadPool*) {
+    return false;
+}
 #endif
 
 static void matmul_int4_scalar_range(const float* A, const uint8_t* B,

@@ -74,7 +74,11 @@ int main() {
         check(gate && down, "find normalized source refs");
 
         Tensor gu, dw;
+        check(!cache.is_ready(gate, down, 1),
+              "unrequested expert is not ready");
         check(cache.acquire(gate, down, 1, gu, dw), "load expert one");
+        check(cache.is_ready(gate, down, 1),
+              "acquired expert is ready");
         check(gu.prec == Precision::FP16 && gu.shape[0] == 1 && gu.shape[1] == 2,
               "gate expert tensor shape");
         const uint16_t* gu_data = static_cast<const uint16_t*>(gu.data);

@@ -768,6 +768,15 @@ bool MoeSsdCache::contains(const MoeSsdTensorSource* gate_up,
     return entry && !entry->is_failed();
 }
 
+bool MoeSsdCache::is_ready(const MoeSsdTensorSource* gate_up,
+                           const MoeSsdTensorSource* down,
+                           int expert) const {
+    if (!valid_pair(gate_up, down, expert)) return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    const Entry* entry = find_entry_locked(gate_up, down, expert);
+    return entry && entry->is_ready();
+}
+
 bool MoeSsdCache::release(const MoeSsdTensorSource* gate_up,
                           const MoeSsdTensorSource* down,
                           int expert) {
