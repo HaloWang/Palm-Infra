@@ -68,10 +68,20 @@ in W8 when pure W4 loses too much quality.
 
 ## Performance
 
+### CPU
+
 Apple M5 Pro results use four CPU threads, `pp256 + tg64`, `warmup=3`, and
 independent-process medians unless noted.
 
 ![CPU throughput comparison](assets/performance_cpu.svg)
+
+### Metal (experimental)
+
+Apple M5 Pro Metal results use the same `pp256 + tg64`, `warmup=3`, and
+independent-process median protocol. Decode starts with an existing 256-token
+context, and both runtimes keep model weights on Metal.
+
+![Metal throughput comparison](assets/performance_metal.svg)
 
 [Protocol, complete CPU and Metal tables, context scaling, and correctness gates](docs/performance.md)
 

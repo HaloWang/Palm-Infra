@@ -58,10 +58,20 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 
 ## 性能
 
+### CPU
+
 除非另有说明，Apple M5 Pro 数据使用 4 CPU 线程、`pp256 + tg64`、
 `warmup=3` 和独立进程中位数。
 
 ![CPU 吞吐量对比](assets/performance_cpu.svg)
+
+### Metal（实验性）
+
+Apple M5 Pro Metal 数据采用相同的 `pp256 + tg64`、`warmup=3` 和独立
+进程中位数协议。Decode 从已有 256-token 上下文开始，两个运行时都将
+模型权重保留在 Metal 上。
+
+![Metal 吞吐量对比](assets/performance_metal.svg)
 
 [测试协议、完整 CPU/Metal 性能表、长上下文 scaling 与正确性门禁](docs/performance.md)
 
