@@ -196,6 +196,7 @@ struct MetalBackend::Impl {
         spec_pipelines[key] = ps;
         return ps;
     }
+
 };
 
 // ---------------------------------------------------------------------------
@@ -235,7 +236,7 @@ uint eoffset(const Tensor& t) {
 int gemv_nsg_cap() {
     static const int cap = [] {
         const char* value = std::getenv("MOLLM_METAL_GEMV_NSG");
-        if (!value) return 4;
+        if (!value) return 8;
         const int parsed = std::atoi(value);
         return (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
                    ? parsed
@@ -251,18 +252,9 @@ int gemv_w4_nr0(int n, int k) {
         if (parsed == 1 || parsed == 2 || parsed == 4 || parsed == 8)
             return parsed;
     }
-    // Youtu's decode projections benefit from the extra row parallelism of
-    // NR1. Keep NR2 elsewhere: globally using NR1 regresses the primary
-    // Qwen3.5-4B decode workload.
-    const bool youtu_decode_shape =
-        (n == 12288 && k == 2048) ||
-        (n == 2048  && k == 6144) ||
-        (n == 3072  && k == 1536) ||
-        (n == 2048  && k == 2048) ||
-        (n == 1536  && k == 2048) ||
-        (n == 4096  && k == 512)  ||
-        (n == 576   && k == 2048);
-    return youtu_decode_shape ? 1 : 2;
+    (void)n;
+    (void)k;
+    return 1;
 }
 
 int gemv_w4_nsg_cap() {
@@ -328,7 +320,8 @@ MetalBackend::MetalBackend(const std::string& metallib_path) : impl_(new Impl) {
         // Metal 4 tensor-API GEMM is correct (parity-tested) and ~2.3x faster
         // than the simdgroup path (prefill 940 vs 403 t/s). Enable it whenever
         // the device and compiled pipeline support it.
-        if (fam && impl_->pipeline("gemm_tensor_f32a_f16b_f32c") != nil) {
+        if (fam &&
+            impl_->pipeline("gemm_tensor_direct_f16a_f16b_f32c") != nil) {
             impl_->has_tensor = true;
         }
         if (getenv("MOLLM_METAL_DEBUG"))
@@ -385,7 +378,8 @@ void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         // Use the tuned gemv2 (NR0=2 + NSG-split K) — same win as graph GEMVs.
         // lm_head N is huge (vocab), K=hidden; the NSG K-split + 2-row reuse help.
-        const int NR0 = 2, NSG = std::min(gemv_nsg_cap(), (K + 127) / 128);
+        const int NR0 = 2;
+        const int NSG = std::min(gemv_nsg_cap(), (K + 127) / 128);
         id<MTLComputePipelineState> ps = impl_->pipeline_gemv2(NR0);
         if (ps) {
             [enc setComputePipelineState:ps];
@@ -888,13 +882,30 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.activation = (act >= 0 && act <= 4) ? act : 0;
         p.act_n_begin = params.i32.size()>1 ? params.i32[1] : 0;
         p.act_n_len = params.i32.size()>2 ? params.i32[2] : -1;
+        auto cast_activation_to_f16 = [&]() -> id<MTLBuffer> {
+            const size_t bytes =
+                (size_t)p.M * (size_t)p.K * sizeof(uint16_t);
+            void* handle = impl_->pool->acquire(bytes);
+            id<MTLBuffer> result = (__bridge id<MTLBuffer>)handle;
+            impl_->pending_free.push_back({handle, bytes});
+            id<MTLComputePipelineState> ps =
+                impl_->pipeline("matmul_cast_f32_to_f16");
+            [enc setComputePipelineState:ps];
+            [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
+            [enc setBuffer:result offset:0 atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            grid1d((p.M * p.K + 3) / 4);
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            return result;
+        };
         // Decode graphs use M=1 throughout. Enable prefix submission only
         // after observing that invariant; large-M prefill benefits from one
         // command buffer and does not need CPU/GPU encoding overlap.
         if (p.M == 1) impl_->chunk_graph = true;
 
         if (p.M == 1 && B.prec == Precision::INT8) {
-            profile_label = "MATMUL_W8_GEMV";
+            profile_label = "W8_GEMV[N=" + std::to_string(p.N) +
+                            ",K=" + std::to_string(p.K) + "]";
             // W8 decode: int8 weight x float activation, per-group weight scale.
             // Weight int8 + fp32 scales both live in the weight region; bind each
             // at its byte offset (scales offset relative to weight_base).
@@ -908,8 +919,10 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.groups_per_row = (int)B.groups_per_row;
             size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
             const int NR0 = 2;
-            const int NSG = std::min(gemv_nsg_cap(), (p.K + 127) / 128);
-            id<MTLComputePipelineState> ps = impl_->pipeline("gemv_w8_f32a_i8b_f32c");
+            const int NSG =
+                std::min(gemv_nsg_cap(), (p.K + 127) / 128);
+            id<MTLComputePipelineState> ps =
+                impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
             [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
@@ -972,10 +985,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLComputePipelineState> gemv2_ps = gemv_old ? nil : impl_->pipeline_gemv2(NR0);
             if (gemv2_ps) {
                 [enc setComputePipelineState:gemv2_ps];
-                // Four SIMD groups give the best cross-model decode throughput
-                // on M5 Pro: enough K parallelism without the occupancy and
-                // reduction overhead of eight groups. The environment override
-                // keeps this tunable for future GPU families.
+                // Eight SIMD groups give the best cross-model decode throughput
+                // on M5 Pro. The environment override keeps this tunable for
+                // future GPU families.
                 int nsg =
                     std::min(gemv_nsg_cap(), (p.K + 127) / 128);
                 if (nsg < 1) nsg = 1;
@@ -995,8 +1007,9 @@ void MetalBackend::dispatch(const GraphNode& node,
             // W8 prefill GEMM. Two paths:
             //  - W8A8 (opt-in, per-channel weights only): quantize activations
             //    per-token to int8, run int8xint8->int32 MMA, dequant at store.
-            //  - W8A16 (default): dequant int8 weight->half during staging, reuse
-            //    the fp16 tensor MMA. Requires the tensor path.
+            //  - W8A16 (default): cast the activation matrix once, dequant int8
+            //    weight->half during staging, and use FP16-input tensor MMA with
+            //    FP32 accumulation. Requires the tensor path.
 #ifdef MOLLM_METAL_TENSOR
             static const bool w8a8 = (getenv("MOLLM_METAL_W8A8") != nullptr);
             if (impl_->has_tensor && w8a8 && B.groups_per_row == 1) {
@@ -1065,15 +1078,25 @@ void MetalBackend::dispatch(const GraphNode& node,
                 w.group_size = (int)B.group_size;
                 w.groups_per_row = (int)B.groups_per_row;
                 size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
-                id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tensor_w8_f32a_i8b_f32c");
+                id<MTLBuffer> ah = cast_activation_to_f16();
+                w.a_row_stride = p.K;
+                // M64 improves occupancy for the smaller projection shapes.
+                // Very large gate/up or down projections amortize the larger
+                // M128 cooperative accumulator and issue fewer threadgroups.
+                const bool use_m128 =
+                    p.K >= 2560 && (p.N >= 8192 || p.K >= 8192);
+                id<MTLComputePipelineState> ps = impl_->pipeline(
+                    use_m128 ? "gemm_tensor_w8_f16a_i8b_f32c"
+                             : "gemm_tensor_w8_f16a_i8b_f32c_m64");
                 [enc setComputePipelineState:ps];
-                [enc setBuffer:buf_of(&A) offset:A.device_offset atIndex:0];
+                [enc setBuffer:ah offset:0 atIndex:0];
                 [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                 [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:4];
                 [enc setBytes:&w length:sizeof(w) atIndex:3];
                 [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t) atIndex:0];
-                MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 127)/128,
+                const NSUInteger m_tile = use_m128 ? 128 : 64;
+                MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + m_tile - 1)/m_tile,
                                           ((NSUInteger)p.N + 63)/64, 1);
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
                 if (w.activation != 0 && w.act_n_len != 0) {
@@ -1097,13 +1120,19 @@ void MetalBackend::dispatch(const GraphNode& node,
             // W4A8 quantizes activations and remains the throughput baseline.
 #ifdef MOLLM_METAL_TENSOR
             if (impl_->has_tensor) {
-                // W4A16 is both faster and more accurate on the Metal 4 tensor
-                // path: Qwen3.5-4B pp256 improved from ~404 to ~910 t/s and
-                // Youtu-2B from ~980 to ~3055 t/s. It also halves the absolute
-                // CE delta versus CPU on Qwen3.6-35B-A3B. Keep W4A8 as an
-                // explicit diagnostic fallback for older tuning comparisons.
-                static const bool w4a16 =
-                    std::getenv("MOLLM_METAL_W4A8") == nullptr;
+                // Default balanced path: unactivated projections use half
+                // tensor GEMM; fused gate/up projections use K64 activation
+                // quantization for the entire output. K64 is closer to the CPU
+                // reference than half staging while combining two K32 tensor
+                // operations before each FP32 dequantization.
+                const char* w4_mode =
+                    std::getenv("MOLLM_METAL_W4_PREFILL_MODE");
+                const bool fast =
+                    w4_mode && std::strcmp(w4_mode, "fast") == 0;
+                const bool accurate =
+                    w4_mode && std::strcmp(w4_mode, "accurate") == 0;
+                const bool w4a16 =
+                    fast || (!accurate && p.activation == 0);
                 if (w4a16) {
                     profile_label = "MATMUL_W4A16_GEMM";
                     MatmulW8Params w{};
@@ -1117,10 +1146,15 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.group_size = (int)B.group_size;
                     w.groups_per_row = (int)B.groups_per_row;
                     size_t scales_boff = (size_t)p.N * (p.K / 2);
-                    id<MTLComputePipelineState> ps =
-                        impl_->pipeline("gemm_tensor_w4_f32a_i4b_f32c");
+                    const bool use_m128 =
+                        std::min(p.N, p.K) >= 2560 &&
+                        std::max(p.N, p.K) >= 4096;
+                    id<MTLComputePipelineState> ps = impl_->pipeline(
+                        use_m128 ? "gemm_tensor_w4_f32a_i4b_f32c"
+                                 : "gemm_tensor_w4_f32a_i4b_f32c_m64");
                     [enc setComputePipelineState:ps];
-                    [enc setBuffer:buf_of(&A) offset:A.device_offset atIndex:0];
+                    [enc setBuffer:buf_of(&A)
+                           offset:A.device_offset atIndex:0];
                     [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
@@ -1128,7 +1162,9 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t)
                                             atIndex:0];
                     MTLSize tgc =
-                        MTLSizeMake(((NSUInteger)p.M + 127)/128,
+                        MTLSizeMake(
+                            ((NSUInteger)p.M + (use_m128 ? 127 : 63)) /
+                                (use_m128 ? 128 : 64),
                                     ((NSUInteger)p.N + 63)/64, 1);
                     [enc dispatchThreadgroups:tgc
                         threadsPerThreadgroup:MTLSizeMake(128,1,1)];
@@ -1144,8 +1180,19 @@ void MetalBackend::dispatch(const GraphNode& node,
                     break;
                 }
                 size_t a_i8_bytes = (size_t)p.M * (size_t)p.K;
-                profile_label = "MATMUL_W4A8_GEMM";
-                size_t sa_bytes   = (size_t)p.M * sizeof(float);
+                const bool block32 = accurate;
+                const bool block64 =
+                    !accurate && B.is_q4_g128_packed;
+                profile_label =
+                    block32 ? "MATMUL_W4_BLOCK_GEMM"
+                            : (block64 ? "MATMUL_W4_BLOCK64_GEMM"
+                                       : "MATMUL_W4_GROUP128_GEMM");
+                const int a_blocks =
+                    block32 ? (p.K + 31) / 32
+                            : (block64 ? (p.K + 63) / 64
+                                       : (int)B.groups_per_row);
+                size_t sa_bytes =
+                    (size_t)p.M * (size_t)a_blocks * sizeof(float);
                 void* a_i8_h = impl_->pool->acquire(a_i8_bytes);
                 void* sa_h   = impl_->pool->acquire(sa_bytes);
                 id<MTLBuffer> a_i8 = (__bridge id<MTLBuffer>)a_i8_h;
@@ -1159,42 +1206,108 @@ void MetalBackend::dispatch(const GraphNode& node,
                     q.M = p.M; q.K = p.K;
                     q.a_offset = A.device_offset / sizeof(float);
                     q.a_row_stride = p.a_row_stride;
-                    id<MTLComputePipelineState> qps = impl_->pipeline("quantize_act_i8");
+                    q.block_size =
+                        block32 ? 32
+                                : (block64 ? 64 : (int)B.group_size);
+                    id<MTLComputePipelineState> qps = impl_->pipeline(
+                        block32 ? "quantize_act_i8_block32"
+                                : (block64
+                                       ? "quantize_act_i8_block64"
+                                       : "quantize_act_i8_blocks"));
                     [enc setComputePipelineState:qps];
                     [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
                     [enc setBuffer:a_i8 offset:0 atIndex:2];
                     [enc setBuffer:sa   offset:0 atIndex:4];
                     [enc setBytes:&q length:sizeof(q) atIndex:3];
-                    const NSUInteger nsg = 8;
-                    [enc setThreadgroupMemoryLength:nsg*sizeof(float) atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.M,1,1)
-                        threadsPerThreadgroup:MTLSizeMake(32,nsg,1)];
+                    if (block32 || block64) {
+                        constexpr NSUInteger nsg = 4;
+                        const NSUInteger block_groups =
+                            ((NSUInteger)a_blocks + nsg - 1) / nsg;
+                        [enc dispatchThreadgroups:
+                                MTLSizeMake((NSUInteger)p.M *
+                                                block_groups, 1, 1)
+                            threadsPerThreadgroup:
+                                MTLSizeMake(32,nsg,1)];
+                    } else {
+                        const NSUInteger nsg = 4;
+                        [enc setThreadgroupMemoryLength:
+                                nsg*sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:
+                                MTLSizeMake((NSUInteger)p.M *
+                                                (NSUInteger)a_blocks, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32,nsg,1)];
+                    }
                 }
                 // 2) int8 x per-group int4 GEMM with per-group dequant.
                 {
                     MatmulW4A8Params w{};
-                    w.M = p.M; w.N = p.N; w.K = p.K;
+                    w.M = p.M;
+                    w.N = p.N;
+                    w.K = p.K;
                     w.c_offset = eoffset(C);
                     w.c_row_stride = p.c_row_stride;
                     w.activation = p.activation;
                     w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                     w.group_size = (int)B.group_size;
                     w.groups_per_row = (int)B.groups_per_row;
+                    char* native_ptr =
+                        (char*)B.q4_g128_data;
+                    char* weight_base =
+                        (char*)impl_->weight_base;
+                    const bool native_bg128 =
+                        B.is_q4_g128_packed && native_ptr &&
+                        impl_->weight_buffer && weight_base &&
+                        native_ptr >= weight_base &&
+                        native_ptr < weight_base + impl_->weight_size;
                     // Decoded W4 buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
                     size_t scales_boff = (size_t)p.N * (p.K / 2);
-                    id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w4a8_i8a_i4b_f32c");
+                    id<MTLComputePipelineState> ps = impl_->pipeline(
+                        block64 && native_bg128
+                            ? (p.K <= 1024
+                                   ? "gemm_w4a8_block64_bg128_smallk_i8a_i4b_f32c"
+                                   : "gemm_w4a8_block64_bg128_i8a_i4b_f32c")
+                            : (block32
+                            ? (native_bg128
+                                   ? "gemm_w4a8_block32_bg128_i8a_i4b_f32c"
+                                   : "gemm_w4a8_block32_i8a_i4b_f32c")
+                            : (native_bg128
+                                   ? "gemm_w4a8_bg128_i8a_i4b_f32c"
+                                   : "gemm_w4a8_i8a_i4b_f32c")));
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:a_i8 offset:0 atIndex:0];
-                    [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
+                    if (native_bg128) {
+                        [enc setBuffer:impl_->weight_buffer
+                               offset:(size_t)(native_ptr - weight_base)
+                              atIndex:1];
+                    } else {
+                        [enc setBuffer:buf_of(&B)
+                               offset:B.device_offset
+                              atIndex:1];
+                    }
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
                     [enc setBuffer:sa offset:0 atIndex:4];
                     [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:5];
-                    // facc (64*64 f32) + scratch (64*64 i32) = 32KB threadgroup.
-                    [enc setThreadgroupMemoryLength:2*64*64*sizeof(int32_t) atIndex:0];
-                    MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 63)/64,
-                                              ((NSUInteger)p.N + 63)/64, 1);
-                    [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                    const NSUInteger tile_m = 64;
+                    const NSUInteger tile_n = 16;
+                    const NSUInteger tg_mem =
+                        block64
+                            ? (p.K <= 1024
+                                   ? 2*tile_m*tile_n*sizeof(int32_t) +
+                                         tile_n*64
+                                   : tile_m*tile_n*sizeof(int32_t) +
+                                         tile_n*64 +
+                                         (tile_n + tile_m)*sizeof(float))
+                            : 2*tile_m*tile_n*sizeof(int32_t) +
+                                  (block32 ? tile_n*32 : 0);
+                    [enc setThreadgroupMemoryLength:tg_mem atIndex:0];
+                    MTLSize tgc = MTLSizeMake(
+                        ((NSUInteger)p.M + tile_m - 1)/tile_m,
+                        ((NSUInteger)w.N + tile_n - 1)/tile_n, 1);
+                    [enc dispatchThreadgroups:tgc
+                        threadsPerThreadgroup:
+                            MTLSizeMake(128,1,1)];
+
                 }
             } else
 #endif
@@ -1202,9 +1315,11 @@ void MetalBackend::dispatch(const GraphNode& node,
                 fprintf(stderr, "MetalBackend: W4 GEMM requires tensor path (M5/A19+)\n");
                 assert(false && "W4 GEMM needs tensor path");
             }
-        } else if (p.activation == 0) {
-            // Tiled GEMM (simdgroup 8x8 MMA; activation=NONE — Qwen3 emits SILU
-            // separately). Weight buffer B bound at its 64-bit BYTE offset with
+        } else {
+            // Tiled/tensor GEMM. Apply an optional fused graph activation as a
+            // lightweight post-pass so activation-bearing FP16 nodes retain
+            // the same high-throughput matrix path.
+            // Weight buffer B bound at its 64-bit BYTE offset with
             // in-shader b_offset=0 to avoid uint32 element-offset overflow for
             // the 8.8GB weight region (incl. lm_head).
             // Default: 32x32 half-staged tile (acc[4]/sg). This is the OCCUPANCY
@@ -1218,19 +1333,31 @@ void MetalBackend::dispatch(const GraphNode& node,
 #ifdef MOLLM_METAL_TENSOR
             if (impl_->has_tensor) {
                 profile_label = "MATMUL_FP16_TENSOR";
-                // Metal 4 tensor-API GEMM (fast path on M5/A19+): weights staged in
-                // a 64-row tile, activations as a device tensor, NK=32.
+                // Metal 4 tensor-API GEMM (fast path on M5/A19+): large-K
+                // weights are staged in a 64-row tile and activations cast once
+                // to an FP16 device tensor. Medium K uses direct device tensors.
                 // grid: tgpig.y = N/64, tgpig.x = M/128.
-                id<MTLComputePipelineState> ps = impl_->pipeline("gemm_tensor_f32a_f16b_f32c");
+                const bool direct_weights =
+                    p.K >= 512 && p.K <= 1024;
+                id<MTLComputePipelineState> ps = impl_->pipeline(
+                    direct_weights
+                        ? "gemm_tensor_direct_f32a_f16b_f32c"
+                        : "gemm_tensor_direct_f16a_f16b_f32c");
                 // Bind A (activations) and B (weights) at their 64-bit byte
                 // offsets; zero the in-shader element offsets accordingly.
                 MatmulParams ptt = pt; ptt.a_offset = 0; ptt.b_offset = 0;
+                id<MTLBuffer> activation_buffer = buf_of(&A);
+                NSUInteger activation_offset = A.device_offset;
+                if (!direct_weights) {
+                    activation_buffer = cast_activation_to_f16();
+                    activation_offset = 0;
+                    ptt.a_row_stride = p.K;
+                }
                 [enc setComputePipelineState:ps];
-                [enc setBuffer:buf_of(&A) offset:A.device_offset atIndex:0];
+                [enc setBuffer:activation_buffer offset:activation_offset atIndex:0];
                 [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                 [enc setBytes:&ptt length:sizeof(ptt) atIndex:3];
-                [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t) atIndex:0];
                 MTLSize tgc = MTLSizeMake(((NSUInteger)p.M + 127)/128,
                                           ((NSUInteger)p.N + 63)/64, 1);
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
@@ -1251,17 +1378,20 @@ void MetalBackend::dispatch(const GraphNode& node,
                                           ((NSUInteger)p.M + 31)/32, 1);
                 [enc dispatchThreadgroups:tgc threadsPerThreadgroup:MTLSizeMake(128,1,1)];
             }
-        } else {
-            profile_label = "MATMUL_FP16_FUSED";
-            // Fused-activation GEMM (rare in dense graph): vectorized scalar path.
-            id<MTLComputePipelineState> ps = impl_->pipeline("gemm_f32a_f16b_f32c");
-            MatmulParams pg = p; pg.b_offset = 0;  // bind B at byte offset (no uint32 overflow)
-            [enc setComputePipelineState:ps];
-            [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
-            [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
-            [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
-            [enc setBytes:&pg length:sizeof(pg) atIndex:3];
-            grid1d(p.M * p.N);
+            if (p.activation != 0 && p.act_n_len != 0) {
+                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                id<MTLComputePipelineState> aps =
+                    impl_->pipeline("matmul_activation_range_f32");
+                [enc setComputePipelineState:aps];
+                [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
+                [enc setBytes:&p length:sizeof(p) atIndex:3];
+                grid1d(p.M * p.N);
+            }
+        }
+        if (impl_->profile) {
+            profile_label += "[M=" + std::to_string(p.M) +
+                             ",N=" + std::to_string(p.N) +
+                             ",K=" + std::to_string(p.K) + "]";
         }
         break;
     }
@@ -1590,7 +1720,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.b_offset = eoffset(B);
         p.state_offset = eoffset(STATE);
         p.out_offset = eoffset(O);
-        id<MTLComputePipelineState> ps = impl_->pipeline("rwkv7_f32");
+        const bool use_h64_tgstate =
+            !p.state_fp16 && p.head_size == 64 && p.real > 1;
+        id<MTLComputePipelineState> ps = impl_->pipeline(
+            use_h64_tgstate ? "rwkv7_h64_tgstate_fp32" : "rwkv7_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&R) offset:0 atIndex:0];
         [enc setBuffer:buf_of(&DECAY) offset:0 atIndex:1];
@@ -1601,8 +1734,19 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&A) offset:0 atIndex:6];
         [enc setBuffer:buf_of(&B) offset:0 atIndex:7];
         [enc setBuffer:buf_of(&STATE) offset:0 atIndex:8];
-        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.heads, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)p.head_size, 1, 1)];
+        if (use_h64_tgstate) {
+            profile_label = "RWKV7_H64_TGSTATE";
+            [enc dispatchThreadgroups:
+                    MTLSizeMake((NSUInteger)p.heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+        } else {
+            const NSUInteger rows_per_group = 32;
+            const NSUInteger groups_per_head =
+                ((NSUInteger)p.head_size + rows_per_group - 1) / rows_per_group;
+            [enc dispatchThreadgroups:
+                    MTLSizeMake((NSUInteger)p.heads * groups_per_head, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(rows_per_group, 1, 1)];
+        }
         break;
     }
 
@@ -1632,7 +1776,106 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.qkv_offset = eoffset(QKV); p.a_offset = eoffset(Aa); p.b_offset = eoffset(Bb);
         p.z_offset = eoffset(Zz); p.Alog_offset = eoffset(ALG); p.dtb_offset = eoffset(DTB);
         p.norm_offset = eoffset(NRM); p.state_offset = eoffset(ST); p.out_offset = eoffset(O);
-        const char* gk = (op == OpType::GATED_DELTANET_PREFILL) ? "gdn_prefill_f32" : "gdn_decode_f32";
+        const bool prefill =
+            op == OpType::GATED_DELTANET_PREFILL;
+        const bool row_recurrence =
+            prefill && p.k_dim == 128 &&
+            p.v_dim > 0 && p.v_dim <= 1024;
+        if (row_recurrence) {
+            const size_t qk_bytes =
+                (size_t)p.seq_len * (size_t)p.num_heads *
+                (size_t)p.k_dim * sizeof(float);
+            const size_t gate_bytes =
+                (size_t)p.seq_len * (size_t)p.num_v_heads *
+                sizeof(float);
+            const size_t raw_bytes =
+                (size_t)p.seq_len * (size_t)p.num_v_heads *
+                (size_t)p.v_dim * sizeof(float);
+            void* qn_h = impl_->pool->acquire(qk_bytes);
+            void* kn_h = impl_->pool->acquire(qk_bytes);
+            void* ge_h = impl_->pool->acquire(gate_bytes);
+            void* be_h = impl_->pool->acquire(gate_bytes);
+            void* raw_h = impl_->pool->acquire(raw_bytes);
+            id<MTLBuffer> qn = (__bridge id<MTLBuffer>)qn_h;
+            id<MTLBuffer> kn = (__bridge id<MTLBuffer>)kn_h;
+            id<MTLBuffer> ge = (__bridge id<MTLBuffer>)ge_h;
+            id<MTLBuffer> be = (__bridge id<MTLBuffer>)be_h;
+            id<MTLBuffer> raw = (__bridge id<MTLBuffer>)raw_h;
+            impl_->pending_free.push_back({qn_h, qk_bytes});
+            impl_->pending_free.push_back({kn_h, qk_bytes});
+            impl_->pending_free.push_back({ge_h, gate_bytes});
+            impl_->pending_free.push_back({be_h, gate_bytes});
+            impl_->pending_free.push_back({raw_h, raw_bytes});
+
+            id<MTLComputePipelineState> prep =
+                impl_->pipeline("gdn_prepare_qk_f32");
+            [enc setComputePipelineState:prep];
+            [enc setBuffer:buf_of(&QKV) offset:0 atIndex:0];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc setBuffer:qn offset:0 atIndex:10];
+            [enc setBuffer:kn offset:0 atIndex:11];
+            [enc setThreadgroupMemoryLength:8*sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:
+                    MTLSizeMake((NSUInteger)p.seq_len *
+                                    (NSUInteger)p.num_heads, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            id<MTLComputePipelineState> gates =
+                impl_->pipeline("gdn_prepare_gates_f32");
+            [enc setComputePipelineState:gates];
+            [enc setBuffer:buf_of(&Aa) offset:0 atIndex:1];
+            [enc setBuffer:buf_of(&Bb) offset:0 atIndex:2];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc setBuffer:buf_of(&ALG) offset:0 atIndex:6];
+            [enc setBuffer:buf_of(&DTB) offset:0 atIndex:7];
+            [enc setBuffer:ge offset:0 atIndex:12];
+            [enc setBuffer:be offset:0 atIndex:13];
+            grid1d(p.seq_len * p.num_v_heads);
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            id<MTLComputePipelineState> recur =
+                impl_->pipeline("gdn_recurrence_rows_f32");
+            [enc setComputePipelineState:recur];
+            [enc setBuffer:buf_of(&QKV) offset:0 atIndex:0];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc setBuffer:buf_of(&ST) offset:0 atIndex:9];
+            [enc setBuffer:qn offset:0 atIndex:10];
+            [enc setBuffer:kn offset:0 atIndex:11];
+            [enc setBuffer:ge offset:0 atIndex:12];
+            [enc setBuffer:be offset:0 atIndex:13];
+            [enc setBuffer:raw offset:0 atIndex:14];
+            [enc dispatchThreadgroups:
+                    MTLSizeMake(((NSUInteger)p.v_dim + 3)/4,
+                                (NSUInteger)p.num_v_heads, 1)
+                threadsPerThreadgroup:MTLSizeMake(32,4,1)];
+
+            [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            id<MTLComputePipelineState> post =
+                impl_->pipeline("gdn_post_f32");
+            [enc setComputePipelineState:post];
+            [enc setBytes:&p length:sizeof(p) atIndex:3];
+            [enc setBuffer:buf_of(&O) offset:0 atIndex:4];
+            [enc setBuffer:buf_of(&Zz) offset:0 atIndex:5];
+            [enc setBuffer:buf_of(&NRM) offset:0 atIndex:8];
+            [enc setBuffer:raw offset:0 atIndex:14];
+            const NSUInteger post_threads = (NSUInteger)p.v_dim;
+            const NSUInteger post_nsg = (post_threads + 31) / 32;
+            [enc setThreadgroupMemoryLength:
+                    post_nsg*sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:
+                    MTLSizeMake((NSUInteger)p.seq_len *
+                                    (NSUInteger)p.num_v_heads, 1, 1)
+                threadsPerThreadgroup:
+                    MTLSizeMake(post_threads,1,1)];
+            break;
+        }
+        const bool kparallel =
+            prefill && p.v_dim > 0 && 4*p.v_dim <= 1024;
+        const char* gk =
+            kparallel
+                ? "gdn_prefill_kparallel_f32"
+                : (prefill ? "gdn_prefill_f32" : "gdn_decode_f32");
         id<MTLComputePipelineState> ps = impl_->pipeline(gk);
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&QKV) offset:0 atIndex:0];
@@ -1645,11 +1888,20 @@ void MetalBackend::dispatch(const GraphNode& node,
         [enc setBuffer:buf_of(&NRM) offset:0 atIndex:8];
         [enc setBuffer:buf_of(&ST)  offset:0 atIndex:9];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
-        // threadgroup: sq[K] + sk[K] + red[V] floats.
-        NSUInteger smem = (NSUInteger)(2*p.k_dim + p.v_dim) * sizeof(float);
+        const NSUInteger threads =
+            kparallel ? (NSUInteger)(4*p.v_dim)
+                      : (NSUInteger)p.v_dim;
+        // 4-way prefill: q/k + three SIMD reductions + four partial pairs,
+        // delta, attn, and two gate scalars. Decode retains q/k + red[V].
+        const NSUInteger nsg = (threads + 31) / 32;
+        NSUInteger smem =
+            (kparallel
+                 ? (NSUInteger)(2*p.k_dim + 3*nsg + 10*p.v_dim + 2)
+                 : (NSUInteger)(2*p.k_dim + p.v_dim)) *
+            sizeof(float);
         [enc setThreadgroupMemoryLength:smem atIndex:0];
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.num_v_heads,1,1)
-            threadsPerThreadgroup:MTLSizeMake((NSUInteger)p.v_dim,1,1)];
+            threadsPerThreadgroup:MTLSizeMake(threads,1,1)];
         break;
     }
 

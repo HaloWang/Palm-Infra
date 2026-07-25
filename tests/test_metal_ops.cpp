@@ -812,7 +812,7 @@ int main() {
 
     // ---- RWKV7 recurrence: output and persistent FP32 state parity --------
     {
-        int heads = 2, head_size = 16, seq = 4, real = 3;
+        int heads = 2, head_size = 64, seq = 4, real = 3;
         int hidden = heads * head_size, total = hidden * seq;
         int state_n = heads * head_size * head_size;
         Tensor R = make_dev(mb, Precision::FP32, hidden, seq);
@@ -865,7 +865,7 @@ int main() {
         CHECK(close((const float*)O.data, ref.data(), total, 2e-5f, 3e-4f) &&
                   close((const float*)STATE.data, ref_state.data(), state_n,
                         2e-5f, 3e-4f),
-              "RWKV7 heads=2 head_size=16 real=3 seq=4 state parity");
+              "RWKV7 H64 threadgroup-state prefill parity");
     }
 
     // ---- ROPE (interleave=false), layout [head_dim, seq, heads] ----
@@ -1092,16 +1092,90 @@ int main() {
     run_sdpa_cfg(1, 767, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=767", 3e-3f);
     run_sdpa_cfg(1, 1023, 192, 128, 16, 16, 1024, "SDPA multipart decode dk=192 dv=128 past=1023", 3e-3f);
 
+    // ---- Default W8A16 prefill GEMM ----------------------------------------
+    // Cover both cooperative output-tile specializations. The second shape
+    // deliberately trips the large-projection M128 dispatch rule.
+    {
+        // Initialize the diagnostic W8A8 switch before its first dispatch.
+        // These cases use two identical scale groups, which intentionally
+        // selects the production W8A16 path even while W8A8 is enabled.
+        setenv("MOLLM_METAL_W8A8", "1", 1);
+        const int shapes[][3] = {
+            {64, 256, 96},
+            {129, 8192, 64},
+        };
+        for (const auto& shape : shapes) {
+            const int M = shape[0], K = shape[1], N = shape[2];
+            std::vector<float> a(M*K); fill_rand(a.data(), M*K);
+            std::vector<int8_t> wi(N*K);
+            std::vector<float> sw(2*N);
+            for (int n = 0; n < N; ++n) {
+                float mx = 0.0f;
+                std::vector<float> row(K);
+                for (int k = 0; k < K; ++k) {
+                    row[k] = static_cast<float>(rand()) /
+                             static_cast<float>(RAND_MAX) - 0.5f;
+                    mx = std::max(mx, std::fabs(row[k]));
+                }
+                const float s = mx / 127.0f;
+                const float inv = mx > 0.0f ? 127.0f / mx : 0.0f;
+                sw[2*n] = s;
+                sw[2*n+1] = s;
+                for (int k = 0; k < K; ++k) {
+                    const int q = (int)std::lround(row[k] * inv);
+                    wi[n*K+k] =
+                        (int8_t)std::max(-127, std::min(127, q));
+                }
+            }
+            const size_t soff = (N*K + 3) & ~size_t(3);
+            const size_t region = soff + 2*N*sizeof(float);
+            std::vector<uint8_t> buf(region, 0);
+            memcpy(buf.data(), wi.data(), N*K);
+            memcpy(buf.data()+soff, sw.data(), 2*N*sizeof(float));
+            mb.register_weight_region(buf.data(), region);
+
+            Tensor A = make_dev(mb, Precision::FP32, K, M);
+            memcpy(A.data, a.data(), M*K*sizeof(float));
+            Tensor C = make_dev(mb, Precision::FP32, N, M);
+            Tensor B = Tensor::create(
+                Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1, nullptr);
+            B.data = buf.data();
+            B.scales = (const float*)(buf.data()+soff);
+            B.group_size = (uint32_t)(K/2);
+            B.groups_per_row = 2;
+            B.num_groups = (uint32_t)(2*N);
+            mb.wrap_weight(B);
+            metal_matmul(mb, A, B, C);
+
+            std::vector<float> ref(M*N);
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    double acc = 0.0;
+                    for (int k = 0; k < K; ++k)
+                        acc += (double)a[m*K+k] * (double)wi[n*K+k];
+                    ref[m*N+n] = (float)(acc * sw[2*n]);
+                }
+            }
+            char label[80];
+            snprintf(label, sizeof(label),
+                     "W8A16 GEMM M=%d K=%d N=%d (%s tile)",
+                     M, K, N, K >= 8192 ? "M128" : "M64");
+            CHECK(close((const float*)C.data, ref.data(), M*N,
+                        1e-2f, 3e-2f), label);
+        }
+    }
+
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
     // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout
     // is compiler-sensitive (must match between offline metallib and runtime).
     // Enabled via MOLLM_METAL_W8A8; weights + scales live in a registered region.
     {
         setenv("MOLLM_METAL_W8A8", "1", 1);
-        for (int ci = 0; ci < 3 && mb.has_tensor_path(); ci++) {
-            int M = ci==0 ? 40 : (ci==1 ? 256 : 33);
-            int K = ci==0 ? 256 : (ci==1 ? 1024 : 96);
-            int N = ci==0 ? 96  : (ci==1 ? 512  : 80);
+        for (int ci = 0; ci < 5 && mb.has_tensor_path(); ci++) {
+            int M = ci==0 ? 40 : (ci==1 ? 256 : (ci==2 ? 33 : 1));
+            int K = ci==0 ? 256 : (ci==1 ? 1024 :
+                    (ci==2 ? 96 : (ci==3 ? 2048 : 1024)));
+            int N = ci==0 ? 96  : (ci==1 ? 512  : (ci==2 ? 80 : 264));
 
             std::vector<float> a(M*K); fill_rand(a.data(), M*K);
             // int8 per-channel weights + fp32 scales laid out in one region.
@@ -1142,6 +1216,15 @@ int main() {
             // Reference: quantize A per token, int8 matmul, dequant.
             std::vector<float> ref(M*N);
             for (int m = 0; m < M; m++) {
+                if (M == 1) {
+                    for (int n = 0; n < N; n++) {
+                        double acc = 0.0;
+                        for (int k = 0; k < K; k++)
+                            acc += (double)a[k] * (double)wi[n*K+k];
+                        ref[n] = (float)(acc * sw[n]);
+                    }
+                    continue;
+                }
                 float mx = 0; for (int k = 0; k < K; k++) mx = std::max(mx, std::fabs(a[k+m*K]));
                 float sa = mx/127.0f, inv = mx>0 ? 127.0f/mx : 0;
                 for (int n = 0; n < N; n++) {
@@ -1154,8 +1237,11 @@ int main() {
                 }
             }
             char label[64];
-            snprintf(label, sizeof(label), "W8A8 GEMM M=%d K=%d N=%d", M, K, N);
-            CHECK(close((const float*)C.data, ref.data(), M*N, 2e-3f, 2e-2f), label);
+            snprintf(label, sizeof(label), "W8%s M=%d K=%d N=%d",
+                     M == 1 ? " GEMV" : "A8 GEMM", M, K, N);
+            CHECK(close((const float*)C.data, ref.data(), M*N,
+                        M == 1 ? 1e-4f : 2e-3f,
+                        M == 1 ? 2e-4f : 2e-2f), label);
         }
         unsetenv("MOLLM_METAL_W8A8");
     }
@@ -1165,11 +1251,19 @@ int main() {
     // them to raw nibbles at wrap_weight time. Build a matching packed blob in a
     // registered weight region so wrap_weight's decode path is exercised.
     {
+        setenv("MOLLM_METAL_W4_PREFILL_MODE", "accurate", 1);
         struct alignas(16) Q4B8G128Block { float scales[8]; uint8_t q[4][8][16]; };
-        for (int ci = 0; ci < 3 && mb.has_tensor_path(); ci++) {
-            int M = ci==0 ? 40 : (ci==1 ? 128 : 1);
-            int K = ci==0 ? 256 : (ci==1 ? 512 : 2048);
-            int N = ci==0 ? 48  : (ci==1 ? 80 : 264);
+        for (int ci = 0; ci < 6 && mb.has_tensor_path(); ci++) {
+            const bool quant_probe = ci == 3;
+            const bool balanced_probe = ci >= 4;
+            const bool large_balanced_probe = ci == 5;
+            int M = ci==0 ? 40 : (ci==1 ? 128 : (ci==2 ? 1 :
+                    (balanced_probe ? 64 : 8)));
+            int K = ci==0 ? 256 : (ci==1 ? 512 : (ci==2 ? 2048 :
+                    (balanced_probe
+                         ? (large_balanced_probe ? 2048 : 256)
+                         : 128)));
+            int N = ci==0 ? 48  : (ci==1 ? 80 : (ci==2 ? 264 : 128));
             int GS = 128, GPR = K / GS;
 
             std::vector<float> a(M*K); fill_rand(a.data(), M*K);
@@ -1177,8 +1271,15 @@ int main() {
             std::vector<int8_t> wq(N*K);
             std::vector<float>  sw(N*GPR);
             for (int n = 0; n < N; n++) {
-                for (int g = 0; g < GPR; g++) sw[n*GPR+g] = 0.0006f + 0.00002f*((n+g)%11);
-                for (int k = 0; k < K; k++) { int v=(rand()%16)-8; if(v==8)v=7; wq[n*K+k]=(int8_t)v; }
+                for (int g = 0; g < GPR; g++)
+                    sw[n*GPR+g] =
+                        quant_probe ? 1.0f
+                                    : 0.0006f + 0.00002f*((n+g)%11);
+                for (int k = 0; k < K; k++) {
+                    int v = quant_probe ? (n == k ? 1 : 0)
+                                        : (rand()%16)-8;
+                    wq[n*K+k]=(int8_t)v;
+                }
             }
             // pack into Q4B8G128Block[ (N/8 padded) x GPR ]: block(nt,g).q[qgi][c]
             // = channel (nt*8+c)'s 16 bytes for K-sub qgi (raw k=g*128+qgi*32+2b lo/+1 hi).
@@ -1219,32 +1320,103 @@ int main() {
             mb.wrap_weight(B);
             mb.wrap_weight_int4_g128(B);   // decode packed blocks -> raw nibbles
 
-            metal_matmul(mb, A, B, C);
+            if (balanced_probe)
+                unsetenv("MOLLM_METAL_W4_PREFILL_MODE");
+            metal_matmul(mb, A, B, C,
+                         balanced_probe
+                             ? std::vector<int>{1, 0, N/2}
+                             : std::vector<int>{});
+            if (balanced_probe) {
+                std::vector<float> first((const float*)C.data,
+                                         (const float*)C.data + M*N);
+                metal_matmul(mb, A, B, C,
+                             std::vector<int>{1, 0, N/2});
+                CHECK(std::memcmp(first.data(), C.data,
+                                  (size_t)M*N*sizeof(float)) == 0,
+                      "W4 balanced K64 deterministic replay");
+            }
+            if (balanced_probe)
+                setenv("MOLLM_METAL_W4_PREFILL_MODE", "accurate", 1);
 
-            // The default W4A16 prefill path and the decode GEMV both consume
-            // FP32 activations. Compare against the exact dequantized W4
-            // product; using the old W4A8 approximation here hid systematic
-            // prefill drift behind a loose tolerance.
+            // Prefill follows the CPU production W4 path: independently
+            // quantize every 32 activation values to Q8, take an integer dot,
+            // combine activation/weight scales, and accumulate with FMA.
+            // Decode consumes FP32 activations directly.
             std::vector<float> ref(M*N);
             for (int m = 0; m < M; m++) {
                 for (int n = 0; n < N; n++) {
-                    double acc=0.0;
-                    for (int g=0; g<GPR; g++) {
-                        double d=0.0;
-                        for (int k=g*GS;k<(g+1)*GS;k++)
-                            d += (double)a[m*K+k] * (double)wq[n*K+k];
-                        acc += d * sw[n*GPR+g];
+                    float acc = 0.0f;
+                    if (M == 1) {
+                        for (int g=0; g<GPR; g++) {
+                            double d=0.0;
+                            for (int k=g*GS;k<(g+1)*GS;k++)
+                                d += (double)a[m*K+k] *
+                                     (double)wq[n*K+k];
+                            acc += (float)(d * sw[n*GPR+g]);
+                        }
+                    } else if (balanced_probe) {
+                        for (int kb=0; kb<K; kb+=64) {
+                            float amax = 0.0f;
+                            for (int k=kb; k<kb+64; k++)
+                                amax = std::max(
+                                    amax, std::fabs(a[m*K+k]));
+                            float as =
+                                amax > 0.0f ? amax/127.0f : 1.0f;
+                            float inv =
+                                amax > 0.0f ? 127.0f/amax : 0.0f;
+                            int dot = 0;
+                            for (int k=kb; k<kb+64; k++) {
+                                int q = (int)std::nearbyint(
+                                    a[m*K+k]*inv);
+                                q = std::max(
+                                    -127, std::min(127, q));
+                                dot += q * (int)wq[n*K+k];
+                            }
+                            float combined =
+                                sw[n*GPR + kb/GS] * as;
+                            acc = std::fma(
+                                (float)dot, combined, acc);
+                        }
+                    } else {
+                        for (int kb=0; kb<K; kb+=32) {
+                            float amax = 0.0f;
+                            for (int k=kb; k<kb+32; k++)
+                                amax = std::max(amax, std::fabs(a[m*K+k]));
+                            float as = amax > 0.0f ? amax/127.0f : 1.0f;
+                            float inv = amax > 0.0f ? 127.0f/amax : 0.0f;
+                            int dot = 0;
+                            for (int k=kb; k<kb+32; k++) {
+                                int q = (int)std::nearbyint(a[m*K+k]*inv);
+                                q = std::max(-127, std::min(127, q));
+                                dot += q * (int)wq[n*K+k];
+                            }
+                            float combined = sw[n*GPR + kb/GS] * as;
+                            acc = std::fma((float)dot, combined, acc);
+                        }
                     }
-                    ref[m*N+n]=(float)acc;
+                    if (balanced_probe && n < N/2)
+                        acc = acc/(1.0f + std::exp(-acc));
+                    ref[m*N+n]=acc;
                 }
             }
             char label[64];
             snprintf(label, sizeof(label), "W4%s M=%d K=%d N=%d",
-                     M == 1 ? " GEMV" : "A16 GEMM", M, K, N);
+                     M == 1 ? " GEMV" :
+                     (balanced_probe ? " balanced K64 GEMM" :
+                                     " block32 GEMM"),
+                     M, K, N);
             CHECK(close((const float*)C.data, ref.data(), M*N,
-                        M == 1 ? 1e-4f : 2e-3f,
-                        M == 1 ? 3e-2f : 5e-3f), label);
+                        M == 1 ? 1e-4f :
+                        (quant_probe ? 1e-7f :
+                         (balanced_probe
+                              ? (large_balanced_probe ? 3e-5f : 1e-5f)
+                              : 3e-5f)),
+                        M == 1 ? 3e-2f :
+                        (quant_probe ? 1e-6f :
+                         (balanced_probe ? 2e-4f : 1e-4f))),
+                  label);
         }
+        unsetenv("MOLLM_METAL_W4_PREFILL_MODE");
     }
 
     // ---- MATMUL from PERMUTE -> non-zero dim-0 SLICE view ------------------

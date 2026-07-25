@@ -6,108 +6,116 @@ using namespace metal;
 inline float apply_activation(float v, int act);
 inline float apply_activation_at(float v, int act, int n, int begin, int len);
 
+kernel void matmul_cast_f32_to_f16(
+    device const float* A [[buffer(0)]],
+    device half* AH [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const uint count = (uint)p.M * (uint)p.K;
+    const uint base = gid * 4;
+    if (base >= count) return;
+    const uint m = base / (uint)p.K;
+    const uint k = base - m * (uint)p.K;
+    if (k + 4 <= (uint)p.K) {
+        const device float4* src = (const device float4*)(
+            A + p.a_offset + m * (uint)p.a_row_stride + k);
+        *((device half4*)(AH + base)) = half4(*src);
+    } else {
+        // Generic tail for odd K. It may cross a logical row boundary, so
+        // derive the row/column again for every remaining scalar.
+        for (uint i = 0; i < 4 && base + i < count; ++i) {
+            const uint linear = base + i;
+            const uint row = linear / (uint)p.K;
+            const uint col = linear - row * (uint)p.K;
+            AH[linear] =
+                half(A[p.a_offset + row * (uint)p.a_row_stride + col]);
+        }
+    }
+}
+
 #ifdef MOLLM_METAL_TENSOR
 #include <metal_tensor>
 #include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
 using namespace mpp::tensor_ops;
 
-// ---------------------------------------------------------------------------
-// Tensor-API GEMM (Metal 4 mpp::tensor_ops) — the fast prefill path on M5/A19+.
-// C[M,N] = A[M,K] (fp32 activations) * B[N,K]^T (fp16 weights).
-// Weights (our N) are staged into threadgroup memory as half; activations (our M)
-// are read straight from device as a 2D tensor. matmul2d runs the MMA on the
-// tensor units. Output C element (m,n) at c_offset + m*c_row_stride + n.
-// Tile NRA=64 (weights) x NRB=128 (activations) x NK=32; 4 simdgroups, 128 threads.
-// ---------------------------------------------------------------------------
-kernel void gemm_tensor_f32a_f16b_f32c(
-    device const float*   A      [[buffer(0)]],
-    device const half*    B      [[buffer(1)]],
-    device float*         C      [[buffer(2)]],
-    constant MatmulParams& p     [[buffer(3)]],
-    threadgroup half*     shmem  [[threadgroup(0)]],
-    uint3  tgpig                 [[threadgroup_position_in_grid]],
-    ushort tiitg                 [[thread_index_in_threadgroup]])
+// FP16 tensor GEMM with both operands read directly from device memory.
+// MPP understands the strided [K,N] weight view, avoiding K32 threadgroup
+// staging and its barriers.
+kernel void gemm_tensor_direct_f32a_f16b_f32c(
+    device const float* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]])
 {
-    const int NRA = 64;    // weights tile (our N), staged into threadgroup
-    const int NRB = 128;   // activations tile (our M), read from device
-    const int NK  = 32;    // K chunk
-    const int NUM_THREADS = 128;
-
-    const int M = p.M, N = p.N, K = p.K;
-    const int ra = (int)tgpig.y * NRA;   // first weight-row (our N) of tile
-    const int rb = (int)tgpig.x * NRB;   // first activation-row (our M) of tile
-
-    // Weights staged as tensor [NK, NRA]: sa[k + n_local*NK] = weight(ra+n_local, loop_k+k).
-    threadgroup half* sa = shmem;
-    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
-
-    // Activations as a device tensor [K, M]: element (k,m) at a_offset + m*a_row_stride + k.
-    device const float* ptrA = A + p.a_offset;
-    auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
+    const int TN = 64, TM = 128, TK = 32;
+    const int n0 = (int)tgpig.y * TN;
+    const int m0 = (int)tgpig.x * TM;
+    auto tA = tensor((device float*)(A + p.a_offset),
+                     dextents<int32_t,2>(p.K, p.M),
                      array<int,2>({1, p.a_row_stride}));
-
-    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+    auto tW = tensor((device half*)(B + p.b_offset),
+                     dextents<int32_t,2>(p.K, p.N),
+                     array<int,2>({1, p.b_row_stride}));
+    matmul2d<matmul2d_descriptor(TM, TN, TK, false, true, true,
              matmul2d_descriptor::mode::multiply_accumulate),
              execution_simdgroups<4>> mm;
-    // The tensor unit only accumulates in FP32; a `half` cooperative tensor is
-    // rejected at compile time ("Unsupported type"). No FP16-accumulate option here.
-    auto cT = mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
-
-    // Each work-item stages UNROLL contiguous K halves (one per thread, no
-    // re-stride loop → contiguous vectorizable device reads).
-    const int UNROLL = 16;
-    const int A_WORK = NRA * (NK / UNROLL);   // 64 * 2 = 128
-
-    for (int loop_k = 0; loop_k < K; loop_k += NK) {
-        // Stage weights: work-item -> (weight row nl, K sub-chunk). Each writes
-        // UNROLL contiguous K halves: sa[k + nl*NK] = weight(ra+nl, loop_k+k).
-        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
-            int nl   = work / (NK / UNROLL);        // weight row within tile (our N)
-            int sub  = work % (NK / UNROLL);        // K sub-chunk index
-            int kbase = sub * UNROLL;               // K offset within chunk
-            int gn = ra + nl;
-            threadgroup half* dst = sa + nl*NK + kbase;
-            int gk0 = loop_k + kbase;
-            if (gn < N && gk0 + UNROLL <= K) {
-                // Fast path: full in-bounds UNROLL span, vectorized half4 loads.
-                device const half4* wrow4 =
-                    (device const half4*)(B + p.b_offset + (uint)gn * p.b_row_stride + gk0);
-                threadgroup half4* dst4 = (threadgroup half4*)dst;
-                #pragma unroll
-                for (int i = 0; i < UNROLL/4; ++i) dst4[i] = wrow4[i];
-            } else if (gn < N) {
-                // Edge: K tail — scalar with bounds check.
-                device const half* wrow = B + p.b_offset + (uint)gn * p.b_row_stride + gk0;
-                #pragma unroll
-                for (int i = 0; i < UNROLL; ++i)
-                    dst[i] = (gk0 + i < K) ? wrow[i] : (half)0;
-            } else {
-                #pragma unroll
-                for (int i = 0; i < UNROLL; ++i) dst[i] = (half)0;
-            }
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-
-        auto mA = tA.slice(0, 0);        // weights staged chunk
-        auto mB = tB.slice(loop_k, rb);  // activations [K-off, M-off]
-        mm.run(mB, mA, cT);
-
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+    auto acc =
+        mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW),
+                                              float>();
+    for (int k0 = 0; k0 < p.K; k0 += TK) {
+        auto a = tA.slice(k0, m0);
+        auto w = tW.slice(k0, n0);
+        mm.run(a, w, acc);
     }
+    auto out = tensor(C + p.c_offset,
+                      dextents<int32_t,2>(p.N, p.M),
+                      array<int,2>({1, p.c_row_stride}));
+    acc.store(out.slice(n0, m0));
+}
 
-    // Store: C element (m,n) at m*c_row_stride + n, as an [N, M] tensor with
-    // strides {1, c_row_stride}, sliced at (ra=weight/N-offset, rb=act/M-offset).
-    device float* dstC = C + p.c_offset;
-    auto tD = tensor(dstC, dextents<int32_t,2>(N, M), array<int,2>({1, p.c_row_stride}));
-    cT.store(tD.slice(ra, rb));
+// Direct-device counterpart for activations already cast to FP16. This avoids
+// weight staging and its K32 barriers while retaining FP32 accumulation.
+kernel void gemm_tensor_direct_f16a_f16b_f32c(
+    device const half* A [[buffer(0)]],
+    device const half* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint3 tgpig [[threadgroup_position_in_grid]])
+{
+    const int TN = 64, TM = 128, TK = 32;
+    const int n0 = (int)tgpig.y * TN;
+    const int m0 = (int)tgpig.x * TM;
+    auto tA = tensor((device half*)(A + p.a_offset),
+                     dextents<int32_t,2>(p.K, p.M),
+                     array<int,2>({1, p.a_row_stride}));
+    auto tW = tensor((device half*)(B + p.b_offset),
+                     dextents<int32_t,2>(p.K, p.N),
+                     array<int,2>({1, p.b_row_stride}));
+    matmul2d<matmul2d_descriptor(TM, TN, TK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto acc =
+        mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW),
+                                              float>();
+    for (int k0 = 0; k0 < p.K; k0 += TK) {
+        auto a = tA.slice(k0, m0);
+        auto w = tW.slice(k0, n0);
+        mm.run(a, w, acc);
+    }
+    auto out = tensor(C + p.c_offset,
+                      dextents<int32_t,2>(p.N, p.M),
+                      array<int,2>({1, p.c_row_stride}));
+    acc.store(out.slice(n0, m0));
 }
 
 // W8A16 GEMM: identical to gemm_tensor but weights are int8 + per-group scale,
-// dequantized to half during staging (sa[...] = half(int8 * scale)). Reuses the
-// same fp16 matmul2d downstream — activations stay float. Handles any group_size
-// via the per-(row,group) scale lookup during staging.
-kernel void gemm_tensor_w8_f32a_i8b_f32c(
-    device const float*    A      [[buffer(0)]],
+// dequantized to half during staging (sa[...] = half(int8 * scale)). The input
+// activation matrix was cast to half once by matmul_cast_f32_to_f16. Handles
+// any group size via the per-(row,group) scale lookup during staging.
+kernel void gemm_tensor_w8_f16a_i8b_f32c(
+    device const half*     A      [[buffer(0)]],
     device const int8_t*   B      [[buffer(1)]],
     device float*          C      [[buffer(2)]],
     device const float*    SCALES [[buffer(4)]],
@@ -124,8 +132,8 @@ kernel void gemm_tensor_w8_f32a_i8b_f32c(
 
     threadgroup half* sa = shmem;
     auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
-    device const float* ptrA = A + p.a_offset;
-    auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
+    device const half* ptrA = A + p.a_offset;
+    auto tB = tensor((device half*)ptrA, dextents<int32_t,2>(K, M),
                      array<int,2>({1, p.a_row_stride}));
     matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
              matmul2d_descriptor::mode::multiply_accumulate),
@@ -142,10 +150,25 @@ kernel void gemm_tensor_w8_f32a_i8b_f32c(
             if (gn < N) {
                 device const int8_t* wrow = B + (uint)gn * (uint)K + gk0;
                 device const float*  srow = SCALES + (uint)gn * (uint)gpr;
-                #pragma unroll
-                for (int i = 0; i < UNROLL; ++i) {
-                    int k = gk0 + i;
-                    dst[i] = (k < K) ? (half)((float)wrow[i] * srow[k / gs]) : (half)0;
+                if (gpr == 1 && gk0 + UNROLL <= K) {
+                    // W8PC common path: one channel scale and four contiguous
+                    // vector loads cover the 16 staged weights.
+                    const float sc = srow[0];
+                    device const char4* src4 =
+                        (device const char4*)wrow;
+                    threadgroup half4* dst4 =
+                        (threadgroup half4*)dst;
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        dst4[i] = half4(float4(src4[i]) * sc);
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) {
+                        int k = gk0 + i;
+                        dst[i] = (k < K)
+                            ? (half)((float)wrow[i] * srow[k / gs])
+                            : (half)0;
+                    }
                 }
             } else {
                 #pragma unroll
@@ -163,18 +186,91 @@ kernel void gemm_tensor_w8_f32a_i8b_f32c(
     cT.store(tD.slice(ra, rb));
 }
 
-// W4A16 GEMM: unpack per-group int4 weights to half while staging, then use
-// the same FP32-activation tensor MMA path as W8A16. Unlike W4A8 this avoids
-// per-token int8 activation quantization, improving prefill numerical parity.
-kernel void gemm_tensor_w4_f32a_i4b_f32c(
-    device const float*    A      [[buffer(0)]],
-    device const uint8_t*  B      [[buffer(1)]],
+// Smaller M tile for projection shapes where the M128 cooperative accumulator
+// loses occupancy. Keep this as a separate entry point: making NRB a runtime
+// branch changes cooperative-tensor register allocation for both paths.
+kernel void gemm_tensor_w8_f16a_i8b_f32c_m64(
+    device const half*     A      [[buffer(0)]],
+    device const int8_t*   B      [[buffer(1)]],
     device float*          C      [[buffer(2)]],
     device const float*    SCALES [[buffer(4)]],
     constant MatmulW8Params& p    [[buffer(3)]],
     threadgroup half*      shmem  [[threadgroup(0)]],
     uint3  tgpig                  [[threadgroup_position_in_grid]],
     ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup half* sa = shmem;
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    device const half* ptrA = A + p.a_offset;
+    auto tB = tensor((device half*)ptrA, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, p.a_row_stride}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    const int UNROLL = 16;
+    const int A_WORK = NRA * (NK / UNROLL);
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+            int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+            int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+            threadgroup half* dst = sa + nl*NK + kbase;
+            if (gn < N) {
+                device const int8_t* wrow = B + (uint)gn * (uint)K + gk0;
+                device const float* srow =
+                    SCALES + (uint)gn * (uint)gpr;
+                if (gpr == 1 && gk0 + UNROLL <= K) {
+                    const float sc = srow[0];
+                    device const char4* src4 = (device const char4*)wrow;
+                    threadgroup half4* dst4 = (threadgroup half4*)dst;
+                    #pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        dst4[i] = half4(float4(src4[i]) * sc);
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) {
+                        int k = gk0 + i;
+                        dst[i] = (k < K)
+                            ? (half)((float)wrow[i] * srow[k / gs])
+                            : (half)0;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = (half)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* dstC = C + p.c_offset;
+    auto tD = tensor(dstC, dextents<int32_t,2>(N, M),
+                     array<int,2>({1, p.c_row_stride}));
+    cT.store(tD.slice(ra, rb));
+}
+
+// W4A16 GEMM: unpack per-group int4 weights to half while staging. Keep
+// activations in FP32; casting them to FP16 measurably changes model PPL.
+kernel void gemm_tensor_w4_f32a_i4b_f32c(
+    device const float* A [[buffer(0)]],
+    device const uint8_t* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    device const float* SCALES [[buffer(4)]],
+    constant MatmulW8Params& p [[buffer(3)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]])
 {
     const int NRA = 64, NRB = 128, NK = 32, NUM_THREADS = 128;
     const int M = p.M, N = p.N, K = p.K;
@@ -251,6 +347,94 @@ kernel void gemm_tensor_w4_f32a_i4b_f32c(
     cT.store(tD.slice(ra, rb));
 }
 
+// Smaller output tile for W4 projection shapes where M128 loses occupancy.
+// This remains an explicit entry point so each cooperative accumulator has a
+// compile-time shape and independent register allocation.
+kernel void gemm_tensor_w4_f32a_i4b_f32c_m64(
+    device const float* A [[buffer(0)]],
+    device const uint8_t* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    device const float* SCALES [[buffer(4)]],
+    constant MatmulW8Params& p [[buffer(3)]],
+    threadgroup half* shmem [[threadgroup(0)]],
+    uint3 tgpig [[threadgroup_position_in_grid]],
+    ushort tiitg [[thread_index_in_threadgroup]])
+{
+    const int NRA = 64, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int gpr = p.groups_per_row, gs = p.group_size;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup half* sa = shmem;
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    device const float* ptrA = A + p.a_offset;
+    auto tB = tensor((device float*)ptrA, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, p.a_row_stride}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+    auto cT =
+        mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA), float>();
+
+    const int UNROLL = 16;
+    const int A_WORK = NRA * (NK / UNROLL);
+    const ulong row_bytes = (ulong)K / 2;
+    for (int loop_k = 0; loop_k < K; loop_k += NK) {
+        for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+            int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+            int kbase = sub * UNROLL, gn = ra + nl, gk0 = loop_k + kbase;
+            threadgroup half* dst = sa + nl*NK + kbase;
+            if (gn < N) {
+                device const uint8_t* wr =
+                    B + (ulong)gn * row_bytes + (ulong)(gk0 / 2);
+                device const float* sr =
+                    SCALES + (ulong)gn * (ulong)gpr;
+                if (gk0 + UNROLL <= K && gs >= UNROLL &&
+                    (gk0 % gs) + UNROLL <= gs) {
+                    device const uint* wr32 = (device const uint*)wr;
+                    const uint p0 = wr32[0], p1 = wr32[1];
+                    const float sc = sr[gk0 / gs];
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        const uint pack = i < 8 ? p0 : p1;
+                        const uint packed = (pack >> (4 * (i & 7))) & 0xff;
+                        dst[i] =
+                            (half)((float)(int(packed & 0x0f) - 8) * sc);
+                        dst[i + 1] =
+                            (half)((float)(int(packed >> 4) - 8) * sc);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        int k = gk0 + i;
+                        uint8_t packed = (k < K) ? wr[i / 2] : 0;
+                        int lo = (packed & 0x0f) - 8;
+                        int hi = (packed >> 4) - 8;
+                        dst[i] = (k < K)
+                            ? (half)((float)lo * sr[k / gs]) : (half)0;
+                        dst[i + 1] = (k + 1 < K)
+                            ? (half)((float)hi * sr[(k + 1) / gs]) : (half)0;
+                    }
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = (half)0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto mA = tA.slice(0, 0);
+        auto mB = tB.slice(loop_k, rb);
+        mm.run(mB, mA, cT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    device float* dstC = C + p.c_offset;
+    auto tD =
+        tensor(dstC, dextents<int32_t,2>(N, M),
+               array<int,2>({1, p.c_row_stride}));
+    cT.store(tD.slice(ra, rb));
+}
+
 // Post-pass for tensor W8 GEMM, whose cooperative tensor store cannot apply a
 // per-column fused activation. Operates in place on row-strided C.
 kernel void matmul_w8_activation_range_f32(
@@ -262,6 +446,23 @@ kernel void matmul_w8_activation_range_f32(
     int m = int(gid) / p.N, n = int(gid) % p.N;
     if (p.act_n_len == 0 ||
         (p.act_n_len > 0 && (n < p.act_n_begin || n >= p.act_n_begin + p.act_n_len))) return;
+    uint idx = p.c_offset + (uint)m * (uint)p.c_row_stride + (uint)n;
+    C[idx] = apply_activation(C[idx], p.activation);
+}
+
+// Post-pass for FP16 GEMM tensor/tiled paths. Keeping activation separate lets
+// fused graph nodes use the high-throughput matrix kernels instead of falling
+// back to one scalar thread per output element.
+kernel void matmul_activation_range_f32(
+    device float* C [[buffer(2)]],
+    constant MatmulParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    if (int(gid) >= p.M * p.N) return;
+    int m = int(gid) / p.N, n = int(gid) % p.N;
+    if (p.act_n_len == 0 ||
+        (p.act_n_len > 0 &&
+         (n < p.act_n_begin || n >= p.act_n_begin + p.act_n_len))) return;
     uint idx = p.c_offset + (uint)m * (uint)p.c_row_stride + (uint)n;
     C[idx] = apply_activation(C[idx], p.activation);
 }
@@ -278,7 +479,7 @@ kernel void gemm_w8a8_i8a_i8b_f32c(
     device const int8_t*  A       [[buffer(0)]],   // int8 activations [M,K]
     device const int8_t*  B       [[buffer(1)]],   // int8 weights [N,K]
     device float*         C       [[buffer(2)]],   // fp32 out [M,N] ([N,M]-strided)
-    device const float*   SCALE_A [[buffer(4)]],   // per-token [M]
+    device const float*   SCALE_A [[buffer(4)]],   // per-(token, weight group)
     device const float*   SCALE_W [[buffer(5)]],   // per-channel [N]
     constant MatmulW8A8Params& p  [[buffer(3)]],
     threadgroup int8_t*   shmem   [[threadgroup(0)]],
@@ -366,7 +567,7 @@ kernel void gemm_w4a8_i8a_i4b_f32c(
     uint3  tgpig                  [[threadgroup_position_in_grid]],
     ushort tiitg                  [[thread_index_in_threadgroup]])
 {
-    const int NRA = 64, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int NRA = 16, NRB = 64, NK = 32, NUM_THREADS = 128;
     const int M = p.M, N = p.N, K = p.K;
     const int GS = p.group_size, GPR = p.groups_per_row;
     const int ra = (int)tgpig.y * NRA;   // first weight row (our N)
@@ -417,24 +618,606 @@ kernel void gemm_w4a8_i8a_i4b_f32c(
             mm.run(mB, mA, cT);
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
-        cT.store(tensor(si, dextents<int32_t,2>(NRB, NRA)));
+        cT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
         threadgroup_barrier(mem_flags::mem_threadgroup);
         for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
-            int nl = idx / NRB, ml = idx % NRB, ni = ra + nl;
-            if (ni < N) facc[ml*NRA + nl] += (float)si[ml*NRA + nl]
-                                             * SCALE_W[(ulong)ni * GPR + g];
+            int ml = idx / NRA, nl = idx % NRA, ni = ra + nl;
+            int mi = rb + ml;
+            if (mi < M && ni < N)
+                facc[idx] +=
+                    (float)si[idx] *
+                    SCALE_A[(ulong)mi * (ulong)GPR + (ulong)g] *
+                    SCALE_W[(ulong)ni * (ulong)GPR + (ulong)g];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
     device float* Cout = C + p.c_offset;
     for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
-        int nl = idx / NRB, ml = idx % NRB, ni = ra + nl, mi = rb + ml;
+        int ml = idx / NRA, nl = idx % NRA;
+        int ni = ra + nl, mi = rb + ml;
         if (mi < M && ni < N) {
-            float v = facc[ml*NRA + nl] * SCALE_A[mi];
             Cout[mi * p.c_row_stride + ni] = apply_activation_at(
-                v, p.activation, ni, p.act_n_begin, p.act_n_len);
+                facc[idx], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
         }
+    }
+}
+
+// K128 W4 path reading the package-native Q4B8G128 layout directly. One block
+// stores scales[8] followed by q[4][8][16], so the 8 output channels consumed
+// together by the kernel are contiguous instead of K/2 bytes apart.
+kernel void gemm_w4a8_bg128_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],
+    device const uint8_t* B       [[buffer(1)]],
+    device float*         C       [[buffer(2)]],
+    device const float*   SCALE_A [[buffer(4)]],
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 16, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int BLOCK_BYTES = 544, SCALE_BYTES = 32;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup float* facc = (threadgroup float*)shmem;
+    threadgroup int8_t* sw =
+        (threadgroup int8_t*)(shmem + NRA*NRB*sizeof(float));
+    threadgroup int32_t* si = (threadgroup int32_t*)sw;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS)
+        facc[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tW = tensor(sw, dextents<int32_t,2>(NK, NRA));
+    auto tA = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, W_WORK = NRA * (NK / UNROLL);
+    for (int g0 = 0; g0 < K; g0 += GS) {
+        const int g = g0 / GS;
+        const int gend = min(g0 + GS, K);
+        auto dotT =
+            mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW),
+                                                  int32_t>();
+        for (int k0 = g0; k0 < gend; k0 += NK) {
+            const int qgi = (k0 - g0) / NK;
+            for (int work = tiitg; work < W_WORK; work += NUM_THREADS) {
+                const int nl = work / (NK / UNROLL);
+                const int sub = work % (NK / UNROLL);
+                const int gn = ra + nl;
+                threadgroup int8_t* dst =
+                    sw + nl*NK + sub*UNROLL;
+                if (gn < N) {
+                    const ulong block =
+                        ((ulong)(gn / 8) * (ulong)GPR + (ulong)g) *
+                        (ulong)BLOCK_BYTES;
+                    device const ulong* src =
+                        (device const ulong*)(B + block + SCALE_BYTES +
+                            qgi*8*16 + (gn & 7)*16 + sub*8);
+                    const ulong packed8 = *src;
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        const uint nibs =
+                            (uint)((packed8 >> (4*i)) & 0xff);
+                        const int lo4 = (int)(nibs & 0x0f);
+                        const int hi4 = (int)(nibs >> 4);
+                        dst[i] = (int8_t)(lo4 >= 8 ? lo4 - 16 : lo4);
+                        dst[i+1] = (int8_t)(hi4 >= 8 ? hi4 - 16 : hi4);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto mA = tA.slice(k0, rb);
+            auto mW = tW.slice(0, 0);
+            mm.run(mA, mW, dotT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        dotT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+            const int ml = idx / NRA, nl = idx % NRA;
+            const int ni = ra + nl, mi = rb + ml;
+            if (mi < M && ni < N) {
+                const ulong block =
+                    ((ulong)(ni / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const float* scales =
+                    (device const float*)(B + block);
+                facc[idx] +=
+                    (float)si[idx] *
+                    SCALE_A[(ulong)mi * (ulong)GPR + (ulong)g] *
+                    scales[ni & 7];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    device float* out = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+        const int ml = idx / NRA, nl = idx % NRA;
+        const int ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N)
+            out[mi * p.c_row_stride + ni] = apply_activation_at(
+                facc[idx], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
+    }
+}
+
+// CPU-equivalent W4 prefill path. Activations use an independent Q8 scale for
+// every 32-element K block (the same quantization granularity as
+// quantize_a_q8_blocks_a4 on the CPU). Each tensor-MMA accumulation therefore
+// covers exactly one activation-scale block before it is converted to fp32 and
+// multiplied by the activation and weight scales.
+kernel void gemm_w4a8_block32_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],
+    device const uint8_t* B       [[buffer(1)]],
+    device float*         C       [[buffer(2)]],
+    device const float*   SCALE_A [[buffer(4)]], // [M, ceil(K/32)]
+    device const float*   SCALE_W [[buffer(5)]],
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 16, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ABS = 32;
+    const int ABPR = (K + ABS - 1) / ABS;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup float*   facc = (threadgroup float*)shmem;
+    threadgroup int8_t*  sa =
+        (threadgroup int8_t*)(shmem + NRA*NRB*sizeof(float));
+    threadgroup int32_t* si =
+        (threadgroup int32_t*)(sa + NRA*NK);
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS)
+        facc[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tA = tensor(sa, dextents<int32_t,2>(NK, NRA));
+    auto tB = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, A_WORK = NRA * (NK / UNROLL);
+    for (int ab0 = 0; ab0 < K; ab0 += ABS) {
+        auto cT =
+            mm.get_destination_cooperative_tensor<decltype(tB), decltype(tA),
+                                                  int32_t>();
+        const int ab_end = min(ab0 + ABS, K);
+        for (int loop_k = ab0; loop_k < ab_end; loop_k += NK) {
+            for (int work = tiitg; work < A_WORK; work += NUM_THREADS) {
+                int nl = work / (NK / UNROLL), sub = work % (NK / UNROLL);
+                int kbase = sub * UNROLL, gn = ra + nl;
+                int gk0 = loop_k + kbase;
+                threadgroup int8_t* dst = sa + nl*NK + kbase;
+                if (gn < N) {
+                    device const uint8_t* wr =
+                        B + (ulong)gn * ((ulong)K/2) + (gk0/2);
+                    const ulong packed8 = *((device const ulong*)wr);
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; i += 2) {
+                        uint8_t byte =
+                            (uint8_t)(packed8 >> (4 * i));
+                        dst[i] = (int8_t)(((gk0 + i) < K)
+                                             ? (int(byte & 0x0f) - 8) : 0);
+                        dst[i+1] = (int8_t)(((gk0 + i + 1) < K)
+                                               ? (int(byte >> 4) - 8) : 0);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            auto mA = tA.slice(0, 0);
+            auto mB = tB.slice(loop_k, rb);
+            mm.run(mB, mA, cT);
+        }
+        cT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int wg = ab0 / GS;
+        for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+            int ml = idx / NRA, nl = idx % NRA;
+            int ni = ra + nl, mi = rb + ml;
+            if (mi < M && ni < N) {
+                facc[idx] +=
+                    (float)si[idx] *
+                    SCALE_A[(ulong)mi * (ulong)ABPR +
+                            (ulong)(ab0 / ABS)] *
+                    SCALE_W[(ulong)ni * (ulong)GPR + (ulong)wg];
+            }
+        }
+    }
+
+    device float* Cout = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+        int ml = idx / NRA, nl = idx % NRA;
+        int ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N) {
+            Cout[mi * p.c_row_stride + ni] = apply_activation_at(
+                facc[idx], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
+        }
+    }
+}
+
+// Exact K32 activation-quantized path over package-native BG128 weights.
+kernel void gemm_w4a8_block32_bg128_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],
+    device const uint8_t* B       [[buffer(1)]],
+    device float*         C       [[buffer(2)]],
+    device const float*   SCALE_A [[buffer(4)]],
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 16, NRB = 64, NK = 32, NUM_THREADS = 128;
+    const int BLOCK_BYTES = 544, SCALE_BYTES = 32;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ABPR = (K + NK - 1) / NK;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup float* facc = (threadgroup float*)shmem;
+    threadgroup int8_t* sw =
+        (threadgroup int8_t*)(shmem + NRA*NRB*sizeof(float));
+    threadgroup int32_t* si =
+        (threadgroup int32_t*)(sw + NRA*NK);
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS)
+        facc[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tW = tensor(sw, dextents<int32_t,2>(NK, NRA));
+    auto tA = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, W_WORK = NRA * (NK / UNROLL);
+    for (int k0 = 0, ab = 0; k0 < K; k0 += NK, ++ab) {
+        const int g = k0 / GS;
+        const int qgi = (k0 % GS) / NK;
+        for (int work = tiitg; work < W_WORK; work += NUM_THREADS) {
+            const int nl = work / (NK / UNROLL);
+            const int sub = work % (NK / UNROLL);
+            const int gn = ra + nl;
+            threadgroup int8_t* dst =
+                sw + nl*NK + sub*UNROLL;
+            if (gn < N) {
+                const ulong block =
+                    ((ulong)(gn / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const ulong* src =
+                    (device const ulong*)(B + block + SCALE_BYTES +
+                        qgi*8*16 + (gn & 7)*16 + sub*8);
+                const ulong packed8 = *src;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; i += 2) {
+                    const uint nibs =
+                        (uint)((packed8 >> (4*i)) & 0xff);
+                    const int lo4 = (int)(nibs & 0x0f);
+                    const int hi4 = (int)(nibs >> 4);
+                    dst[i] = (int8_t)(lo4 >= 8 ? lo4 - 16 : lo4);
+                    dst[i+1] = (int8_t)(hi4 >= 8 ? hi4 - 16 : hi4);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto dotT =
+            mm.get_destination_cooperative_tensor<decltype(tA), decltype(tW),
+                                                  int32_t>();
+        auto mA = tA.slice(k0, rb);
+        auto mW = tW.slice(0, 0);
+        mm.run(mA, mW, dotT);
+        dotT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+            const int ml = idx / NRA, nl = idx % NRA;
+            const int ni = ra + nl, mi = rb + ml;
+            if (mi < M && ni < N) {
+                const ulong block =
+                    ((ulong)(ni / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const float* scales =
+                    (device const float*)(B + block);
+                facc[idx] +=
+                    (float)si[idx] *
+                    SCALE_A[(ulong)mi * (ulong)ABPR + (ulong)ab] *
+                    scales[ni & 7];
+            }
+        }
+    }
+
+    device float* out = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+        const int ml = idx / NRA, nl = idx % NRA;
+        const int ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N)
+            out[mi * p.c_row_stride + ni] = apply_activation_at(
+                facc[idx], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
+    }
+}
+
+// Small-K K64 path. Keeping FP32 partials in threadgroup memory avoids the
+// register pressure of the large-K specialization on K=1024 models.
+kernel void gemm_w4a8_block64_bg128_smallk_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],
+    device const uint8_t* B       [[buffer(1)]],
+    device float*         C       [[buffer(2)]],
+    device const float*   SCALE_A [[buffer(4)]],
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 16, NRB = 64, NK = 32, ABS = 64, NUM_THREADS = 128;
+    const int BLOCK_BYTES = 544, SCALE_BYTES = 32;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ABPR = (K + ABS - 1) / ABS;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup float* facc = (threadgroup float*)shmem;
+    threadgroup int8_t* sw =
+        shmem + NRA*NRB*sizeof(float);
+    threadgroup int32_t* si =
+        (threadgroup int32_t*)(sw + NRA*ABS);
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS)
+        facc[idx] = 0.0f;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    auto tW0 = tensor(sw, dextents<int32_t,2>(NK, NRA));
+    auto tW1 = tensor(sw + NRA*NK, dextents<int32_t,2>(NK, NRA));
+    auto tA = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, W_WORK = NRA * (NK / UNROLL);
+    for (int ab0 = 0, ab = 0; ab0 < K; ab0 += ABS, ++ab) {
+        for (int work = tiitg; work < 2*W_WORK; work += NUM_THREADS) {
+            const int half_idx = work / W_WORK;
+            const int local = work - half_idx*W_WORK;
+            const int nl = local / (NK / UNROLL);
+            const int sub = local % (NK / UNROLL);
+            const int k0 = ab0 + half_idx*NK;
+            const int g = k0 / GS;
+            const int qgi = (k0 % GS) / NK;
+            const int gn = ra + nl;
+            threadgroup int8_t* dst =
+                sw + half_idx*NRA*NK + nl*NK + sub*UNROLL;
+            if (gn < N && k0 < K) {
+                const ulong block =
+                    ((ulong)(gn / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const ulong* src =
+                    (device const ulong*)(B + block + SCALE_BYTES +
+                        qgi*8*16 + (gn & 7)*16 + sub*8);
+                const ulong packed8 = *src;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; i += 2) {
+                    const uint nibs =
+                        (uint)((packed8 >> (4*i)) & 0xff);
+                    const int lo4 = (int)(nibs & 0x0f);
+                    const int hi4 = (int)(nibs >> 4);
+                    dst[i] = (int8_t)(lo4 >= 8 ? lo4 - 16 : lo4);
+                    dst[i+1] = (int8_t)(hi4 >= 8 ? hi4 - 16 : hi4);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto dotT =
+            mm.get_destination_cooperative_tensor<
+                decltype(tA), decltype(tW0), int32_t>();
+        auto mA0 = tA.slice(ab0, rb);
+        auto mW0 = tW0.slice(0, 0);
+        mm.run(mA0, mW0, dotT);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (ab0 + NK < K) {
+            auto mA1 = tA.slice(ab0 + NK, rb);
+            auto mW1 = tW1.slice(0, 0);
+            mm.run(mA1, mW1, dotT);
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        dotT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int g = ab0 / GS;
+        for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+            const int ml = idx / NRA, nl = idx % NRA;
+            const int ni = ra + nl, mi = rb + ml;
+            if (mi < M && ni < N) {
+                const ulong block =
+                    ((ulong)(ni / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const float* scales =
+                    (device const float*)(B + block);
+                facc[idx] +=
+                    (float)si[idx] *
+                    SCALE_A[(ulong)mi * (ulong)ABPR + (ulong)ab] *
+                    scales[ni & 7];
+            }
+        }
+    }
+
+    device float* out = C + p.c_offset;
+    for (int idx = tiitg; idx < NRA*NRB; idx += NUM_THREADS) {
+        const int ml = idx / NRA, nl = idx % NRA;
+        const int ni = ra + nl, mi = rb + ml;
+        if (mi < M && ni < N)
+            out[mi * p.c_row_stride + ni] = apply_activation_at(
+                facc[idx], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
+    }
+}
+
+// Large-K K64 path over package-native BG128 weights. Two K32 integer tensor
+// operations share one cooperative accumulator before FP32 dequantization.
+kernel void gemm_w4a8_block64_bg128_i8a_i4b_f32c(
+    device const int8_t*  A       [[buffer(0)]],
+    device const uint8_t* B       [[buffer(1)]],
+    device float*         C       [[buffer(2)]],
+    device const float*   SCALE_A [[buffer(4)]],
+    constant MatmulW4A8Params& p  [[buffer(3)]],
+    threadgroup int8_t*   shmem   [[threadgroup(0)]],
+    uint3  tgpig                  [[threadgroup_position_in_grid]],
+    ushort tiitg                  [[thread_index_in_threadgroup]])
+{
+    const int NRA = 16, NRB = 64, NK = 32, ABS = 64, NUM_THREADS = 128;
+    const int BLOCK_BYTES = 544, SCALE_BYTES = 32;
+    const int M = p.M, N = p.N, K = p.K;
+    const int GS = p.group_size, GPR = p.groups_per_row;
+    const int ABPR = (K + ABS - 1) / ABS;
+    const int ra = (int)tgpig.y * NRA;
+    const int rb = (int)tgpig.x * NRB;
+
+    threadgroup int8_t* sw = shmem;
+    threadgroup int32_t* si =
+        (threadgroup int32_t*)(sw + NRA*ABS);
+    threadgroup float* weight_scales = (threadgroup float*)(si + NRA*NRB);
+    threadgroup float* activation_scales = weight_scales + NRA;
+    constexpr int ACC_PER_THREAD =
+        (NRA * NRB + NUM_THREADS - 1) / NUM_THREADS;
+    float facc[ACC_PER_THREAD];
+    #pragma unroll
+    for (int slot = 0; slot < ACC_PER_THREAD; ++slot)
+        facc[slot] = 0.0f;
+
+    auto tW0 = tensor(sw, dextents<int32_t,2>(NK, NRA));
+    auto tW1 = tensor(sw + NRA*NK, dextents<int32_t,2>(NK, NRA));
+    auto tA = tensor((device int8_t*)A, dextents<int32_t,2>(K, M),
+                     array<int,2>({1, K}));
+    matmul2d<matmul2d_descriptor(NRB, NRA, NK, false, true, true,
+             matmul2d_descriptor::mode::multiply_accumulate),
+             execution_simdgroups<4>> mm;
+
+    const int UNROLL = 16, W_WORK = NRA * (NK / UNROLL);
+    for (int ab0 = 0, ab = 0; ab0 < K; ab0 += ABS, ++ab) {
+        const int scale_group = ab0 / GS;
+        // Stage both K32 halves of this K64 activation block together. This
+        // replaces two independent stage/barrier pairs with one wider stage.
+        // The halves occupy disjoint threadgroup regions, so only the barrier
+        // after both MMAs (before cooperative store) is required.
+        for (int work = tiitg; work < 2*W_WORK; work += NUM_THREADS) {
+            const int half_idx = work / W_WORK;
+            const int local = work - half_idx*W_WORK;
+            const int nl = local / (NK / UNROLL);
+            const int sub = local % (NK / UNROLL);
+            const int k0 = ab0 + half_idx*NK;
+            const int g = k0 / GS;
+            const int qgi = (k0 % GS) / NK;
+            const int gn = ra + nl;
+            threadgroup int8_t* dst =
+                sw + half_idx*NRA*NK + nl*NK + sub*UNROLL;
+            if (gn < N && k0 < K) {
+                const ulong block =
+                    ((ulong)(gn / 8) * (ulong)GPR + (ulong)g) *
+                    (ulong)BLOCK_BYTES;
+                device const ulong* src =
+                    (device const ulong*)(B + block + SCALE_BYTES +
+                        qgi*8*16 + (gn & 7)*16 + sub*8);
+                const ulong packed8 = *src;
+                #pragma unroll
+                for (int i = 0; i < UNROLL; i += 2) {
+                    const uint nibs =
+                        (uint)((packed8 >> (4*i)) & 0xff);
+                    const int lo4 = (int)(nibs & 0x0f);
+                    const int hi4 = (int)(nibs >> 4);
+                    dst[i] = (int8_t)(lo4 >= 8 ? lo4 - 16 : lo4);
+                    dst[i+1] = (int8_t)(hi4 >= 8 ? hi4 - 16 : hi4);
+                }
+            } else {
+                #pragma unroll
+                for (int i = 0; i < UNROLL; ++i) dst[i] = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto dotT =
+            mm.get_destination_cooperative_tensor<
+                decltype(tA), decltype(tW0), int32_t>();
+        auto mA0 = tA.slice(ab0, rb);
+        auto mW0 = tW0.slice(0, 0);
+        mm.run(mA0, mW0, dotT);
+        if (ab0 + NK < K) {
+            auto mA1 = tA.slice(ab0 + NK, rb);
+            auto mW1 = tW1.slice(0, 0);
+            mm.run(mA1, mW1, dotT);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        dotT.store(tensor(si, dextents<int32_t,2>(NRA, NRB)));
+        if (tiitg < NRA) {
+            const int ni = ra + int(tiitg);
+            if (ni < N) {
+                const ulong block =
+                    ((ulong)(ni / 8) * (ulong)GPR +
+                     (ulong)scale_group) *
+                    (ulong)BLOCK_BYTES;
+                device const float* scales =
+                    (device const float*)(B + block);
+                weight_scales[tiitg] = scales[ni & 7];
+            } else {
+                weight_scales[tiitg] = 0.0f;
+            }
+        }
+        if (tiitg < NRB) {
+            const int mi = rb + int(tiitg);
+            activation_scales[tiitg] =
+                mi < M
+                    ? SCALE_A[(ulong)mi * (ulong)ABPR + (ulong)ab]
+                    : 0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        #pragma unroll
+        for (int slot = 0; slot < ACC_PER_THREAD; ++slot) {
+            const int idx = tiitg + slot*NUM_THREADS;
+            const int ml = idx / NRA, nl = idx % NRA;
+            const int ni = ra + nl, mi = rb + ml;
+            if (idx < NRA*NRB && mi < M && ni < N) {
+                const float partial =
+                    (float)si[idx] *
+                    activation_scales[ml] *
+                    weight_scales[nl];
+                facc[slot] += partial;
+            }
+        }
+    }
+
+    device float* out = C + p.c_offset;
+    #pragma unroll
+    for (int slot = 0; slot < ACC_PER_THREAD; ++slot) {
+        const int idx = tiitg + slot*NUM_THREADS;
+        const int ml = idx / NRA, nl = idx % NRA;
+        const int ni = ra + nl, mi = rb + ml;
+        if (idx < NRA*NRB && mi < M && ni < N)
+            out[mi * p.c_row_stride + ni] = apply_activation_at(
+                facc[slot], p.activation, ni,
+                p.act_n_begin, p.act_n_len);
     }
 }
 
@@ -938,9 +1721,24 @@ kernel void gemv_w8_f32a_i8b_f32c(
     // Each lane strides K; scale applied per group boundary. w8pc (gpr==1) →
     // one scale/row, factored out at the end (fast path); else per-group.
     if (gpr == 1) {
-        for (int k = (int)sgitg*NW + (int)lane; k < p.K; k += NW*(int)nsg) {
+        const int NF = 8;
+        const int NB = NW * NF;
+        const int nb = p.K / NB;
+        for (int ib = (int)sgitg; ib < nb; ib += nsg) {
+            int k = ib * NB + (int)lane * NF;
+            float4 av0 = *(device const float4*)(a + k);
+            float4 av1 = *(device const float4*)(a + k + 4);
+            for (short r=0;r<NR0;++r) {
+                char4 w0 = *(device const char4*)(bx[r] + k);
+                char4 w1 = *(device const char4*)(bx[r] + k + 4);
+                sumf[r] += dot(av0, float4(w0)) + dot(av1, float4(w1));
+            }
+        }
+        for (int k = nb * NB + (int)sgitg*NW + (int)lane;
+             k < p.K; k += NW*(int)nsg) {
             float av = a[k];
-            for (short r=0;r<NR0;++r) sumf[r] += av * (float)bx[r][k];
+            for (short r=0;r<NR0;++r)
+                sumf[r] += av * (float)bx[r][k];
         }
         for (short r=0;r<NR0;++r) sumf[r] *= sc[r][0];            // one scale per row
     } else {
@@ -1251,6 +2049,124 @@ kernel void quantize_act_i8(
         int q = (int)rint(a[k] * inv);
         q = clamp(q, -127, 127);
         o[k] = (int8_t)q;
+    }
+}
+
+// Q8 activation quantization at the CPU W4 kernel's 32-element granularity.
+// One SIMD group owns one (row, K-block), so no threadgroup memory or barrier
+// is required.
+kernel void quantize_act_i8_block32(
+    device const float* A        [[buffer(0)]],
+    device int8_t*      A_I8     [[buffer(2)]],
+    device float*       SCALE_A  [[buffer(4)]],
+    constant QuantActParams& p   [[buffer(3)]],
+    uint group                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]],
+    ushort nsg                   [[simdgroups_per_threadgroup]])
+{
+    const uint blocks = ((uint)p.K + 31u) / 32u;
+    const uint block_groups = (blocks + (uint)nsg - 1u) / (uint)nsg;
+    const uint m = group / block_groups;
+    const uint b =
+        (group - m * block_groups) * (uint)nsg + (uint)sgitg;
+    if (m >= (uint)p.M || b >= blocks) return;
+    const uint k = b * 32u + (uint)lane;
+    device const float* row =
+        A + p.a_offset + m * (uint)p.a_row_stride;
+    float v = k < (uint)p.K ? row[k] : 0.0f;
+    float amax = simd_max(fabs(v));
+    float scale = amax / 127.0f;
+    float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (lane == 0) SCALE_A[m * blocks + b] = scale;
+    if (k < (uint)p.K) {
+        int q = clamp((int)rint(v * inv), -127, 127);
+        A_I8[m * (uint)p.K + k] = (int8_t)q;
+    }
+}
+
+// Four independent K64 activation blocks per 128-thread group.  Each SIMD
+// lane owns two values, so the absmax and quantization need no cross-SIMD
+// synchronization.
+kernel void quantize_act_i8_block64(
+    device const float* A        [[buffer(0)]],
+    device int8_t*      A_I8     [[buffer(2)]],
+    device float*       SCALE_A  [[buffer(4)]],
+    constant QuantActParams& p   [[buffer(3)]],
+    uint group                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]],
+    ushort nsg                   [[simdgroups_per_threadgroup]])
+{
+    const uint blocks = ((uint)p.K + 63u) / 64u;
+    const uint block_groups = (blocks + (uint)nsg - 1u) / (uint)nsg;
+    const uint m = group / block_groups;
+    const uint b =
+        (group - m * block_groups) * (uint)nsg + (uint)sgitg;
+    if (m >= (uint)p.M || b >= blocks) return;
+    const uint k0 = b * 64u + (uint)lane;
+    const uint k1 = k0 + 32u;
+    device const float* row =
+        A + p.a_offset + m * (uint)p.a_row_stride;
+    const float v0 = k0 < (uint)p.K ? row[k0] : 0.0f;
+    const float v1 = k1 < (uint)p.K ? row[k1] : 0.0f;
+    const float amax = simd_max(fmax(fabs(v0), fabs(v1)));
+    const float scale = amax / 127.0f;
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (lane == 0) SCALE_A[m * blocks + b] = scale;
+    if (k0 < (uint)p.K)
+        A_I8[m * (uint)p.K + k0] =
+            (int8_t)clamp((int)rint(v0 * inv), -127, 127);
+    if (k1 < (uint)p.K)
+        A_I8[m * (uint)p.K + k1] =
+            (int8_t)clamp((int)rint(v1 * inv), -127, 127);
+}
+
+// Block-granular variant used by W4 prefill. The block size normally matches
+// the weight quantization group (128), which preserves local activation range
+// while allowing one integer MMA accumulation per weight group.
+kernel void quantize_act_i8_blocks(
+    device const float* A        [[buffer(0)]],
+    device int8_t*      A_I8     [[buffer(2)]],
+    device float*       SCALE_A  [[buffer(4)]],
+    constant QuantActParams& p   [[buffer(3)]],
+    uint group                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]],
+    ushort nsg                   [[simdgroups_per_threadgroup]],
+    threadgroup float* shmem     [[threadgroup(0)]])
+{
+    const uint bs = (uint)p.block_size;
+    const uint blocks = ((uint)p.K + bs - 1u) / bs;
+    const uint m = group / blocks;
+    const uint b = group - m * blocks;
+    if (m >= (uint)p.M) return;
+    const uint k0 = b * bs;
+    const uint kend = min(k0 + bs, (uint)p.K);
+    device const float* row =
+        A + p.a_offset + m * (uint)p.a_row_stride;
+
+    float amax = 0.0f;
+    for (uint k = k0 + (uint)sgitg * 32u + (uint)lane;
+         k < kend; k += (uint)nsg * 32u)
+        amax = fmax(amax, fabs(row[k]));
+    amax = simd_max(amax);
+    if (lane == 0) shmem[sgitg] = amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        float v = lane < nsg ? shmem[lane] : 0.0f;
+        v = simd_max(v);
+        if (lane == 0) shmem[0] = v;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    amax = shmem[0];
+    const float scale = amax / 127.0f;
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (sgitg == 0 && lane == 0) SCALE_A[m * blocks + b] = scale;
+    for (uint k = k0 + (uint)sgitg * 32u + (uint)lane;
+         k < kend; k += (uint)nsg * 32u) {
+        int q = clamp((int)rint(row[k] * inv), -127, 127);
+        A_I8[m * (uint)p.K + k] = (int8_t)q;
     }
 }
 
@@ -1715,9 +2631,10 @@ kernel void rwkv_post_f32(
     }
 }
 
-// RWKV-7 recurrence. One threadgroup owns one head and one thread owns one
-// state-matrix row. Tokens remain serial within the kernel, while all rows and
-// heads update in parallel.
+// RWKV-7 recurrence. A 32-thread SIMD group owns a row tile within one head;
+// every lane owns one state-matrix row. Rows are independent, so splitting a
+// 64-row head across two threadgroups improves occupancy without introducing
+// synchronization. Tokens remain serial within each row.
 kernel void rwkv7_f32(
     device const float* R          [[buffer(0)]],
     device const float* DECAY      [[buffer(1)]],
@@ -1728,14 +2645,70 @@ kernel void rwkv7_f32(
     device const float* A          [[buffer(6)]],
     device const float* B          [[buffer(7)]],
     device void* STATE             [[buffer(8)]],
-    uint head                      [[threadgroup_position_in_grid]],
-    uint row                       [[thread_position_in_threadgroup]])
+    uint group                     [[threadgroup_position_in_grid]],
+    uint lane                      [[thread_position_in_threadgroup]])
 {
+    const uint rows_per_group = 32;
+    const uint groups_per_head =
+        ((uint)p.head_size + rows_per_group - 1) / rows_per_group;
+    uint head = group / groups_per_head;
+    uint row = (group % groups_per_head) * rows_per_group + lane;
     if (int(head) >= p.heads || int(row) >= p.head_size) return;
     uint hidden = (uint)p.heads * (uint)p.head_size;
     uint state_head =
         p.state_offset + head * (uint)p.head_size * (uint)p.head_size;
     uint state_row = state_head + row * (uint)p.head_size;
+
+    if (p.state_fp16 && (p.head_size % 4) == 0) {
+        device half4* state4 =
+            (device half4*)STATE + state_row / 4;
+        for (int t = 0; t < p.real; ++t) {
+            uint base =
+                (uint)t * hidden + head * (uint)p.head_size;
+            float state_a = 0.0f;
+            for (int j = 0; j < p.head_size; j += 4) {
+                const float4 sv = float4(state4[j / 4]);
+                const float4 av =
+                    *((device const float4*)(
+                        A + p.a_offset + base + (uint)j));
+                state_a += sv.x * av.x;
+                state_a += sv.y * av.y;
+                state_a += sv.z * av.z;
+                state_a += sv.w * av.w;
+            }
+
+            float result = 0.0f;
+            const float value = V[p.v_offset + base + row];
+            for (int j = 0; j < p.head_size; j += 4) {
+                float4 sv = float4(state4[j / 4]);
+                const float4 decay =
+                    *((device const float4*)(
+                        DECAY + p.decay_offset + base + (uint)j));
+                const float4 key =
+                    *((device const float4*)(
+                        K + p.k_offset + base + (uint)j));
+                const float4 bv =
+                    *((device const float4*)(
+                        B + p.b_offset + base + (uint)j));
+                const float4 rv =
+                    *((device const float4*)(
+                        R + p.r_offset + base + (uint)j));
+                sv = sv * decay + value * key + state_a * bv;
+                state4[j / 4] = half4(sv);
+                result += sv.x * rv.x;
+                result += sv.y * rv.y;
+                result += sv.z * rv.z;
+                result += sv.w * rv.w;
+            }
+            O[p.out_offset + base + row] = result;
+        }
+        for (int t = p.real; t < p.seq; ++t) {
+            uint base =
+                (uint)t * hidden + head * (uint)p.head_size;
+            O[p.out_offset + base + row] = 0.0f;
+        }
+        return;
+    }
 
     for (int t = 0; t < p.real; ++t) {
         uint base = (uint)t * hidden + head * (uint)p.head_size;
@@ -1768,6 +2741,90 @@ kernel void rwkv7_f32(
     }
     for (int t = p.real; t < p.seq; ++t) {
         uint base = (uint)t * hidden + head * (uint)p.head_size;
+        O[p.out_offset + base + row] = 0.0f;
+    }
+}
+
+// Head-size-64 RWKV7 prefill. One workgroup owns an entire head and keeps its
+// FP32 state matrix in threadgroup memory across the sequence. The five
+// per-token input vectors are loaded once per head instead of once per state
+// row. Decode retains rwkv7_f32 to avoid the two per-token barriers here.
+kernel void rwkv7_h64_tgstate_fp32(
+    device const float* R          [[buffer(0)]],
+    device const float* DECAY      [[buffer(1)]],
+    device float* O                [[buffer(2)]],
+    constant Rwkv7Params& p        [[buffer(3)]],
+    device const float* K          [[buffer(4)]],
+    device const float* V          [[buffer(5)]],
+    device const float* A          [[buffer(6)]],
+    device const float* B          [[buffer(7)]],
+    device float* STATE            [[buffer(8)]],
+    uint head                      [[threadgroup_position_in_grid]],
+    uint row                       [[thread_position_in_threadgroup]])
+{
+    constexpr uint HS = 64;
+    threadgroup float state[HS * HS];
+    threadgroup float sr[HS];
+    threadgroup float sw[HS];
+    threadgroup float sk[HS];
+    threadgroup float sa[HS];
+    threadgroup float sb[HS];
+
+    if (int(head) >= p.heads) return;
+    const uint hidden = (uint)p.heads * HS;
+    const uint state_head = p.state_offset + head * HS * HS;
+    threadgroup float* state_row = state + row * HS;
+    device const float* device_state_row = STATE + state_head + row * HS;
+    #pragma unroll
+    for (uint j = 0; j < HS; j += 4)
+        *((threadgroup float4*)(state_row + j)) =
+            *((device const float4*)(device_state_row + j));
+
+    for (int t = 0; t < p.real; ++t) {
+        const uint base = (uint)t * hidden + head * HS;
+        sr[row] = R[p.r_offset + base + row];
+        sw[row] = DECAY[p.decay_offset + base + row];
+        sk[row] = K[p.k_offset + base + row];
+        sa[row] = A[p.a_offset + base + row];
+        sb[row] = B[p.b_offset + base + row];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float state_a = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < HS; j += 4) {
+            const float4 sv = *((threadgroup float4*)(state_row + j));
+            state_a += sv.x * sa[j];
+            state_a += sv.y * sa[j + 1];
+            state_a += sv.z * sa[j + 2];
+            state_a += sv.w * sa[j + 3];
+        }
+
+        const float value = V[p.v_offset + base + row];
+        float result = 0.0f;
+        #pragma unroll
+        for (uint j = 0; j < HS; j += 4) {
+            float4 sv = *((threadgroup float4*)(state_row + j));
+            const float4 decay(sw[j], sw[j + 1], sw[j + 2], sw[j + 3]);
+            const float4 key(sk[j], sk[j + 1], sk[j + 2], sk[j + 3]);
+            const float4 bv(sb[j], sb[j + 1], sb[j + 2], sb[j + 3]);
+            const float4 rv(sr[j], sr[j + 1], sr[j + 2], sr[j + 3]);
+            sv = sv * decay + value * key + state_a * bv;
+            *((threadgroup float4*)(state_row + j)) = sv;
+            result += sv.x * rv.x;
+            result += sv.y * rv.y;
+            result += sv.z * rv.z;
+            result += sv.w * rv.w;
+        }
+        O[p.out_offset + base + row] = result;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    #pragma unroll
+    for (uint j = 0; j < HS; j += 4)
+        *((device float4*)(STATE + state_head + row * HS + j)) =
+            *((threadgroup float4*)(state_row + j));
+    for (int t = p.real; t < p.seq; ++t) {
+        const uint base = (uint)t * hidden + head * HS;
         O[p.out_offset + base + row] = 0.0f;
     }
 }
@@ -1890,23 +2947,35 @@ kernel void gdn_decode_f32(
     threadgroup float* sq  = sh;
     threadgroup float* sk  = sq + K;
     threadgroup float* red = sk + K;
+    uint lane = dv & 31u;
+    uint sg = dv >> 5;
+    uint nsg = (nthreads + 31u) >> 5;
 
     // Stage q,k; L2-normalize (cooperative). Each thread handles strided dims.
     for (int d = (int)dv; d < K; d += (int)nthreads) { sq[d] = QKV[q_base + d]; sk[d] = QKV[k_base + d]; }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     // L2 norm of q and k: reduce sum of squares over K.
     float qss = 0.0f, kss = 0.0f;
-    for (int d = (int)dv; d < K; d += (int)nthreads) { qss += sq[d]*sq[d]; kss += sk[d]*sk[d]; }
-    // reduce qss then kss via shared mem.
-    red[dv] = qss; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
-    float q_inv = 1.0f / sqrt(red[0] + p.l2_eps);
+    for (int d = (int)dv; d < K; d += (int)nthreads) {
+        qss += sq[d]*sq[d];
+        kss += sk[d]*sk[d];
+    }
+    // Two-level SIMD reduction avoids the log2(V) threadgroup-barrier tree.
+    qss = simd_sum(qss);
+    kss = simd_sum(kss);
+    if (lane == 0) {
+        red[sg] = qss;
+        red[nsg + sg] = kss;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    red[dv] = kss; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
-    float k_inv = 1.0f / sqrt(red[0] + p.l2_eps);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int d = (int)dv; d < K; d += (int)nthreads) { sq[d] *= q_inv; sk[d] *= k_inv; }
+    float q_total = simd_sum(lane < nsg ? red[lane] : 0.0f);
+    float k_total = simd_sum(lane < nsg ? red[nsg + lane] : 0.0f);
+    float q_inv = 1.0f / sqrt(q_total + p.l2_eps);
+    float k_inv = 1.0f / sqrt(k_total + p.l2_eps);
+    for (int d = (int)dv; d < K; d += (int)nthreads) {
+        sq[d] *= q_inv;
+        sk[d] *= k_inv;
+    }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Gate scalars (per value head).
@@ -1914,34 +2983,40 @@ kernel void gdn_decode_f32(
     float b_h = B[p.b_offset + vh];
     float sp = gdn_softplus(a_h + DTB[p.dtb_offset + vh]);
     float g_exp = exp((-exp(ALOG[p.Alog_offset + vh])) * sp);
-    float beta  = 1.0f / (1.0f + exp(-b_h));       // sigmoid(b)
+    float beta = 1.0f / (1.0f + exp(-b_h));
 
     // NOTE: host dispatches exactly V threads, so dv < V for all threads (all
     // must reach the RMSNorm barriers below — no early return allowed).
     device float* state_h = STATE + p.state_offset + (uint)((int)vh * K * V);
     float vv = QKV[v_base + dv];
 
-    // Pass 1: decay state rows + kv_mem[dv] = Σ_dk state[dk,dv]*k[dk].
-    float kv = 0.0f;
+    // Pass 1 reads the old state without writing it. Besides kv, accumulate
+    // the decayed-state contribution to q and q·k. This lets pass 2 perform
+    // the only state write and avoids storing then immediately reloading the
+    // decayed matrix.
+    float kv = 0.0f, attn_decay = 0.0f, qk = 0.0f;
     for (int dk = 0; dk < K; dk++) {
         float r = state_h[dk*V + dv] * g_exp;
-        state_h[dk*V + dv] = r;
         kv += r * sk[dk];
+        attn_decay += r * sq[dk];
+        qk += sk[dk] * sq[dk];
     }
     float delta = (vv - kv) * beta;
-    // Pass 2: state[dk,dv] += k[dk]*delta ; attn_out[dv] = Σ state[dk,dv]*q[dk].
-    float attn = 0.0f;
+    // Pass 2 writes final state. attn(state_new,q) is reconstructed from the
+    // two dot products above, so this traversal does no extra state readback
+    // for the output reduction.
     for (int dk = 0; dk < K; dk++) {
-        float r = state_h[dk*V + dv] + sk[dk]*delta;
+        float r = state_h[dk*V + dv] * g_exp + sk[dk] * delta;
         state_h[dk*V + dv] = r;
-        attn += r * sq[dk];
     }
-    attn *= p.scale;
+    float attn = (attn_decay + delta * qk) * p.scale;
 
     // RMSNormGated: rms over v_dim (reduction), then *norm_w * silu(z).
-    red[dv] = attn*attn; threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint s = nthreads/2; s>0; s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}    
-    float rms = 1.0f / sqrt(red[0] / (float)V + p.rms_eps);
+    float attn_sq = simd_sum(attn * attn);
+    if (lane == 0) red[sg] = attn_sq;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float attn_total = simd_sum(lane < nsg ? red[lane] : 0.0f);
+    float rms = 1.0f / sqrt(attn_total / (float)V + p.rms_eps);
     float normed = attn * rms * NORMW[p.norm_offset + dv];
     float z = Z[p.z_offset + (uint)((int)vh * V) + dv];
     float silu_z = z / (1.0f + exp(-z));
@@ -1984,6 +3059,9 @@ kernel void gdn_prefill_f32(
     threadgroup float* sq  = sh;
     threadgroup float* sk  = sq + K;
     threadgroup float* red = sk + K;
+    uint lane = dv & 31u;
+    uint sg = dv >> 5;
+    uint nsg = (nthreads + 31u) >> 5;
 
     device float* state_h = STATE + p.state_offset + (uint)((int)vh * K * V);
     float neg_exp_A = -exp(ALOG[p.Alog_offset + vh]);
@@ -2001,15 +3079,26 @@ kernel void gdn_prefill_f32(
             sk[d] = QKV[(kb + (uint)d) * (uint)S + (uint)t];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        float qss=0.0f, kss=0.0f;
-        for (int d=(int)dv; d<K; d+=(int)nthreads){ qss+=sq[d]*sq[d]; kss+=sk[d]*sk[d]; }
-        red[dv]=qss; threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
-        float qi=1.0f/sqrt(red[0]+p.l2_eps); threadgroup_barrier(mem_flags::mem_threadgroup);
-        red[dv]=kss; threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
-        float ki=1.0f/sqrt(red[0]+p.l2_eps); threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(int d=(int)dv; d<K; d+=(int)nthreads){ sq[d]*=qi; sk[d]*=ki; }
+        float qss=0.0f,kss=0.0f;
+        for(int d=(int)dv;d<K;d+=(int)nthreads){
+            qss+=sq[d]*sq[d];
+            kss+=sk[d]*sk[d];
+        }
+        qss=simd_sum(qss);
+        kss=simd_sum(kss);
+        if(lane==0) {
+            red[sg]=qss;
+            red[nsg+sg]=kss;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float qt=simd_sum(lane<nsg?red[lane]:0.0f);
+        float kt=simd_sum(lane<nsg?red[nsg+lane]:0.0f);
+        float qi=1.0f/sqrt(qt+p.l2_eps);
+        float ki=1.0f/sqrt(kt+p.l2_eps);
+        for(int d=(int)dv; d<K; d+=(int)nthreads) {
+            sq[d]*=qi;
+            sk[d]*=ki;
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
         // gate scalars for (t, vh): a/b are [seq, num_v_heads].
@@ -2017,26 +3106,381 @@ kernel void gdn_prefill_f32(
         float b_h = B[p.b_offset + (uint)(t*p.num_v_heads) + vh];
         float sp = gdn_softplus(a_h + DTB[p.dtb_offset + vh]);
         float g_exp = exp(neg_exp_A * sp);
-        float beta  = 1.0f/(1.0f+exp(-b_h));
+        float beta = 1.0f/(1.0f+exp(-b_h));
         float vv = QKV[(p.qkv_offset + (uint)(2*qkv_dim) + (uint)((int)vh*V) + dv) * (uint)S + (uint)t];
 
-        // Pass1
-        float kv = 0.0f;
-        for (int dk=0; dk<K; dk++){ float r=state_h[dk*V+dv]*g_exp; state_h[dk*V+dv]=r; kv+=r*sk[dk]; }
+        // Read old state once for the three reductions; write only the final
+        // state in pass 2.
+        float kv=0.0f,attn_decay=0.0f,qk=0.0f;
+        for(int dk=0;dk<K;dk++){
+            float r=state_h[dk*V+dv]*g_exp;
+            kv+=r*sk[dk];
+            attn_decay+=r*sq[dk];
+            qk+=sk[dk]*sq[dk];
+        }
         float delta = (vv - kv) * beta;
-        // Pass2
-        float attn = 0.0f;
-        for (int dk=0; dk<K; dk++){ float r=state_h[dk*V+dv]+sk[dk]*delta; state_h[dk*V+dv]=r; attn+=r*sq[dk]; }
-        attn *= p.scale;
+        for(int dk=0;dk<K;dk++){
+            float r=state_h[dk*V+dv]*g_exp+sk[dk]*delta;
+            state_h[dk*V+dv]=r;
+        }
+        float attn=(attn_decay+delta*qk)*p.scale;
         // RMSNormGated
-        red[dv]=attn*attn; threadgroup_barrier(mem_flags::mem_threadgroup);
-        for(uint s=nthreads/2;s>0;s>>=1){ if(dv<s) red[dv]+=red[dv+s]; threadgroup_barrier(mem_flags::mem_threadgroup);}
-        float rms=1.0f/sqrt(red[0]/(float)V + p.rms_eps);
+        float ats=simd_sum(attn*attn);
+        if(lane==0) red[sg]=ats;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float at=simd_sum(lane<nsg?red[lane]:0.0f);
+        float rms=1.0f/sqrt(at/(float)V + p.rms_eps);
         float normed = attn*rms*NORMW[p.norm_offset + dv];
         float z = Z[p.z_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv];
         float silu_z = z/(1.0f+exp(-z));
         O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = normed * silu_z;
         threadgroup_barrier(mem_flags::mem_threadgroup);  // state consistent before next t
+    }
+}
+
+// K-parallel GDN prefill. Threads cooperate on each state column,
+// while q·k is reduced once per head/token instead of redundantly in every
+// value-column thread. Token recurrence remains serial and exact.
+kernel void gdn_prefill_kparallel_f32(
+    device const float*   QKV    [[buffer(0)]],
+    device const float*   A      [[buffer(1)]],
+    device const float*   B      [[buffer(2)]],
+    device const float*   Z      [[buffer(5)]],
+    device const float*   ALOG   [[buffer(6)]],
+    device const float*   DTB    [[buffer(7)]],
+    device const float*   NORMW  [[buffer(8)]],
+    device float*         STATE  [[buffer(9)]],
+    device float*         O      [[buffer(4)]],
+    constant GdnParams&   p      [[buffer(3)]],
+    threadgroup float*    sh     [[threadgroup(0)]],
+    uint  vh                     [[threadgroup_position_in_grid]],
+    uint  tid                    [[thread_position_in_threadgroup]],
+    uint  nthreads               [[threads_per_threadgroup]])
+{
+    const int K = p.k_dim, V = p.v_dim, S = p.seq_len;
+    const int SPLITS = 4;
+    if ((int)vh >= p.num_v_heads) return;
+    const int nreal =
+        (p.n_real > 0 && p.n_real < S) ? p.n_real : S;
+    const int repeat = p.num_v_heads / p.num_heads;
+    const int kh = (int)vh / repeat;
+    const int qkv_dim = p.num_heads * K;
+    const int zdim = p.num_v_heads * V;
+    const int split = (int)tid / V;
+    const int dv = (int)tid - split * V;
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5;
+    const uint nsg = (nthreads + 31u) >> 5;
+
+    threadgroup float* sq = sh;
+    threadgroup float* sk = sq + K;
+    threadgroup float* red_q = sk + K;       // nsg
+    threadgroup float* red_k = red_q + nsg;  // nsg
+    threadgroup float* red_qk = red_k + nsg; // nsg
+    threadgroup float* partial_kv = red_qk + nsg;
+    threadgroup float* partial_attn = partial_kv + SPLITS*V;
+    threadgroup float* delta = partial_attn + SPLITS*V;
+    threadgroup float* attn_s = delta + V;             // V
+    threadgroup float* gate = attn_s + V;              // 2
+
+    device float* state_h =
+        STATE + p.state_offset + (uint)((int)vh * K * V);
+    const float neg_exp_A = -exp(ALOG[p.Alog_offset + vh]);
+
+    for (int t = 0; t < S; ++t) {
+        if (t >= nreal) {
+            if (split == 0 && dv < V)
+                O[p.out_offset + (uint)(t*zdim) +
+                  (uint)((int)vh*V + dv)] = 0.0f;
+            continue;
+        }
+
+        const uint qb = p.qkv_offset + (uint)(kh*K);
+        const uint kb = p.qkv_offset + (uint)qkv_dim + (uint)(kh*K);
+        for (int d = (int)tid; d < K; d += (int)nthreads) {
+            sq[d] = QKV[(qb + (uint)d)*(uint)S + (uint)t];
+            sk[d] = QKV[(kb + (uint)d)*(uint)S + (uint)t];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float qss = 0.0f, kss = 0.0f, qks = 0.0f;
+        for (int d = (int)tid; d < K; d += (int)nthreads) {
+            const float q = sq[d], k = sk[d];
+            qss += q*q;
+            kss += k*k;
+            qks += q*k;
+        }
+        qss = simd_sum(qss);
+        kss = simd_sum(kss);
+        qks = simd_sum(qks);
+        if (lane == 0) {
+            red_q[sg] = qss;
+            red_k[sg] = kss;
+            red_qk[sg] = qks;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float qt = simd_sum(lane < nsg ? red_q[lane] : 0.0f);
+        const float kt = simd_sum(lane < nsg ? red_k[lane] : 0.0f);
+        const float qkt = simd_sum(lane < nsg ? red_qk[lane] : 0.0f);
+        const float qi = 1.0f / sqrt(qt + p.l2_eps);
+        const float ki = 1.0f / sqrt(kt + p.l2_eps);
+        const float qk = qkt * qi * ki;
+        for (int d = (int)tid; d < K; d += (int)nthreads) {
+            sq[d] *= qi;
+            sk[d] *= ki;
+        }
+        if (tid == 0) {
+            const float a_h =
+                A[p.a_offset + (uint)(t*p.num_v_heads) + vh];
+            const float b_h =
+                B[p.b_offset + (uint)(t*p.num_v_heads) + vh];
+            gate[0] =
+                exp(neg_exp_A *
+                    gdn_softplus(a_h + DTB[p.dtb_offset + vh]));
+            gate[1] = 1.0f / (1.0f + exp(-b_h));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float kv = 0.0f, attn_decay = 0.0f;
+        if (dv < V) {
+            for (int dk = split; dk < K; dk += SPLITS) {
+                const float r =
+                    state_h[dk*V + dv] * gate[0];
+                kv += r * sk[dk];
+                attn_decay += r * sq[dk];
+            }
+            partial_kv[split*V + dv] = kv;
+            partial_attn[split*V + dv] = attn_decay;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (split == 0 && dv < V) {
+            const float vv =
+                QKV[(p.qkv_offset + (uint)(2*qkv_dim) +
+                     (uint)((int)vh*V + dv)) * (uint)S + (uint)t];
+            float kv_total = 0.0f, attn_total = 0.0f;
+            #pragma unroll
+            for (int s = 0; s < SPLITS; ++s) {
+                kv_total += partial_kv[s*V + dv];
+                attn_total += partial_attn[s*V + dv];
+            }
+            const float d = (vv - kv_total) * gate[1];
+            delta[dv] = d;
+            attn_s[dv] = (attn_total + d*qk) * p.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (dv < V) {
+            const float d = delta[dv];
+            for (int dk = split; dk < K; dk += SPLITS)
+                state_h[dk*V + dv] =
+                    state_h[dk*V + dv] * gate[0] + sk[dk] * d;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        float ats =
+            (split == 0 && dv < V) ? attn_s[dv] * attn_s[dv] : 0.0f;
+        ats = simd_sum(ats);
+        if (lane == 0) red_q[sg] = ats;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const float at =
+            simd_sum(lane < nsg ? red_q[lane] : 0.0f);
+        if (split == 0 && dv < V) {
+            const float rms =
+                1.0f / sqrt(at / (float)V + p.rms_eps);
+            const float z =
+                Z[p.z_offset + (uint)(t*zdim) +
+                  (uint)((int)vh*V + dv)];
+            const float silu_z = z / (1.0f + exp(-z));
+            O[p.out_offset + (uint)(t*zdim) +
+              (uint)((int)vh*V + dv)] =
+                attn_s[dv] * rms * NORMW[p.norm_offset + dv] * silu_z;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// Prepare normalized Q/K for the row-parallel recurrent kernel. One
+// threadgroup owns one (token, key-head).
+kernel void gdn_prepare_qk_f32(
+    device const float* QKV [[buffer(0)]],
+    device float* QN [[buffer(10)]],
+    device float* KN [[buffer(11)]],
+    constant GdnParams& p [[buffer(3)]],
+    threadgroup float* red [[threadgroup(0)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]])
+{
+    const int K = p.k_dim, S = p.seq_len;
+    const int kh = (int)group / S;
+    const int t = (int)group - kh*S;
+    if (kh >= p.num_heads) return;
+    const uint qb = p.qkv_offset + (uint)(kh*K);
+    const uint kb =
+        p.qkv_offset + (uint)(p.num_heads*K + kh*K);
+    float qss = 0.0f, kss = 0.0f;
+    for (int d = (int)tid; d < K; d += (int)nthreads) {
+        const float q = QKV[(qb + (uint)d)*(uint)S + (uint)t];
+        const float k = QKV[(kb + (uint)d)*(uint)S + (uint)t];
+        QN[((kh*S + t)*K) + d] = q;
+        KN[((kh*S + t)*K) + d] = k;
+        qss += q*q;
+        kss += k*k;
+    }
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5;
+    const uint nsg = (nthreads + 31u) >> 5;
+    qss = simd_sum(qss);
+    kss = simd_sum(kss);
+    if (lane == 0) {
+        red[sg] = qss;
+        red[nsg + sg] = kss;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float qt = simd_sum(lane < nsg ? red[lane] : 0.0f);
+    const float kt = simd_sum(lane < nsg ? red[nsg + lane] : 0.0f);
+    const float qi = 1.0f / sqrt(qt + p.l2_eps);
+    const float ki = 1.0f / sqrt(kt + p.l2_eps);
+    for (int d = (int)tid; d < K; d += (int)nthreads) {
+        QN[((kh*S + t)*K) + d] *= qi;
+        KN[((kh*S + t)*K) + d] *= ki;
+    }
+}
+
+// Precompute the two scalar gates once per (token, value-head).
+kernel void gdn_prepare_gates_f32(
+    device const float* A [[buffer(1)]],
+    device const float* B [[buffer(2)]],
+    device const float* ALOG [[buffer(6)]],
+    device const float* DTB [[buffer(7)]],
+    device float* GEXP [[buffer(12)]],
+    device float* BETA [[buffer(13)]],
+    constant GdnParams& p [[buffer(3)]],
+    uint gid [[thread_position_in_grid]])
+{
+    const int total = p.seq_len * p.num_v_heads;
+    if ((int)gid >= total) return;
+    const int vh = (int)gid % p.num_v_heads;
+    const float a = A[p.a_offset + gid];
+    const float b = B[p.b_offset + gid];
+    GEXP[gid] =
+        exp(-exp(ALOG[p.Alog_offset + vh]) *
+            gdn_softplus(a + DTB[p.dtb_offset + vh]));
+    BETA[gid] = 1.0f / (1.0f + exp(-b));
+}
+
+// One SIMD group per (value-head, value-row). Each lane keeps K/32 state
+// values in registers for the whole sequence, so state is loaded and stored
+// once per prefill instead of once per token.
+kernel void gdn_recurrence_rows_f32(
+    device const float* QKV [[buffer(0)]],
+    device float* STATE [[buffer(9)]],
+    device const float* QN [[buffer(10)]],
+    device const float* KN [[buffer(11)]],
+    device const float* GEXP [[buffer(12)]],
+    device const float* BETA [[buffer(13)]],
+    device float* RAW [[buffer(14)]],
+    constant GdnParams& p [[buffer(3)]],
+    uint2 group [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]])
+{
+    const int K = 128, V = p.v_dim, S = p.seq_len;
+    const int dv = (int)group.x*4 + (int)sg;
+    const int vh = (int)group.y;
+    if (dv >= V || vh >= p.num_v_heads) return;
+    const int repeat = p.num_v_heads / p.num_heads;
+    const int kh = vh / repeat;
+    const int qkv_dim = p.num_heads*K;
+    const int nreal =
+        (p.n_real > 0 && p.n_real < S) ? p.n_real : S;
+    device float* state =
+        STATE + p.state_offset + (ulong)vh*K*V;
+    float ls[4];
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int dk = (int)lane + j*32;
+        ls[j] = state[dk*V + dv];
+    }
+
+    for (int t = 0; t < nreal; ++t) {
+        const int gate_idx = t*p.num_v_heads + vh;
+        const float decay = GEXP[gate_idx];
+        float sk = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int dk = (int)lane + j*32;
+            ls[j] *= decay;
+            sk += ls[j] * KN[(kh*S + t)*K + dk];
+        }
+        sk = simd_sum(sk);
+        const float vv =
+            QKV[(p.qkv_offset + (uint)(2*qkv_dim + vh*V + dv)) *
+                (uint)S + (uint)t];
+        const float delta = (vv - sk) * BETA[gate_idx];
+        float y = 0.0f;
+        #pragma unroll
+        for (int j = 0; j < 4; ++j) {
+            const int dk = (int)lane + j*32;
+            ls[j] += KN[(kh*S + t)*K + dk] * delta;
+            y += ls[j] * QN[(kh*S + t)*K + dk];
+        }
+        y = simd_sum(y);
+        if (lane == 0)
+            RAW[(t*p.num_v_heads + vh)*V + dv] = y * p.scale;
+    }
+    if (lane == 0) {
+        for (int t = nreal; t < S; ++t)
+            RAW[(t*p.num_v_heads + vh)*V + dv] = 0.0f;
+    }
+    #pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int dk = (int)lane + j*32;
+        state[dk*V + dv] = ls[j];
+    }
+}
+
+// RMSNormGated over the recurrent output, one threadgroup per
+// (token, value-head).
+kernel void gdn_post_f32(
+    device const float* Z [[buffer(5)]],
+    device const float* NORMW [[buffer(8)]],
+    device const float* RAW [[buffer(14)]],
+    device float* O [[buffer(4)]],
+    constant GdnParams& p [[buffer(3)]],
+    threadgroup float* red [[threadgroup(0)]],
+    uint group [[threadgroup_position_in_grid]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint nthreads [[threads_per_threadgroup]])
+{
+    const int V = p.v_dim;
+    const int vh = (int)group % p.num_v_heads;
+    const int t = (int)group / p.num_v_heads;
+    if (t >= p.seq_len) return;
+    const int base = (t*p.num_v_heads + vh)*V;
+    float ss = 0.0f;
+    if ((int)tid < V) {
+        const float v = RAW[base + tid];
+        ss = v*v;
+    }
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5;
+    const uint nsg = (nthreads + 31u) >> 5;
+    ss = simd_sum(ss);
+    if (lane == 0) red[sg] = ss;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total =
+        simd_sum(lane < nsg ? red[lane] : 0.0f);
+    if ((int)tid < V) {
+        const float rms =
+            1.0f / sqrt(total/(float)V + p.rms_eps);
+        const float z =
+            Z[p.z_offset + (uint)base + tid];
+        const float silu_z = z/(1.0f + exp(-z));
+        O[p.out_offset + (uint)base + tid] =
+            RAW[base + tid] * rms *
+            NORMW[p.norm_offset + tid] * silu_z;
     }
 }
 

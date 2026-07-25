@@ -24,6 +24,7 @@ struct Options {
     int ssd_cache_mb = 0;
     int ssd_io_workers = 8;
     std::string trace_path;
+    std::string token_loss_path;
     bool prepend_bos = false;
     bool tokenize_only = false;
     Device device = Device::CPU;
@@ -53,10 +54,12 @@ void print_usage(const char* argv0) {
     std::printf("  --chunk-size <int>    Prefill chunk size for CE passes (default 256)\n");
     std::printf("  --n-ctx <int>         Context size (default 4096)\n");
     std::printf("  --threads <int>       Worker threads (default 4)\n");
+    std::printf("  --device <cpu|metal>  Compute backend (default: cpu)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
+    std::printf("  --dump-token-loss <path.csv>  Write position,target,CE rows\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
 }
@@ -140,6 +143,13 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             opts.trace_path = value;
             if (opts.trace_path.empty()) {
                 error = "--trace path must not be empty";
+                return false;
+            }
+        } else if (arg == "--dump-token-loss") {
+            if (!require_value("--dump-token-loss", value)) return false;
+            opts.token_loss_path = value;
+            if (opts.token_loss_path.empty()) {
+                error = "--dump-token-loss path must not be empty";
                 return false;
             }
         } else if (arg == "--prepend-bos") {
@@ -261,6 +271,16 @@ int main(int argc, char** argv) {
     int chunks = 0;
     bool finite = true;
     double total_ce = 0.0;
+    std::ofstream token_loss;
+    if (!opts.token_loss_path.empty()) {
+        token_loss.open(opts.token_loss_path);
+        if (!token_loss) {
+            std::fprintf(stderr, "ppl: failed to open %s\n",
+                         opts.token_loss_path.c_str());
+            return 1;
+        }
+        token_loss << "position,target,ce\n";
+    }
 
     auto start = std::chrono::steady_clock::now();
     for (int offset = 0; offset < n_tokens - 1; offset += opts.chunk_size) {
@@ -292,7 +312,12 @@ int main(int argc, char** argv) {
             int target_pos = global_pos + 1;
             if (target_pos >= n_tokens) break;
             const float* p = logits.data() + pos * vocab;
-            total_ce += cross_entropy_for_target(p, vocab, token_ids[target_pos], finite);
+            const float token_ce =
+                cross_entropy_for_target(p, vocab, token_ids[target_pos], finite);
+            total_ce += token_ce;
+            if (token_loss)
+                token_loss << global_pos << ',' << token_ids[target_pos] << ','
+                           << token_ce << '\n';
             n_targets++;
         }
         chunks++;

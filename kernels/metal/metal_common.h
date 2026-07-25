@@ -117,6 +117,7 @@ struct QuantActParams {
     int  K;
     uint a_offset;         // elements into fp32 A
     int  a_row_stride;     // elements between rows of A
+    int  block_size;       // 0 = one scale per row; otherwise K-block size
     // out int8 A (buffer 2) contiguous [M,K]; scale_a (buffer 4) [M].
 };
 

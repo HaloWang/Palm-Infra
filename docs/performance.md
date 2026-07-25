@@ -67,9 +67,9 @@ Metal support is experimental. The current optimized path covers resident
 FP16, W8, and W4 packages. Results below use the same Apple M5 Pro, four CPU
 threads, `warmup=3`, five independent processes, and median throughput.
 
-For mollm, `--prompt-tokens 256 --max-new-tokens 65` produces one prefill token
-and exactly 64 timed decode tokens. For llama.cpp, prefill and decode are
-separate processes: `-p 256 -n 0` and `-p 0 -n 64 -d 256`. The latter matters:
+For mollm, `--prompt-tokens 256 --max-new-tokens 65` produces one 256-token
+prefill pass and exactly 64 timed decode tokens. For llama.cpp, prefill and
+decode are separate processes: `-p 256 -n 0` and `-p 0 -n 64 -d 256`. The latter matters:
 it measures tg64 with an existing 256-token context rather than the faster
 empty-context decode path. Both runtimes keep model weights on Metal.
 
@@ -79,33 +79,74 @@ empty-context decode path. Both runtimes keep model weights on Metal.
 
 | Model | mollm Metal pp/tg | llama.cpp Metal pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | 2773.60 / 126.59 | **8181.36** / **135.13** | -6.3% |
-| Youtu-LLM-2B | 154.09 / **61.44** | **3829.10** / 60.54 | +1.5% |
-| Qwen3.5-4B | 1094.58 / **30.43** | **2051.41** / 30.37 | +0.2% |
-| RWKV7-1.5B | 443.46 / **78.06** | **3690.54** / 73.16 | +6.7% |
+| Qwen3.5-0.8B | **8484.55** / 124.34 | 8181.36 / **135.13** | -8.0% |
+| Youtu-LLM-2B | **4994.05** / **61.67** | 3829.10 / 60.54 | +1.9% |
+| Qwen3.5-4B | 2021.33 / **30.55** | **2051.41** / 30.37 | +0.6% |
+| RWKV7-1.5B | **3703.60** / **79.43** | 3690.54 / 73.16 | +8.6% |
 
 ### W8
 
 | Model | mollm Metal W8 pp/tg | llama.cpp Metal Q8_0 pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | 2515.67 / 158.53 | **8570.11** / **200.54** | -20.9% |
-| Youtu-LLM-2B | 3067.52 / 86.98 | **3897.02** / **95.07** | -8.5% |
-| Qwen3.5-4B | 939.51 / 44.86 | **2140.11** / **51.28** | -12.5% |
-| RWKV7-1.5B | 1502.81 / 102.39 | **3700.83** / **102.86** | -0.5% |
+| Qwen3.5-0.8B | **9011.61** / 177.50 | 8570.11 / **200.54** | -11.5% |
+| Youtu-LLM-2B | **4840.48** / **98.89** | 3897.02 / 95.07 | +4.0% |
+| Qwen3.5-4B | 1966.32 / **51.97** | **2140.11** / 51.28 | +1.3% |
+| RWKV7-1.5B | 3536.47 / **120.44** | **3700.83** / 102.86 | +17.1% |
 
 ### W4
 
 | Model | mollm Metal W4 pp/tg | llama.cpp Metal Q4_0 pp/tg | Decode difference |
 |---|---:|---:|---:|
-| Qwen3.5-0.8B | 2844.41 / 227.71 | **8875.59** / **251.99** | -9.6% |
-| Youtu-LLM-2B | **4418.90** / **149.69** | 4102.45 / 141.63 | +5.7% |
-| Qwen3.5-4B | 1208.82 / 76.00 | **2214.69** / **76.96** | -1.2% |
-| RWKV7-1.5B mixed W4 | 1647.55 / **144.21** | **3797.51** / 132.25 | +9.0% |
+| Qwen3.5-0.8B | **9080.44** / 233.56 | 8875.59 / **251.99** | -7.3% |
+| Youtu-LLM-2B | 3929.00 / **153.77** | **4102.45** / 141.63 | +8.6% |
+| Qwen3.5-4B | 2170.91 / **77.28** | **2214.69** / 76.96 | +0.4% |
+| RWKV7-1.5B mixed W4 | 2962.41 / **151.40** | **3797.51** / 132.25 | +14.5% |
 
-Metal decode is competitive on the larger FP16 and W4 cases, but it is not yet
-a blanket speedup: Qwen 0.8B and the W8 models remain behind llama.cpp. Metal
-prefill also trails llama.cpp for most models. Youtu FP16 prefill is an
-especially slow fallback path; Youtu W4 is the optimized path.
+FP16 and W8 prefill cast each reused FP32 activation matrix to FP16 once, then
+use FP16-input tensor GEMM for activation-bearing projections. FP16 reads both
+operands directly as device tensors; W8 dequantizes weights while staging.
+W8 selects separately compiled M64xN64 or M128xN64 cooperative tiles from the
+matrix dimensions, keeping occupancy high on smaller projections without
+regressing large gate/up and down projections.
+This reduces the activation working set and repeated device reads while
+retaining FP32 accumulation.
+K=128 Gated DeltaNet prefill keeps each state row in SIMD-group registers
+across the sequence, matching the recurrent structure used by llama.cpp.
+This makes Qwen3.5-0.8B FP16 and W8 prefill faster than llama.cpp, while Youtu
+FP16/W8 is also faster. Qwen3.5-4B FP16 prefill is now
+within about 1.5% of llama.cpp; its W8 prefill remains about 8% behind.
+
+RWKV7 prefill assigns one workgroup to each 64-wide head. Its 16 KiB FP32
+state matrix remains in threadgroup memory for the whole sequence, while each
+token's R/W/K/A/B vectors are loaded once per head. This removes per-token
+global state traffic and redundant per-row vector reads. FP16 prefill now
+slightly exceeds llama.cpp; W8 is within 5%, up from less than half of
+llama.cpp before this change. Decode keeps the row-parallel kernel to avoid
+prefill's synchronization cost.
+
+W4 now uses a correctness-aware balanced path by default. Unactivated
+projections retain FP32 activations while unpacking weights to half for tensor
+GEMM, with dimension-selected M64xN64 and M128xN64 cooperative tiles. Fused
+gate/up projections quantize activations in K64 blocks and reuse
+package-native BG128 weights; two K32 integer tensor operations are accumulated
+before FP32 dequantization. Both K32 halves are staged together. For
+`K > 1024`, each thread keeps its FP32 output partials in registers, while the
+small activation and weight-scale vectors reuse the existing cooperative-store
+barrier. K1024 retains the lower-register-pressure shared-partial kernel. This
+reduces synchronization, shared-memory traffic, and the large-K threadgroup
+footprint without changing integer accumulation or scale boundaries.
+`MOLLM_METAL_W4_PREFILL_MODE=accurate` remains available for full-output K32
+diagnostics.
+
+On the pathological 512-token Youtu sample, default Metal PPL is now
+`82.5373` versus CPU `84.1760`, a -1.95% difference. The previous all-half
+path that produced a +7.71% gap is no longer used. Five repeated Metal runs
+produced identical CE/PPL. The balanced path
+also keeps 0.8B and 4B within -0.18% and -0.13% of their CPU PPL, respectively.
+Register-resident partials, scale staging, and dimension-selected cooperative
+tiles lift the Youtu prefill median from `3287.35` to `3929.00` tok/s (+19.5%).
+Youtu now trails llama.cpp prefill by 4.2%; decode remains 8.6% faster through
+a separate GEMV path.
 
 ### Youtu W4 context scaling
 
@@ -114,7 +155,7 @@ and 4096-token rows are earlier three-process medians used to show scaling.
 
 | tg64 starting context | mollm Metal | llama.cpp Metal | Difference |
 |---|---:|---:|---:|
-| 256 | **149.69 t/s** | 141.63 t/s | +5.7% |
+| 256 | **153.77 t/s** | 141.63 t/s | +8.6% |
 | 1024 | **133.23 t/s** | 131.35 t/s | +1.4% |
 | 4096 | 88.52 t/s | **93.02 t/s** | -4.8% |
 
