@@ -524,8 +524,22 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         Tensor shared_up_t = make_fp32_tensor(shared_up_out.data(), shared_intermediate_size, seq_len);
 
         if (profile) stage_start = moe_profile_now();
-        kernel_matmul_fp32(hidden, shared_gate_b, shared_gate_t, thread_pool);
-        kernel_matmul_fp32(hidden, shared_up_b, shared_up_t, thread_pool);
+        bool batched_gate_up = false;
+        if (seq_len == 1) {
+            std::vector<Tensor> shared_inputs = {hidden, hidden};
+            std::vector<Tensor> shared_weights = {
+                shared_gate_b, shared_up_b};
+            std::vector<Tensor> shared_outputs = {
+                shared_gate_t, shared_up_t};
+            batched_gate_up = kernel_matmul_int4_gemv_batch(
+                shared_inputs, shared_weights, shared_outputs, thread_pool);
+        }
+        if (!batched_gate_up) {
+            kernel_matmul_fp32(
+                hidden, shared_gate_b, shared_gate_t, thread_pool);
+            kernel_matmul_fp32(
+                hidden, shared_up_b, shared_up_t, thread_pool);
+        }
         apply_swiglu(shared_gate_out.data(), shared_up_out.data(),
                      shared_inter.data(), seq_len, shared_intermediate_size,
                      shared_intermediate_size, shared_intermediate_size,
