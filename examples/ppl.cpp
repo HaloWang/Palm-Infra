@@ -27,6 +27,7 @@ struct Options {
     std::string token_loss_path;
     bool prepend_bos = false;
     bool tokenize_only = false;
+    bool decode_token_by_token = false;
     Device device = Device::CPU;
 };
 
@@ -61,6 +62,7 @@ void print_usage(const char* argv0) {
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
     std::printf("  --dump-token-loss <path.csv>  Write position,target,CE rows\n");
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
+    std::printf("  --decode-token-by-token  Score through decode_hidden after the first token\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
 }
 
@@ -154,6 +156,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             }
         } else if (arg == "--prepend-bos") {
             opts.prepend_bos = true;
+        } else if (arg == "--decode-token-by-token") {
+            opts.decode_token_by_token = true;
         } else if (arg == "--tokenize-only") {
             opts.tokenize_only = true;
         } else {
@@ -271,6 +275,8 @@ int main(int argc, char** argv) {
     int chunks = 0;
     bool finite = true;
     double total_ce = 0.0;
+    const int scoring_chunk_size =
+        opts.decode_token_by_token ? 1 : opts.chunk_size;
     std::ofstream token_loss;
     if (!opts.token_loss_path.empty()) {
         token_loss.open(opts.token_loss_path);
@@ -283,12 +289,16 @@ int main(int argc, char** argv) {
     }
 
     auto start = std::chrono::steady_clock::now();
-    for (int offset = 0; offset < n_tokens - 1; offset += opts.chunk_size) {
-        int chunk = std::min(opts.chunk_size, n_tokens - offset);
+    for (int offset = 0; offset < n_tokens - 1; offset += scoring_chunk_size) {
+        int chunk = std::min(scoring_chunk_size, n_tokens - offset);
         std::vector<int> chunk_ids(token_ids.begin() + offset,
                                    token_ids.begin() + offset + chunk);
 
-        Tensor hidden = engine.prefill_hidden(chunk_ids);
+        Tensor hidden;
+        if (opts.decode_token_by_token && offset > 0)
+            hidden = engine.decode_hidden(chunk_ids[0]);
+        else
+            hidden = engine.prefill_hidden(chunk_ids);
         if (!hidden.data) {
             std::fprintf(stderr, "ppl: prefill_hidden failed at offset %d\n", offset);
             return 1;
@@ -338,7 +348,9 @@ int main(int argc, char** argv) {
     std::printf("tokens=%d\n", n_tokens);
     std::printf("targets=%d\n", n_targets);
     std::printf("chunks=%d\n", chunks);
-    std::printf("chunk_size=%d\n", opts.chunk_size);
+    std::printf("chunk_size=%d\n", scoring_chunk_size);
+    std::printf("decode_token_by_token=%s\n",
+                opts.decode_token_by_token ? "true" : "false");
     std::printf("ce=%.6f\n", ce);
     std::printf("ppl=%.6f\n", ppl);
     std::printf("finite=%s\n", finite ? "true" : "false");
