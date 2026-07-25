@@ -1,5 +1,6 @@
 #include "engine/engine.h"
 #include "engine/tokenizer.h"
+#include "kernels/threading.h"
 
 #include <algorithm>
 #include <chrono>
@@ -19,7 +20,7 @@ struct Options {
     int max_tokens = 256;
     int chunk_size = 256;
     int n_ctx = 4096;
-    int threads = 4;
+    int threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     int ssd_cache_mb = 0;
     int ssd_io_workers = 8;
@@ -55,7 +56,8 @@ void print_usage(const char* argv0) {
     std::printf("  --max-tokens <int>    Token cap after tokenization (default 256; 0 = no cap)\n");
     std::printf("  --chunk-size <int>    Prefill chunk size for CE passes (default 256)\n");
     std::printf("  --n-ctx <int>         Context size (default 4096)\n");
-    std::printf("  --threads <int>       Worker threads (default 4)\n");
+    std::printf("  --threads <int>       Worker threads (default: auto, %d here)\n",
+                default_worker_threads());
     std::printf("  --device <cpu|metal>  Compute backend (default: cpu)\n");
     std::printf("  --mmap                Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>  CPU MoE SSD cache capacity\n");

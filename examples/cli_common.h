@@ -16,7 +16,7 @@ struct CliCommonOptions {
     int n_ctx = 16384;
     int rope_dim = 64;
     float rope_theta = 10000000.f;
-    int num_threads = 4;
+    int num_threads = default_worker_threads();
     bool profile = false;
     int warmup = 1;
     bool static_padded = false;  // pad short prompts to graph_seq_len (A/B vs DYNAMIC)

@@ -10,6 +10,10 @@
 #include <utility>
 #include <vector>
 
+// Pick a conservative compute-worker default from the host topology. Explicit
+// CLI/API thread counts continue to override this value.
+int default_worker_threads();
+
 class ThreadPool {
 public:
     using ParallelForFn = std::function<void(int thread_id, int begin, int end)>;

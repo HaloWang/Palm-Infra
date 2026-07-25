@@ -230,7 +230,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --n-ctx <int>             Default: 16384\n");
     std::printf("  --rope-dim <int>          Default: 64\n");
     std::printf("  --rope-theta <float>      Default: 1600000\n");
-    std::printf("  --threads <int>          Default: 4\n");
+    std::printf("  --threads <int>          Default: auto (%d on this host)\n",
+                default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
     std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");

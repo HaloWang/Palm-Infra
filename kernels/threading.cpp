@@ -4,7 +4,12 @@
 #include <chrono>
 #include <condition_variable>
 #include <mutex>
+#include <string>
 #include <thread>
+
+#if defined(__APPLE__)
+#include <sys/sysctl.h>
+#endif
 
 namespace {
 
@@ -27,6 +32,46 @@ bool compute_shard(int begin, int end, int grain_size,
 }
 
 } // namespace
+
+int default_worker_threads() {
+    constexpr int max_default_threads = 8;
+#if defined(__APPLE__)
+    int performance_cores = 0;
+    bool found_named_level = false;
+    for (int level = 0; level < 4; ++level) {
+        const std::string prefix =
+            "hw.perflevel" + std::to_string(level);
+        int cores = 0;
+        size_t cores_size = sizeof(cores);
+        if (sysctlbyname((prefix + ".physicalcpu").c_str(), &cores,
+                         &cores_size, nullptr, 0) != 0 ||
+            cores <= 0) {
+            break;
+        }
+
+        char level_name[64] = {};
+        size_t name_size = sizeof(level_name);
+        if (sysctlbyname((prefix + ".name").c_str(), level_name,
+                         &name_size, nullptr, 0) == 0) {
+            found_named_level = true;
+            if (std::string(level_name).find("Efficiency") ==
+                std::string::npos) {
+                performance_cores += cores;
+            }
+        } else if (level == 0) {
+            // Older Apple Silicon exposes the performance level count but not
+            // its descriptive name.
+            performance_cores = cores;
+        }
+    }
+    if (performance_cores > 0 || found_named_level) {
+        return std::clamp(performance_cores, 1, max_default_threads);
+    }
+#endif
+    const unsigned int detected = std::thread::hardware_concurrency();
+    return std::clamp(static_cast<int>(detected == 0 ? 4 : detected),
+                      1, max_default_threads);
+}
 
 ThreadPool::ThreadPool(int num_threads) {
     resize(num_threads);

@@ -85,7 +85,7 @@ struct EngineConfig {
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
-    int num_threads = 4;
+    int num_threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
     // CPU-only MoE expert cache. A non-zero value enables SSD offload for
     // packages carrying `moe_expert_storage` metadata.
