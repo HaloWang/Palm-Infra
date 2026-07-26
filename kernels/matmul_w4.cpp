@@ -24,8 +24,21 @@ static inline void load_int4x32_signed_scaled16(const uint8_t* src,
 static inline int32x4_t q4_q8_dot32(int8x16_t q4_even, int8x16_t q4_odd,
                                     int8x16_t qa_even, int8x16_t qa_odd) {
     int32x4_t d = vdupq_n_s32(0);
+#if defined(__aarch64__)
+    // Keep the M=1 path on SDOT even when the translation unit enables i8mm.
+    // Clang otherwise recognizes the eight independent column dots as a
+    // matrix multiply and rewrites them to SMMLA, whose operand duplication
+    // and lane rearrangement make GEMV substantially slower.
+    __asm__("sdot %0.4s, %1.16b, %2.16b"
+            : "+w"(d)
+            : "w"(q4_even), "w"(qa_even));
+    __asm__("sdot %0.4s, %1.16b, %2.16b"
+            : "+w"(d)
+            : "w"(q4_odd), "w"(qa_odd));
+#else
     d = vdotq_s32(d, q4_even, qa_even);
     d = vdotq_s32(d, q4_odd, qa_odd);
+#endif
     return d;
 }
 
