@@ -1286,9 +1286,12 @@ kernel void gemv_selected_slots_bg128_tile8_i8a_i4b_f32c(
     const int channel0 = row0 & 7;
     const int row_tile = row0 >> 3;
     const ulong BG128_BYTES = 544;
-    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f,
-                     0.0f, 0.0f, 0.0f, 0.0f};
+    float lane_sums[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                          0.0f, 0.0f, 0.0f, 0.0f};
 
+    // Apply each BG128 weight scale to the lane-local integer partial, then
+    // reduce once after the K loop. Reduction is linear, so this replaces
+    // 8 * groups_per_row SIMD reductions with eight total reductions.
     for (int g = 0; g < p.groups_per_row; ++g) {
         device const uint8_t* block =
             weight + ((ulong)row_tile * p.groups_per_row + g) *
@@ -1314,29 +1317,25 @@ kernel void gemv_selected_slots_bg128_tile8_i8a_i4b_f32c(
                 partials[channel_offset] += a0 * lo + a1 * hi;
             }
         }
+        device const float* weight_scales =
+            (device const float*)block;
         #pragma unroll
         for (int channel_offset = 0; channel_offset < 8;
-             ++channel_offset) {
-            const int group_dot = simd_sum(partials[channel_offset]);
-            if (lane == 0) {
-                device const float* weight_scales =
-                    (device const float*)block;
-                sums[channel_offset] +=
-                    (float)group_dot *
-                    weight_scales[channel0 + channel_offset];
-            }
-        }
+             ++channel_offset)
+            lane_sums[channel_offset] +=
+                (float)partials[channel_offset] *
+                weight_scales[channel0 + channel_offset];
     }
-    if (lane == 0) {
-        const float activation_scale = SCALE_A[ar];
-        #pragma unroll
-        for (int channel_offset = 0; channel_offset < 8;
-             ++channel_offset) {
+    const float activation_scale = SCALE_A[ar];
+    #pragma unroll
+    for (int channel_offset = 0; channel_offset < 8;
+         ++channel_offset) {
+        const float sum = simd_sum(lane_sums[channel_offset]);
+        if (lane == 0) {
             const int row = row0 + channel_offset;
-            if (row < p.N) {
+            if (row < p.N)
                 C[p.c_offset + (ulong)output_sel * p.c_row_stride + row] =
-                    sums[channel_offset] * activation_scale;
-            }
+                    sum * activation_scale;
         }
     }
 }
