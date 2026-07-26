@@ -94,41 +94,33 @@ i8mm_w4_8x4_accumulate_qblock(const int8_t* aq, const uint8_t* bq,
         "smmla v22.4s, v26.16b, v24.16b\n"
         "smmla v23.4s, v26.16b, v25.16b\n"
 
-        "uzp1 v24.2d, v16.2d, v17.2d\n"
-        "uzp2 v25.2d, v16.2d, v17.2d\n"
-        "scvtf v24.4s, v24.4s, #4\n"
-        "scvtf v25.4s, v25.4s, #4\n"
-        "ldr s26, [%[as], #0]\n"
-        "ldr s27, [%[as], #4]\n"
-        "fmla %[o0].4s, v24.4s, v26.s[0]\n"
-        "fmla %[o1].4s, v25.4s, v27.s[0]\n"
+        // Keep the native 2-row x 2-column SMMLA matrix layout through all
+        // qblocks. Pairwise scale vectors avoid transposing every qblock.
+        "scvtf v16.4s, v16.4s, #4\n"
+        "scvtf v17.4s, v17.4s, #4\n"
+        "scvtf v18.4s, v18.4s, #4\n"
+        "scvtf v19.4s, v19.4s, #4\n"
+        "scvtf v20.4s, v20.4s, #4\n"
+        "scvtf v21.4s, v21.4s, #4\n"
+        "scvtf v22.4s, v22.4s, #4\n"
+        "scvtf v23.4s, v23.4s, #4\n"
 
-        "uzp1 v24.2d, v18.2d, v19.2d\n"
-        "uzp2 v25.2d, v18.2d, v19.2d\n"
-        "scvtf v24.4s, v24.4s, #4\n"
-        "scvtf v25.4s, v25.4s, #4\n"
-        "ldr s26, [%[as], #8]\n"
-        "ldr s27, [%[as], #12]\n"
-        "fmla %[o2].4s, v24.4s, v26.s[0]\n"
-        "fmla %[o3].4s, v25.4s, v27.s[0]\n"
-
-        "uzp1 v24.2d, v20.2d, v21.2d\n"
-        "uzp2 v25.2d, v20.2d, v21.2d\n"
-        "scvtf v24.4s, v24.4s, #4\n"
-        "scvtf v25.4s, v25.4s, #4\n"
-        "ldr s26, [%[as], #16]\n"
-        "ldr s27, [%[as], #20]\n"
-        "fmla %[o4].4s, v24.4s, v26.s[0]\n"
-        "fmla %[o5].4s, v25.4s, v27.s[0]\n"
-
-        "uzp1 v24.2d, v22.2d, v23.2d\n"
-        "uzp2 v25.2d, v22.2d, v23.2d\n"
-        "scvtf v24.4s, v24.4s, #4\n"
-        "scvtf v25.4s, v25.4s, #4\n"
-        "ldr s26, [%[as], #24]\n"
-        "ldr s27, [%[as], #28]\n"
-        "fmla %[o6].4s, v24.4s, v26.s[0]\n"
-        "fmla %[o7].4s, v25.4s, v27.s[0]\n"
+        "ldr d24, [%[as], #0]\n"
+        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "fmla %[o0].4s, v16.4s, v24.4s\n"
+        "fmla %[o1].4s, v17.4s, v24.4s\n"
+        "ldr d24, [%[as], #8]\n"
+        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "fmla %[o2].4s, v18.4s, v24.4s\n"
+        "fmla %[o3].4s, v19.4s, v24.4s\n"
+        "ldr d24, [%[as], #16]\n"
+        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "fmla %[o4].4s, v20.4s, v24.4s\n"
+        "fmla %[o5].4s, v21.4s, v24.4s\n"
+        "ldr d24, [%[as], #24]\n"
+        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "fmla %[o6].4s, v22.4s, v24.4s\n"
+        "fmla %[o7].4s, v23.4s, v24.4s\n"
         : [o0] "+w"(out[0]), [o1] "+w"(out[1]), [o2] "+w"(out[2]),
           [o3] "+w"(out[3]), [o4] "+w"(out[4]), [o5] "+w"(out[5]),
           [o6] "+w"(out[6]), [o7] "+w"(out[7])
@@ -171,24 +163,47 @@ void matmul_int4_i8mm_g128(
                             &ab.q[0][0][0], &bg.q[qgi][half * 4][0],
                             ab.scales, group);
                     }
-                    float32x4_t bscale = vld1q_f32(bg.scales + half * 4);
-                    for (int r = 0; r < 8; r++) {
-                        out[r] = vfmaq_f32(out[r], group[r], bscale);
+                    float32x2_t bscale01 =
+                        vld1_f32(bg.scales + half * 4);
+                    float32x2_t bscale23 =
+                        vld1_f32(bg.scales + half * 4 + 2);
+                    float32x4_t bscale_pair01 =
+                        vcombine_f32(bscale01, bscale01);
+                    float32x4_t bscale_pair23 =
+                        vcombine_f32(bscale23, bscale23);
+                    for (int rp = 0; rp < 4; rp++) {
+                        out[rp * 2] = vfmaq_f32(
+                            out[rp * 2], group[rp * 2], bscale_pair01);
+                        out[rp * 2 + 1] = vfmaq_f32(
+                            out[rp * 2 + 1], group[rp * 2 + 1],
+                            bscale_pair23);
                     }
                 }
 
                 int half_cols = std::min(4, c_valid - half * 4);
-                for (int r = 0; r < r_valid; r++) {
-                    float* dst =
-                        C + (size_t)(m + r) * ldc + n + half * 4;
-                    if (half_cols == 4) {
-                        vst1q_f32(dst, out[r]);
-                        continue;
+                for (int rp = 0; rp < 4; rp++) {
+                    float32x4_t row0 =
+                        vcombine_f32(vget_low_f32(out[rp * 2]),
+                                     vget_low_f32(out[rp * 2 + 1]));
+                    float32x4_t row1 =
+                        vcombine_f32(vget_high_f32(out[rp * 2]),
+                                     vget_high_f32(out[rp * 2 + 1]));
+                    for (int rr = 0; rr < 2; rr++) {
+                        int r = rp * 2 + rr;
+                        if (r >= r_valid)
+                            continue;
+                        float* dst =
+                            C + (size_t)(m + r) * ldc + n + half * 4;
+                        float32x4_t row = rr == 0 ? row0 : row1;
+                        if (half_cols == 4) {
+                            vst1q_f32(dst, row);
+                            continue;
+                        }
+                        float tmp[4];
+                        vst1q_f32(tmp, row);
+                        for (int c = 0; c < half_cols; c++)
+                            dst[c] = tmp[c];
                     }
-                    float tmp[4];
-                    vst1q_f32(tmp, out[r]);
-                    for (int c = 0; c < half_cols; c++)
-                        dst[c] = tmp[c];
                 }
             }
         }
