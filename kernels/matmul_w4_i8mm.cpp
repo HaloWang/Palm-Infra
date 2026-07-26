@@ -152,7 +152,8 @@ i8mm_w4_8x4_accumulate_qblock(const int8_t* aq, const uint8_t* bq,
 
 void matmul_int4_i8mm_g128(
     const Q8A8I8MMBlock* qA8, const Q4B8G128Block* B_g128, float* C,
-    int M, int N, int K, int ldc, int m_begin, int m_end) {
+    int M, int N, int K, int ldc, int m_begin, int m_end, int n_begin,
+    int n_end) {
     int blocks_per_row = K / MATMUL_Q8_BLOCK;
     int groups_per_row = K / 128;
 
@@ -160,8 +161,8 @@ void matmul_int4_i8mm_g128(
         int r_valid = std::min(8, M - m);
         const Q8A8I8MMBlock* a_tile =
             qA8 + (size_t)(m / 8) * blocks_per_row;
-        for (int n = 0; n < N; n += 8) {
-            int c_valid = std::min(8, N - n);
+        for (int n = n_begin; n < n_end; n += 8) {
+            int c_valid = std::min({8, N - n, n_end - n});
             float32x4_t out_lo[8];
             float32x4_t out_hi[8];
             for (int r = 0; r < 8; r++) {

@@ -943,11 +943,9 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         auto run_q4_gemm = [&](int m_begin, int m_end, int n_begin, int n_end) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
             if (can_use_q4_i8mm) {
-                (void)n_begin;
-                (void)n_end;
                 matmul_int4_i8mm_g128(
                     qA8.data(), b_q4_g128, c_ptr, M, N, K, ldc, m_begin,
-                    m_end);
+                    m_end, n_begin, n_end);
                 return;
             } else
 #endif
@@ -982,7 +980,13 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
             }
         };
 
-        if (!use_parallel) {
+        if (can_use_q4_i8mm && n_threads > 1 && N > 8) {
+            int n_chunk = ((N + n_threads - 1) / n_threads + 7) / 8 * 8;
+            thread_pool->parallel_for(
+                0, N, n_chunk, [&](int, int n_begin, int n_end) {
+                    run_q4_gemm(0, M, n_begin, n_end);
+                });
+        } else if (!use_parallel) {
             run_q4_gemm(0, M, 0, N);
         } else {
             thread_pool->parallel_for(0, M, tile_m,
