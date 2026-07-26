@@ -63,10 +63,10 @@ struct alignas(16) Q8A4Block {
 };
 
 struct alignas(16) Q8A8I8MMBlock {
-    float scales[8];
+    float scale_pairs[4][4];
     int8_t q[4][8][8];
 };
-static_assert(sizeof(Q8A8I8MMBlock) == 288,
+static_assert(sizeof(Q8A8I8MMBlock) == 320,
               "unexpected Q8A8I8MMBlock size");
 
 struct Q4GemvScratch {

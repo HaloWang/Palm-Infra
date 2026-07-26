@@ -105,20 +105,16 @@ i8mm_w4_8x4_accumulate_qblock(const int8_t* aq, const uint8_t* bq,
         "scvtf v22.4s, v22.4s, #4\n"
         "scvtf v23.4s, v23.4s, #4\n"
 
-        "ldr d24, [%[as], #0]\n"
-        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "ldr q24, [%[as], #0]\n"
         "fmla %[o0].4s, v16.4s, v24.4s\n"
         "fmla %[o1].4s, v17.4s, v24.4s\n"
-        "ldr d24, [%[as], #8]\n"
-        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "ldr q24, [%[as], #16]\n"
         "fmla %[o2].4s, v18.4s, v24.4s\n"
         "fmla %[o3].4s, v19.4s, v24.4s\n"
-        "ldr d24, [%[as], #16]\n"
-        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "ldr q24, [%[as], #32]\n"
         "fmla %[o4].4s, v20.4s, v24.4s\n"
         "fmla %[o5].4s, v21.4s, v24.4s\n"
-        "ldr d24, [%[as], #24]\n"
-        "zip1 v24.4s, v24.4s, v24.4s\n"
+        "ldr q24, [%[as], #48]\n"
         "fmla %[o6].4s, v22.4s, v24.4s\n"
         "fmla %[o7].4s, v23.4s, v24.4s\n"
         : [o0] "+w"(out[0]), [o1] "+w"(out[1]), [o2] "+w"(out[2]),
@@ -161,7 +157,7 @@ void matmul_int4_i8mm_g128(
                         const Q8A8I8MMBlock& ab = a_tile[g * 4 + qgi];
                         i8mm_w4_8x4_accumulate_qblock(
                             &ab.q[0][0][0], &bg.q[qgi][half * 4][0],
-                            ab.scales, group);
+                            &ab.scale_pairs[0][0], group);
                     }
                     float32x2_t bscale01 =
                         vld1_f32(bg.scales + half * 4);

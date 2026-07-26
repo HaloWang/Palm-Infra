@@ -177,7 +177,10 @@ void quantize_a_q8_blocks_i8mm_a8(const float* A, int M, int K, int lda,
                 quantize_q8_block32_neon(
                     A + (size_t)m * lda + qb * MATMUL_Q8_BLOCK, scale, q_lo,
                     q_hi);
-                block.scales[ar] = scale;
+                int pair = ar / 2;
+                int lane = (ar & 1) * 2;
+                block.scale_pairs[pair][lane] = scale;
+                block.scale_pairs[pair][lane + 1] = scale;
                 int8x16_t q_even = vuzp1q_s8(q_lo, q_hi);
                 int8x16_t q_odd = vuzp2q_s8(q_lo, q_hi);
                 vst1_s8(block.q[0][ar], vget_low_s8(q_even));
