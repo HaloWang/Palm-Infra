@@ -25,6 +25,8 @@ def _canonical_quant(quant: str) -> str:
         return "fp16"
     if q in ("w8", "w8pc"):
         return "w8pc"
+    if q == "w4mixg32":
+        return "w4mixg32"
     if q in ("w4", "w4mix", "w4mixg128"):
         return "w4mixg128"
     raise ValueError(f"unsupported RWKV quant mode: {quant}")
@@ -41,10 +43,10 @@ def _quant_spec(quant: str, name: str, k: int) -> tuple[str, int] | None:
     if quant == "w8pc":
         return ("w8", k)
     # Mixed W4: retain the vocabulary projection and low-rank attention
-    # adapters at W8; large attention/FFN matrices use symmetric W4G128.
+    # adapters at W8; large attention/FFN matrices use symmetric W4.
     if name == "lm_head" or _is_small_lora(name):
         return ("w8", 128)
-    return ("w4", 128)
+    return ("w4", 32 if quant == "w4mixg32" else 128)
 
 
 def _matrix_precision(quant: str, name: str, k: int) -> Precision:
@@ -168,21 +170,19 @@ def _build_attention_block(g: GraphBuilder, root: str, weights: dict[str, np.nda
     def scalar(name: str) -> int:
         return _scalar_weight(g, root, f"{attention}_{name}", (hidden,))
 
-    def linear(name: str, source: int) -> int:
-        array = weights[f"blocks.{layer}.att.{name}.weight"]
-        weight = _weight(g, root, f"{attention}_{name}_weight",
-                         tuple(array.shape), quant=quant)
-        return g.matmul(source, weight)
-
     # .pth LoRA matrices are [hidden, rank] / [rank, hidden], unlike Linear weights.
     def lora(name: str, source: int, activation=None) -> int:
+        w1, w2 = lora_weights(name)
+        return _lora(g, source, w1, w2, activation)
+
+    def lora_weights(name: str) -> tuple[int, int]:
         first = weights[f"blocks.{layer}.att.{name}1"]
         second = weights[f"blocks.{layer}.att.{name}2"]
         w1 = _weight(g, root, f"{attention}_{name}1", tuple(first.shape[::-1]),
                      quant=quant)
         w2 = _weight(g, root, f"{attention}_{name}2", tuple(second.shape[::-1]),
                      quant=quant)
-        return _lora(g, source, w1, w2, activation)
+        return w1, w2
 
     ln_weight = _scalar_weight(g, root, f"{block}_ln1_weight", (hidden,))
     ln_bias = _scalar_weight(g, root, f"{block}_ln1_bias", (hidden,))
@@ -191,12 +191,33 @@ def _build_attention_block(g: GraphBuilder, root: str, weights: dict[str, np.nda
 
     mix_weights = [scalar(name) for name in ("x_r", "x_w", "x_k", "x_v", "x_a", "x_g")]
     xr, xw, xk, xv, xa, xg = (_mix(g, normalized, shifted, mix) for mix in mix_weights)
-    receptance = linear("receptance", xr)
-    key = linear("key", xk)
-    value = linear("value", xv)
+    projection_names = ("receptance", "key", "value")
+    projection_inputs = (xr, xk, xv)
+    projection_weights = []
+    for name in projection_names:
+        array = weights[f"blocks.{layer}.att.{name}.weight"]
+        projection_weights.append(
+            _weight(g, root, f"{attention}_{name}_weight",
+                    tuple(array.shape), quant=quant))
+    projection_pairs = list(zip(projection_inputs, projection_weights))
+    if seq_len == 1:
+        receptance, key, value = g.matmul_batch(projection_pairs)
+    else:
+        receptance, key, value = (
+            g.matmul(source, weight)
+            for source, weight in projection_pairs
+        )
 
-    w_delta = lora("w", xw, "tanh")
-    a_delta = lora("a", xa)
+    if seq_len == 1:
+        w1, w2 = lora_weights("w")
+        a1, a2 = lora_weights("a")
+        w_hidden, a_hidden = g.matmul_batch([(xw, w1), (xa, a1)])
+        w_hidden = g.tanh(w_hidden)
+        w_delta, a_delta = g.matmul_batch(
+            [(w_hidden, w2), (a_hidden, a2)])
+    else:
+        w_delta = lora("w", xw, "tanh")
+        a_delta = lora("a", xa)
     gate = lora("g", xg, "sigmoid_exact")
     decay = g.exp_exact(g.scalar_mul(g.sigmoid_exact(g.add(w_delta, scalar("w0"))), -0.606531))
     alpha = g.sigmoid_exact(g.add(a_delta, scalar("a0")))
@@ -341,7 +362,8 @@ if __name__ == "__main__":
     parser.add_argument("--prefill-seq-len", type=int, default=256)
     parser.add_argument("--tokenizer", default="")
     parser.add_argument("--quant", default="fp16",
-                        choices=("fp16", "w8", "w8pc", "w4", "w4mixg128"))
+                        choices=("fp16", "w8", "w8pc", "w4", "w4mixg32",
+                                 "w4mixg128"))
     args = parser.parse_args()
     convert_rwkv7(args.checkpoint, args.output, args.prefill_seq_len,
                   args.tokenizer, args.quant)

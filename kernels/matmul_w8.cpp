@@ -945,6 +945,106 @@ static void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
 #endif
 #endif
 
+bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    const size_t batch = inputs.size();
+    if (batch == 0 || weights.size() != batch || outputs.size() != batch ||
+        !thread_pool) {
+        return false;
+    }
+    const int K = (int)inputs[0].shape[0];
+    const int N = (int)weights[0].shape[0];
+    const int group_size = (int)weights[0].group_size;
+    const int groups_per_row = (int)weights[0].groups_per_row;
+    if (K <= 0 || N <= 0 || group_size <= 0 || groups_per_row <= 0)
+        return false;
+    const int K_padded =
+        ((K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK) * MATMUL_Q8_BLOCK;
+
+    struct BatchScratch {
+        std::vector<std::vector<int8_t>> q_inputs;
+        std::vector<std::vector<float>> a_scales;
+        std::vector<size_t> input_indices;
+        std::vector<const int8_t*> packed_weights;
+        std::vector<const float*> weight_scales;
+        std::vector<float*> outputs;
+    };
+    static thread_local BatchScratch scratch;
+    scratch.q_inputs.resize(batch);
+    scratch.a_scales.resize(batch);
+    scratch.input_indices.resize(batch);
+    scratch.packed_weights.resize(batch);
+    scratch.weight_scales.resize(batch);
+    scratch.outputs.resize(batch);
+
+    for (size_t i = 0; i < batch; ++i) {
+        const Tensor& input = inputs[i];
+        const Tensor& weight = weights[i];
+        Tensor& output = outputs[i];
+        if (input.prec != Precision::FP32 || input.shape[0] != K ||
+            input.shape[1] != 1 || weight.prec != Precision::INT8 ||
+            weight.shape[0] != N || weight.shape[1] != K ||
+            (int)weight.group_size != group_size ||
+            (int)weight.groups_per_row != groups_per_row ||
+            !weight.q8_repack_data || !weight.scales ||
+            output.prec != Precision::FP32 || output.shape[0] != N ||
+            output.shape[1] != 1) {
+            return false;
+        }
+        size_t input_index = i;
+        for (size_t previous = 0; previous < i; ++previous) {
+            if (inputs[previous].data == input.data &&
+                inputs[previous].stride[1] == input.stride[1]) {
+                input_index = scratch.input_indices[previous];
+                break;
+            }
+        }
+        scratch.input_indices[i] = input_index;
+        if (input_index == i) {
+            quantize_a_q8_blocks(
+                input.ptr<float>(), 1, K, (int)(input.stride[1] / sizeof(float)),
+                K_padded, scratch.q_inputs[i], scratch.a_scales[i]);
+        }
+        scratch.packed_weights[i] =
+            reinterpret_cast<const int8_t*>(weight.q8_repack_data);
+        scratch.weight_scales[i] = weight.scales;
+        scratch.outputs[i] = output.ptr<float>();
+    }
+
+    MatmulTimer timer;
+    timer.set_shape("q8dot_gemv_repack_batch", (int)batch, N, K, group_size,
+                    groups_per_row, true, false, thread_pool->num_threads());
+    int n_chunk = std::max(N / (thread_pool->num_threads() * 8), 64);
+    n_chunk = ((n_chunk + 7) / 8) * 8;
+    // `scratch` is thread-local to the dispatching thread. Capture its address
+    // explicitly; referring to the TLS name inside workers would select each
+    // worker's unrelated, empty instance.
+    BatchScratch* batch_data = &scratch;
+    thread_pool->parallel_for(
+        0, N, n_chunk, [&](int, int n_begin, int n_end) {
+            for (size_t i = 0; i < batch; ++i) {
+                const size_t input_index = batch_data->input_indices[i];
+                matmul_int8_q8dot_neon_gemv_repacked_range(
+                    batch_data->q_inputs[input_index].data(),
+                    batch_data->a_scales[input_index].data(),
+                    batch_data->packed_weights[i],
+                    batch_data->weight_scales[i], group_size, groups_per_row,
+                    batch_data->outputs[i], K, K_padded, n_begin, n_end);
+            }
+        });
+    return true;
+#else
+    (void)inputs;
+    (void)weights;
+    (void)outputs;
+    (void)thread_pool;
+    return false;
+#endif
+}
+
 void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool, Activation act,
                           int act_n_begin, int act_n_len, MatmulTimer& timer) {

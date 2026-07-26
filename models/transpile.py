@@ -40,6 +40,7 @@ class OpType(IntEnum):
     INPUT          = 0
     CONSTANT       = 1
     MATMUL         = 10
+    MATMUL_BATCH   = 11
     RMS_NORM       = 20
     LAYER_NORM     = 21
     ADD_RMS_NORM   = 22
@@ -267,7 +268,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op in (OpType.ADD, OpType.MUL, OpType.SIGMOID_MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op in (OpType.MATMUL, OpType.GEMV_SPARSE_A):
+    if op in (OpType.MATMUL, OpType.MATMUL_BATCH, OpType.GEMV_SPARSE_A):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
@@ -444,6 +445,34 @@ class GraphBuilder:
         return self._add(OpType.MATMUL, [a, b], (N, M),
                          prec=self._nodes[a].out_prec,
                          i32=[int(activation), int(act_n_begin), int(act_n_len)])
+
+    def matmul_batch(self, pairs: list[tuple[int, int]]) -> list[int]:
+        """Run same-shaped independent matmuls through one runtime dispatch."""
+        if not pairs:
+            return []
+        inputs: list[int] = []
+        common_n = None
+        common_m = None
+        for a, b in pairs:
+            sa = self._nodes[a].out_shape
+            sb = self._nodes[b].out_shape
+            k, m = sa[0], sa[1]
+            if sb[1] != k:
+                raise AssertionError(f"batched matmul K mismatch: {sa} vs {sb}")
+            n = sb[0]
+            if common_n is None:
+                common_n, common_m = n, m
+            elif n != common_n or m != common_m:
+                raise AssertionError(
+                    f"batched matmul shape mismatch: {(n, m)} vs "
+                    f"{(common_n, common_m)}")
+            inputs.extend((a, b))
+        merged = self._add(
+            OpType.MATMUL_BATCH, inputs,
+            (common_n, common_m, len(pairs)),
+            prec=self._nodes[pairs[0][0]].out_prec,
+            i32=[len(pairs)])
+        return self.slice(merged, [1] * len(pairs), 2)
 
     def gemv_sparse_a(self, a: int, b: int) -> int:
         """Matmul with a decode GEMV path that skips exact-zero A entries."""

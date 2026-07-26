@@ -7,6 +7,55 @@ MatmulConfig g_matmul_config;
 // Debug override used by precision-comparison tests and tools.
 bool g_mollm_force_fp32_acc = false;
 
+void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
+                         Tensor& output, ThreadPool* thread_pool) {
+    if ((pairs.size() & 1) != 0 || pairs.empty())
+        return;
+
+    const size_t batch = pairs.size() / 2;
+    std::vector<Tensor> inputs;
+    std::vector<Tensor> weights;
+    std::vector<Tensor> outputs;
+    inputs.reserve(batch);
+    weights.reserve(batch);
+    outputs.reserve(batch);
+
+    size_t output_offset = 0;
+    bool valid = output.prec == Precision::FP32 && output.data;
+    for (size_t i = 0; i < batch; ++i) {
+        const Tensor* input = pairs[i * 2];
+        const Tensor* weight = pairs[i * 2 + 1];
+        if (!input || !weight || input->shape[0] != weight->shape[1] ||
+            input->shape[1] != output.shape[1]) {
+            valid = false;
+            break;
+        }
+        inputs.push_back(*input);
+        weights.push_back(*weight);
+        Tensor slice = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, weight->shape[0],
+            input->shape[1], 1, 1,
+            output.ptr<float>() + output_offset);
+        outputs.push_back(slice);
+        output_offset +=
+            (size_t)weight->shape[0] * (size_t)input->shape[1];
+    }
+    if (!valid || output.shape[2] != (int64_t)batch ||
+        output_offset != output.nelements())
+        return;
+
+    if (thread_pool && output.shape[1] == 1 &&
+        kernel_matmul_int4_gemv_batch(inputs, weights, outputs, thread_pool)) {
+        return;
+    }
+    if (thread_pool && output.shape[1] == 1 &&
+        kernel_matmul_int8_gemv_batch(inputs, weights, outputs, thread_pool)) {
+        return;
+    }
+    for (size_t i = 0; i < batch; ++i)
+        kernel_matmul_fp32(inputs[i], weights[i], outputs[i], thread_pool);
+}
+
 void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
                         ThreadPool* thread_pool, Activation act,
                         int act_n_begin, int act_n_len,

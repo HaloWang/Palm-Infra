@@ -294,6 +294,90 @@ static void matmul_int4_q8dot_neon_gemv_g128_range(
     }
 }
 
+static void matmul_int4_q8dot_neon_gemv_g32_range(
+    const int8_t* qA_even_pre, const int8_t* qA_odd_pre,
+    const float* a_scales, const Q4B8G32Block* B_g32, float* C, int K,
+    int n_begin, int n_end) {
+    int blocks_per_row = K / MATMUL_Q8_BLOCK;
+
+    for (int n = n_begin; n < n_end; n += 8) {
+        int c_valid = std::min(n + 8, n_end) - n;
+        const Q4B8G32Block* b_tile =
+            B_g32 + (size_t)(n / 8) * blocks_per_row;
+        float32x4_t acc_lo = vdupq_n_f32(0.f);
+        float32x4_t acc_hi = vdupq_n_f32(0.f);
+
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            const Q4B8G32Block& block = b_tile[qb];
+            int8x16_t qa_even =
+                vld1q_s8(qA_even_pre + (size_t)qb * 16);
+            int8x16_t qa_odd =
+                vld1q_s8(qA_odd_pre + (size_t)qb * 16);
+            auto dot_col = [&](int c) {
+                int8x16_t q4_even;
+                int8x16_t q4_odd;
+                load_int4x32_signed_scaled16(block.q[c], q4_even, q4_odd);
+                return q4_q8_dot32(q4_even, q4_odd, qa_even, qa_odd);
+            };
+            int32x4_t d0 = vdupq_n_s32(0);
+            int32x4_t d1 = vdupq_n_s32(0);
+            int32x4_t d2 = vdupq_n_s32(0);
+            int32x4_t d3 = vdupq_n_s32(0);
+            int32x4_t d4 = vdupq_n_s32(0);
+            int32x4_t d5 = vdupq_n_s32(0);
+            int32x4_t d6 = vdupq_n_s32(0);
+            int32x4_t d7 = vdupq_n_s32(0);
+            if (c_valid == 8) {
+                d0 = dot_col(0);
+                d1 = dot_col(1);
+                d2 = dot_col(2);
+                d3 = dot_col(3);
+                d4 = dot_col(4);
+                d5 = dot_col(5);
+                d6 = dot_col(6);
+                d7 = dot_col(7);
+            } else {
+                if (c_valid > 0) d0 = dot_col(0);
+                if (c_valid > 1) d1 = dot_col(1);
+                if (c_valid > 2) d2 = dot_col(2);
+                if (c_valid > 3) d3 = dot_col(3);
+                if (c_valid > 4) d4 = dot_col(4);
+                if (c_valid > 5) d5 = dot_col(5);
+                if (c_valid > 6) d6 = dot_col(6);
+            }
+
+            int32x4_t p01 = vpaddq_s32(d0, d1);
+            int32x4_t p23 = vpaddq_s32(d2, d3);
+            int32x4_t p45 = vpaddq_s32(d4, d5);
+            int32x4_t p67 = vpaddq_s32(d6, d7);
+            int32x4_t dots_lo = vpaddq_s32(p01, p23);
+            int32x4_t dots_hi = vpaddq_s32(p45, p67);
+            float32x4_t bscale_lo = vld1q_f32(block.scales);
+            float32x4_t bscale_hi = vld1q_f32(block.scales + 4);
+            float a_scale = a_scales[qb];
+            acc_lo = vfmaq_f32(acc_lo,
+                               q4_scaled16_dot_to_f32(dots_lo),
+                               vmulq_n_f32(bscale_lo, a_scale));
+            acc_hi = vfmaq_f32(acc_hi,
+                               q4_scaled16_dot_to_f32(dots_hi),
+                               vmulq_n_f32(bscale_hi, a_scale));
+        }
+
+        if (c_valid == 8) {
+            vst1q_f32(C + n, acc_lo);
+            vst1q_f32(C + n + 4, acc_hi);
+        } else {
+            float tmp[4];
+            vst1q_f32(tmp, acc_lo);
+            for (int c = 0; c < 4 && c < c_valid; c++)
+                C[n + c] = tmp[c];
+            vst1q_f32(tmp, acc_hi);
+            for (int c = 0; c < 4 && c + 4 < c_valid; c++)
+                C[n + 4 + c] = tmp[c];
+        }
+    }
+}
+
 bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
                                    const std::vector<Tensor>& weights,
                                    std::vector<Tensor>& outputs,
@@ -306,19 +390,24 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
 
     const int K = (int)inputs[0].shape[0];
     const int N = (int)weights[0].shape[0];
-    if (K <= 0 || N <= 0 || K % 128 != 0) return false;
+    if (K <= 0 || N <= 0 || K % 32 != 0) return false;
 
     struct BatchScratch {
         std::vector<Q4GemvScratch> quantized_inputs;
         std::vector<size_t> input_indices;
-        std::vector<const Q4B8G128Block*> packed_weights;
+        std::vector<const Q4B8G32Block*> packed_g32_weights;
+        std::vector<const Q4B8G128Block*> packed_g128_weights;
         std::vector<float*> output_data;
     };
     static thread_local BatchScratch batch_scratch;
     batch_scratch.quantized_inputs.resize(batch);
     batch_scratch.input_indices.resize(batch);
-    batch_scratch.packed_weights.resize(batch);
+    batch_scratch.packed_g32_weights.resize(batch);
+    batch_scratch.packed_g128_weights.resize(batch);
     batch_scratch.output_data.resize(batch);
+    const int group_size = (int)weights[0].group_size;
+    if (group_size != 32 && group_size != 128)
+        return false;
     for (size_t i = 0; i < batch; ++i) {
         const Tensor& input = inputs[i];
         const Tensor& weight = weights[i];
@@ -326,19 +415,26 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
         if (input.prec != Precision::FP32 || input.shape[0] != K ||
             input.shape[1] != 1 || weight.prec != Precision::INT4 ||
             weight.shape[0] != N || weight.shape[1] != K ||
-            weight.group_size != 128 || !weight.is_q4_g128_packed ||
-            !weight.q4_g128_data || output.prec != Precision::FP32 ||
+            (int)weight.group_size != group_size ||
+            (group_size == 32 && !weight.q4_g32_data) ||
+            (group_size == 128 &&
+             (!weight.is_q4_g128_packed || !weight.q4_g128_data)) ||
+            output.prec != Precision::FP32 ||
             output.shape[0] != N || output.shape[1] != 1) {
             return false;
         }
-        batch_scratch.packed_weights[i] =
+        batch_scratch.packed_g32_weights[i] =
+            reinterpret_cast<const Q4B8G32Block*>(weight.q4_g32_data);
+        batch_scratch.packed_g128_weights[i] =
             reinterpret_cast<const Q4B8G128Block*>(weight.q4_g128_data);
         batch_scratch.output_data[i] = output.ptr<float>();
     }
 
     MatmulTimer timer;
-    timer.set_shape("q4dot_gemv_bg128_batch", (int)batch, N, K, 128,
-                    K / 128, true, false, thread_pool->num_threads());
+    timer.set_shape(group_size == 128 ? "q4dot_gemv_bg128_batch"
+                                      : "q4dot_gemv_bg32_batch",
+                    (int)batch, N, K, group_size, K / group_size, true, false,
+                    thread_pool->num_threads());
     for (size_t i = 0; i < batch; ++i) {
         const Tensor& input = inputs[i];
         size_t input_index = i;
@@ -353,9 +449,15 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
         if (input_index == i) {
             Q4GemvScratch& quantized =
                 batch_scratch.quantized_inputs[input_index];
-            quantize_a_q8_g128_even_odd(
-                input.ptr<float>(), K, quantized.qA_even, quantized.qA_odd,
-                quantized.a_scales);
+            if (group_size == 128) {
+                quantize_a_q8_g128_even_odd(
+                    input.ptr<float>(), K, quantized.qA_even,
+                    quantized.qA_odd, quantized.a_scales);
+            } else {
+                quantize_a_q8_blocks_even_odd(
+                    input.ptr<float>(), K, quantized.qA_even,
+                    quantized.qA_odd, quantized.a_scales);
+            }
         }
     }
 
@@ -364,18 +466,27 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
     const Q4GemvScratch* quantized_inputs =
         batch_scratch.quantized_inputs.data();
     const size_t* input_indices = batch_scratch.input_indices.data();
-    const Q4B8G128Block* const* packed_weights =
-        batch_scratch.packed_weights.data();
+    const Q4B8G32Block* const* packed_g32_weights =
+        batch_scratch.packed_g32_weights.data();
+    const Q4B8G128Block* const* packed_g128_weights =
+        batch_scratch.packed_g128_weights.data();
     float* const* output_data = batch_scratch.output_data.data();
     thread_pool->parallel_for(
         0, N, n_chunk, [&](int, int n_begin, int n_end) {
             for (size_t i = 0; i < batch; ++i) {
                 const Q4GemvScratch& quantized =
                     quantized_inputs[input_indices[i]];
-                matmul_int4_q8dot_neon_gemv_g128_range(
-                    quantized.qA_even.data(), quantized.qA_odd.data(),
-                    quantized.a_scales.data(), packed_weights[i],
-                    output_data[i], K, n_begin, n_end);
+                if (group_size == 128) {
+                    matmul_int4_q8dot_neon_gemv_g128_range(
+                        quantized.qA_even.data(), quantized.qA_odd.data(),
+                        quantized.a_scales.data(), packed_g128_weights[i],
+                        output_data[i], K, n_begin, n_end);
+                } else {
+                    matmul_int4_q8dot_neon_gemv_g32_range(
+                        quantized.qA_even.data(), quantized.qA_odd.data(),
+                        quantized.a_scales.data(), packed_g32_weights[i],
+                        output_data[i], K, n_begin, n_end);
+                }
             }
         });
     return true;
@@ -849,13 +960,20 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     int groups_per_row = (int)B.groups_per_row;
     const uint8_t* b_q4_repack =
         reinterpret_cast<const uint8_t*>(B.q4_repack_data);
+    const auto* b_q4_g32 =
+        reinterpret_cast<const Q4B8G32Block*>(B.q4_g32_data);
     const auto* b_q4_g128 =
         reinterpret_cast<const Q4B8G128Block*>(B.q4_g128_data);
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;
     const bool has_embedded_bg128_scales =
         B.is_q4_g128_packed && b_q4_g128 && group_size == 128 &&
         K % 128 == 0 && matmul_int4_q4dot_kernel_available();
-    if ((!scales && !has_embedded_bg128_scales) || group_size <= 0 ||
+    const bool has_embedded_bg32_scales =
+        B.is_q4_g32_packed && b_q4_g32 && group_size == 32 &&
+        K % 32 == 0 && matmul_int4_q4dot_kernel_available();
+    if ((!scales && !has_embedded_bg32_scales &&
+         !has_embedded_bg128_scales) ||
+        group_size <= 0 ||
         groups_per_row <= 0) {
         timer.set_shape("int4_invalid_scales", M, N, K, group_size,
                         groups_per_row, false, false, n_threads);
@@ -871,26 +989,36 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_parallel = n_threads > 1 && n_chunks > 1;
 
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    bool has_direct_q4_g32 = B.is_q4_g32_packed && b_q4_g32;
     bool has_direct_q4_g128 = B.is_q4_g128_packed && b_q4_g128;
     bool can_use_q4_dot =
-        (B.is_q4_repacked || has_direct_q4_g128 || b_int4 != nullptr) &&
+        (B.is_q4_repacked || has_direct_q4_g32 || has_direct_q4_g128 ||
+         b_int4 != nullptr) &&
         (K % MATMUL_Q8_BLOCK == 0) && (group_size % MATMUL_Q8_BLOCK == 0);
     bool use_q4_repack = can_use_q4_dot && b_q4_repack;
+    bool can_use_q4_bg32 =
+        can_use_q4_dot && b_q4_g32 && group_size == 32 && (K % 32 == 0);
     bool can_use_q4_bg128 =
         can_use_q4_dot && b_q4_g128 && group_size == 128 && (K % 128 == 0);
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-    bool can_use_q4_i8mm = M > 1 && can_use_q4_bg128;
+    bool can_use_q4_i8mm = M > 1 && (can_use_q4_bg32 || can_use_q4_bg128);
 #else
     bool can_use_q4_i8mm = false;
 #endif
     if (M == 1 && can_use_q4_dot) {
         bool use_q4_gemv_bg128 = can_use_q4_bg128;
+        bool use_q4_gemv_bg32 = can_use_q4_bg32;
         const char* path =
             use_q4_gemv_bg128
                 ? "q4dot_gemv_bg128"
-                : (use_q4_repack ? "q4dot_gemv_repack" : "q4dot_gemv");
+                : (use_q4_gemv_bg32
+                       ? "q4dot_gemv_bg32"
+                       : (use_q4_repack ? "q4dot_gemv_repack"
+                                        : "q4dot_gemv"));
         timer.set_shape(path, M, N, K, group_size, groups_per_row,
-                        use_q4_gemv_bg128 || use_q4_repack, false, n_threads);
+                        use_q4_gemv_bg128 || use_q4_gemv_bg32 ||
+                            use_q4_repack,
+                        false, n_threads);
         static thread_local Q4GemvScratch scratch;
         if (use_q4_gemv_bg128) {
             quantize_a_q8_g128_even_odd(a_ptr, K, scratch.qA_even,
@@ -907,6 +1035,10 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
                 matmul_int4_q8dot_neon_gemv_g128_range(
                     qA_even_data, qA_odd_data, a_scales_data, b_q4_g128, c_ptr,
                     K, 0, N);
+            } else if (use_q4_gemv_bg32) {
+                matmul_int4_q8dot_neon_gemv_g32_range(
+                    qA_even_data, qA_odd_data, a_scales_data, b_q4_g32, c_ptr,
+                    K, 0, N);
             } else {
                 matmul_int4_q8dot_neon_gemv_range(
                     nullptr, qA_even_data, qA_odd_data, a_scales_data, b_int4,
@@ -922,6 +1054,10 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
                         matmul_int4_q8dot_neon_gemv_g128_range(
                             qA_even_data, qA_odd_data, a_scales_data, b_q4_g128,
                             c_ptr, K, n_begin, n_end);
+                    } else if (use_q4_gemv_bg32) {
+                        matmul_int4_q8dot_neon_gemv_g32_range(
+                            qA_even_data, qA_odd_data, a_scales_data,
+                            b_q4_g32, c_ptr, K, n_begin, n_end);
                     } else {
                         matmul_int4_q8dot_neon_gemv_range(
                             nullptr, qA_even_data, qA_odd_data, a_scales_data,
@@ -942,7 +1078,8 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         bool use_q4_dot_gemm_bg128 = can_use_q4_bg128 && !force_4x8;
         const char* path =
             can_use_q4_i8mm
-                ? "q4_i8mm_g128_a8"
+                ? (can_use_q4_bg128 ? "q4_i8mm_g128_a8"
+                                    : "q4_i8mm_g32_a8")
                 : (use_q4_dot_gemm_bg128
                        ? (use_q4_dot_gemm_a4 ? "q4dot_gemm_bg128_a4"
                                              : "q4dot_gemm_bg128")
@@ -972,9 +1109,15 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         auto run_q4_gemm = [&](int m_begin, int m_end, int n_begin, int n_end) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
             if (can_use_q4_i8mm) {
-                matmul_int4_i8mm_g128(
-                    qA8.data(), b_q4_g128, c_ptr, M, N, K, ldc, m_begin,
-                    m_end, n_begin, n_end);
+                if (can_use_q4_bg128) {
+                    matmul_int4_i8mm_g128(
+                        qA8.data(), b_q4_g128, c_ptr, M, N, K, ldc, m_begin,
+                        m_end, n_begin, n_end);
+                } else {
+                    matmul_int4_i8mm_g32(
+                        qA8.data(), b_q4_g32, c_ptr, M, N, K, ldc, m_begin,
+                        m_end, n_begin, n_end);
+                }
                 return;
             } else
 #endif

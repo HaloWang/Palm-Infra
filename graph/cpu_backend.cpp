@@ -52,6 +52,11 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::MATMUL_BATCH:
+        if (output)
+            kernel_matmul_batch(inputs, *output, thread_pool);
+        break;
+
     case OpType::GEMV_SPARSE_A:
         if (inputs.size() >= 2 && inputs[0] && inputs[1] && output) {
             kernel_gemv_sparse_a(*inputs[0], *inputs[1], *output, thread_pool);

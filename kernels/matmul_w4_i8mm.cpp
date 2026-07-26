@@ -206,4 +206,80 @@ void matmul_int4_i8mm_g128(
     }
 }
 
+void matmul_int4_i8mm_g32(
+    const Q8A8I8MMBlock* qA8, const Q4B8G32Block* B_g32, float* C,
+    int M, int N, int K, int ldc, int m_begin, int m_end, int n_begin,
+    int n_end) {
+    int blocks_per_row = K / MATMUL_Q8_BLOCK;
+
+    for (int m = m_begin; m < m_end; m += 8) {
+        int r_valid = std::min(8, M - m);
+        const Q8A8I8MMBlock* a_tile =
+            qA8 + (size_t)(m / 8) * blocks_per_row;
+        for (int n = n_begin; n < n_end; n += 8) {
+            int c_valid = std::min({8, N - n, n_end - n});
+            const Q4B8G32Block* b_tile =
+                B_g32 + (size_t)(n / 8) * blocks_per_row;
+            for (int half = 0; half * 4 < c_valid; half++) {
+                float32x4_t out[8];
+                for (int r = 0; r < 8; r++)
+                    out[r] = vdupq_n_f32(0.f);
+
+                for (int qb = 0; qb < blocks_per_row; qb++) {
+                    const Q8A8I8MMBlock& ab = a_tile[qb];
+                    const Q4B8G32Block& bb = b_tile[qb];
+                    float32x4_t block[8];
+                    for (int r = 0; r < 8; r++)
+                        block[r] = vdupq_n_f32(0.f);
+                    i8mm_w4_8x4_accumulate_qblock(
+                        &ab.q[0][0][0], &bb.q[half * 4][0],
+                        &ab.scale_pairs[0][0], block);
+
+                    float32x2_t bscale01 =
+                        vld1_f32(bb.scales + half * 4);
+                    float32x2_t bscale23 =
+                        vld1_f32(bb.scales + half * 4 + 2);
+                    float32x4_t bscale_pair01 =
+                        vcombine_f32(bscale01, bscale01);
+                    float32x4_t bscale_pair23 =
+                        vcombine_f32(bscale23, bscale23);
+                    for (int rp = 0; rp < 4; rp++) {
+                        out[rp * 2] = vfmaq_f32(
+                            out[rp * 2], block[rp * 2], bscale_pair01);
+                        out[rp * 2 + 1] = vfmaq_f32(
+                            out[rp * 2 + 1], block[rp * 2 + 1],
+                            bscale_pair23);
+                    }
+                }
+
+                int half_cols = std::min(4, c_valid - half * 4);
+                for (int rp = 0; rp < 4; rp++) {
+                    float32x4_t row0 =
+                        vcombine_f32(vget_low_f32(out[rp * 2]),
+                                     vget_low_f32(out[rp * 2 + 1]));
+                    float32x4_t row1 =
+                        vcombine_f32(vget_high_f32(out[rp * 2]),
+                                     vget_high_f32(out[rp * 2 + 1]));
+                    for (int rr = 0; rr < 2; rr++) {
+                        int r = rp * 2 + rr;
+                        if (r >= r_valid)
+                            continue;
+                        float* dst =
+                            C + (size_t)(m + r) * ldc + n + half * 4;
+                        float32x4_t row = rr == 0 ? row0 : row1;
+                        if (half_cols == 4) {
+                            vst1q_f32(dst, row);
+                            continue;
+                        }
+                        float tmp[4];
+                        vst1q_f32(tmp, row);
+                        for (int c = 0; c < half_cols; c++)
+                            dst[c] = tmp[c];
+                    }
+                }
+            }
+        }
+    }
+}
+
 #endif

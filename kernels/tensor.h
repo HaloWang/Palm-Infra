@@ -70,9 +70,11 @@ struct Tensor {
     bool        is_interleaved = false; // weight data is packed as [N/8, K, 8]
     const void* rowmajor_data = nullptr; // original linear weight, retained beside CPU packs
     bool        is_q4_repacked = false; // INT4 data itself is [N/8, K/32, 8, 16B]
+    bool        is_q4_g32_packed = false; // INT4 data itself is [N/8, K/32] G32 blocks
     bool        is_q4_g128_packed = false; // INT4 data itself is [N/8, K/128] G128 blocks
     const void* q8_repack_data = nullptr; // optional [N/8, K/32, 8, 32] INT8 dot layout
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
+    const void* q4_g32_data = nullptr; // optional [N/8, K/32] G32 packed INT4+scales
     const void* q4_g128_data = nullptr; // optional [N/8, K/128] G128 packed INT4+scales
     const void* sparse_data = nullptr; // optional [N/8,K,8] sparse-A GEMV layout
     // Optional CPU MoE SSD source. Aggregate expert tensors use this instead

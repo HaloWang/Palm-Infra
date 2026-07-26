@@ -166,18 +166,59 @@ void maybe_pack_int4_g128_weight(Tensor& weight, const std::string& key,
 #endif
 }
 
+void maybe_pack_int4_g32_weight(Tensor& weight, const std::string& key,
+                                const void* q4dot_data,
+                                PackedWeightMap& packed_weights) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (!is_2d_linear_weight(weight))
+        return;
+    if (weight.prec != Precision::INT4 || !q4dot_data || !weight.scales ||
+        weight.group_size != 32 || weight.shape[1] <= 0 ||
+        (weight.shape[1] % 32) != 0) {
+        return;
+    }
+
+    const int N = (int)weight.shape[0];
+    const int K = (int)weight.shape[1];
+    const std::string g32_key = key + "#int4_q4g32";
+    auto it = packed_weights.find(g32_key);
+    if (it == packed_weights.end()) {
+        uint8_t* b_g32 = pack_b_q4dot_g32_full(
+            reinterpret_cast<const uint8_t*>(q4dot_data), weight.scales, N, K,
+            (int)weight.groups_per_row);
+        if (!b_g32)
+            return;
+        const size_t buf_size = pack_b_q4dot_g32_bytes(N, K);
+        std::vector<uint8_t> buf(b_g32, b_g32 + buf_size);
+        delete[] b_g32;
+        it = packed_weights.emplace(g32_key, std::move(buf)).first;
+    }
+    weight.q4_g32_data = it->second.data();
+#else
+    (void)weight;
+    (void)key;
+    (void)q4dot_data;
+    (void)packed_weights;
+#endif
+}
+
 void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
                             const void* weight_data,
                             PackedWeightMap& packed_weights) {
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(weight))
         return;
+    if (weight.is_q4_g32_packed) {
+        weight.q4_g32_data = weight_data;
+        return;
+    }
     if (weight.is_q4_g128_packed) {
         weight.q4_g128_data = weight_data;
         return;
     }
     if (weight.is_q4_repacked) {
         weight.q4_repack_data = weight_data;
+        maybe_pack_int4_g32_weight(weight, key, weight_data, packed_weights);
         maybe_pack_int4_g128_weight(weight, key, weight_data, packed_weights);
         return;
     }
@@ -199,6 +240,8 @@ void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
         it = packed_weights.emplace(q4_key, std::move(buf)).first;
     }
     weight.q4_repack_data = it->second.data();
+    maybe_pack_int4_g32_weight(weight, key, weight.q4_repack_data,
+                               packed_weights);
     maybe_pack_int4_g128_weight(weight, key, weight.q4_repack_data,
                                 packed_weights);
 #else
@@ -312,6 +355,52 @@ uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K,
         }
     }
     return dst;
+}
+
+size_t pack_b_q4dot_g32_bytes(int N, int K) {
+    int N_padded = ((N + 7) / 8) * 8;
+    int groups_per_row = K / 32;
+    return (size_t)(N_padded / 8) * groups_per_row * sizeof(Q4B8G32Block);
+}
+
+uint8_t* pack_b_q4dot_g32_full(const uint8_t* B_q4dot, const float* scales,
+                               int N, int K, int groups_per_row) {
+    if (!B_q4dot || !scales || K % 32 != 0)
+        return nullptr;
+    int N_padded = ((N + 7) / 8) * 8;
+    int blocks_per_row = K / MATMUL_Q8_BLOCK;
+    if (groups_per_row != blocks_per_row)
+        return nullptr;
+
+    size_t total_bytes = pack_b_q4dot_g32_bytes(N, K);
+    uint8_t* raw = new uint8_t[total_bytes];
+    std::memset(raw, 0, total_bytes);
+    auto* dst = reinterpret_cast<Q4B8G32Block*>(raw);
+
+    constexpr int bytes_per_block = MATMUL_Q8_BLOCK / 2;
+    for (int n_tile = 0; n_tile < N_padded; n_tile += 8) {
+        int tile_valid = std::min(8, N - n_tile);
+        if (tile_valid < 0)
+            tile_valid = 0;
+        const uint8_t* src_tile =
+            B_q4dot + (size_t)(n_tile / 8) * blocks_per_row * 8 *
+                          bytes_per_block;
+        Q4B8G32Block* dst_tile =
+            dst + (size_t)(n_tile / 8) * blocks_per_row;
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            Q4B8G32Block& block = dst_tile[qb];
+            for (int c = 0; c < 8; c++) {
+                block.scales[c] =
+                    (c < tile_valid)
+                        ? scales[(size_t)(n_tile + c) * groups_per_row + qb]
+                        : 0.f;
+            }
+            const uint8_t* src_block =
+                src_tile + (size_t)qb * 8 * bytes_per_block;
+            std::memcpy(block.q, src_block, 8 * bytes_per_block);
+        }
+    }
+    return raw;
 }
 
 size_t pack_b_q4dot_g128_bytes(int N, int K) {

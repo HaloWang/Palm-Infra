@@ -303,9 +303,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
             t.is_q4_repacked = false;
+            t.is_q4_g32_packed = false;
             t.is_q4_g128_packed = false;
             t.q8_repack_data = nullptr;
             t.q4_repack_data = nullptr;
+            t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
 #ifdef MOLLM_METAL
             // Alias this weight into the registered device weight buffer NOW,

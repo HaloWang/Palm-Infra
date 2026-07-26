@@ -63,6 +63,7 @@ enum class OpType : uint32_t {
 
     // linear
     MATMUL  = 10,
+    MATMUL_BATCH = 11,
 
     // normalisation
     RMS_NORM   = 20,
@@ -129,6 +130,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::INPUT: return "INPUT";
     case OpType::CONSTANT: return "CONSTANT";
     case OpType::MATMUL: return "MATMUL";
+    case OpType::MATMUL_BATCH: return "MATMUL_BATCH";
     case OpType::RMS_NORM: return "RMS_NORM";
     case OpType::LAYER_NORM: return "LAYER_NORM";
     case OpType::ADD_RMS_NORM: return "ADD_RMS_NORM";

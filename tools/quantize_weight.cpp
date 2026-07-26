@@ -17,6 +17,7 @@
 namespace {
 
 constexpr int INT4_BG128_BLOCK_BYTES = 544;
+constexpr int INT4_BG32_BLOCK_BYTES = 160;
 
 float half_to_float(uint16_t h) {
     uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
@@ -105,12 +106,17 @@ void write_weight_file(const std::string& path,
     hdr.shape[3] = 1;
     hdr.data_offset = sizeof(MappedFile::Header);
     hdr.data_size = data.size();
-    hdr.scales_offset = sizeof(MappedFile::Header) + data.size();
-    hdr.scales_size = scales.size() * sizeof(float);
+    const bool embedded_bg32 =
+        precision == Precision::INT4 &&
+        (flags & MappedFile::FLAG_INT4_BG32) != 0;
+    hdr.scales_offset =
+        embedded_bg32 ? 0 : sizeof(MappedFile::Header) + data.size();
+    hdr.scales_size =
+        embedded_bg32 ? 0 : scales.size() * sizeof(float);
     hdr.group_size = (uint32_t)group_size;
     hdr.num_groups = (uint32_t)num_groups;
 
-    if (scales.empty()) {
+    if (scales.empty() && !embedded_bg32) {
         hdr.scales_offset = 0;
         hdr.scales_size = 0;
         hdr.group_size = 0;
@@ -125,7 +131,7 @@ void write_weight_file(const std::string& path,
     if (!data.empty()) {
         out.write((const char*)data.data(), (std::streamsize)data.size());
     }
-    if (!scales.empty()) {
+    if (!scales.empty() && !embedded_bg32) {
         out.write((const char*)scales.data(), (std::streamsize)(scales.size() * sizeof(float)));
     }
     if (!out) {
@@ -186,7 +192,8 @@ void quantize_w8(const uint8_t* raw, const std::string& dtype,
 }
 
 void quantize_w4(const uint8_t* raw, const std::string& dtype,
-                 int n, int k, int group_size, bool q4dot, bool bg128, int threads,
+                 int n, int k, int group_size, bool q4dot, bool bg32,
+                 bool bg128, int threads,
                  std::vector<uint8_t>& out, std::vector<float>& scales, uint32_t& flags) {
     int groups_per_row = (k + group_size - 1) / group_size;
     int row_stride = (k + 1) / 2;
@@ -194,7 +201,16 @@ void quantize_w4(const uint8_t* raw, const std::string& dtype,
     int n_padded = ((n + 7) / 8) * 8;
 
     flags = 0;
-    if (q4dot) {
+    if (bg32) {
+        if (group_size != 32 || k % 32 != 0) {
+            throw std::runtime_error(
+                "BG32 W4 requires group_size=32 and K multiple of 32");
+        }
+        out.assign((size_t)(n_padded / 8) * groups_per_row *
+                       INT4_BG32_BLOCK_BYTES,
+                   0);
+        flags = MappedFile::FLAG_INT4_BG32;
+    } else if (q4dot) {
         if (k % 32 != 0) {
             throw std::runtime_error("q4dot W4 requires K multiple of 32");
         }
@@ -222,6 +238,15 @@ void quantize_w4(const uint8_t* raw, const std::string& dtype,
                 }
                 float scale = max_abs > 0.0f ? max_abs / 7.0f : 1.0f;
                 scales[(size_t)row * groups_per_row + g] = scale;
+                size_t bg32_block_base = 0;
+                if (bg32) {
+                    bg32_block_base =
+                        ((size_t)(row / 8) * groups_per_row + (size_t)g) *
+                        INT4_BG32_BLOCK_BYTES;
+                    std::memcpy(out.data() + bg32_block_base +
+                                    (size_t)(row % 8) * sizeof(float),
+                                &scale, sizeof(scale));
+                }
                 size_t bg128_block_base = 0;
                 if (bg128) {
                     bg128_block_base =
@@ -237,7 +262,15 @@ void quantize_w4(const uint8_t* raw, const std::string& dtype,
                     q = std::max(-7, std::min(7, q));
                     uint8_t nibble = (uint8_t)(q & 0x0f);
 
-                    if (q4dot) {
+                    if (bg32) {
+                        size_t idx = bg32_block_base + 32 +
+                                     (size_t)(row % 8) * 16 +
+                                     (size_t)((col % 32) / 2);
+                        if (col & 1)
+                            out[idx] |= (uint8_t)(nibble << 4);
+                        else
+                            out[idx] |= nibble;
+                    } else if (q4dot) {
                         size_t idx = (((size_t)(row / 8) * k_blocks + (col / 32)) * 8 + (row % 8)) * 16
                                      + (size_t)((col % 32) / 2);
                         if (col & 1) out[idx] |= (uint8_t)(nibble << 4);
@@ -311,9 +344,11 @@ int main(int argc, char** argv) {
             write_weight_file(output, qdata, scales, n, k, Precision::INT8,
                               0, group_size, (int)scales.size());
         } else {
+            bool bg32 = (group_size == 32) && (k % 32 == 0);
             bool bg128 = (group_size == 128) && (k % 128 == 0);
-            bool q4dot = !bg128 && (k % 32 == 0) && (group_size % 32 == 0);
-            quantize_w4(raw.data(), dtype, n, k, group_size, q4dot, bg128,
+            bool q4dot = !bg32 && !bg128 && (k % 32 == 0) &&
+                         (group_size % 32 == 0);
+            quantize_w4(raw.data(), dtype, n, k, group_size, q4dot, bg32, bg128,
                         threads, qdata, scales, flags);
             write_weight_file(output, qdata, scales, n, k, Precision::INT4,
                               flags, group_size, (int)scales.size());

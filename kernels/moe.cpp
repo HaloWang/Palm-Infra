@@ -189,9 +189,11 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     view.num_groups = 0;
     view.is_interleaved = false;
     view.is_q4_repacked = false;
+    view.is_q4_g32_packed = false;
     view.is_q4_g128_packed = false;
     view.q8_repack_data = nullptr;
     view.q4_repack_data = nullptr;
+    view.q4_g32_data = nullptr;
     view.q4_g128_data = nullptr;
 
     if (src.prec == Precision::FP32 || src.prec == Precision::FP16) {
@@ -203,8 +205,15 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     int groups_per_row = src.groups_per_row > 0
         ? (int)src.groups_per_row
         : (src.group_size > 0 ? (K + (int)src.group_size - 1) / (int)src.group_size : 0);
-    if (!src.scales || src.group_size == 0 || groups_per_row <= 0) return false;
-    view.scales = src.scales + (size_t)row0 * (size_t)groups_per_row;
+    const bool embeds_scales =
+        (src.is_q4_g32_packed && src.q4_g32_data) ||
+        (src.is_q4_g128_packed && src.q4_g128_data);
+    if ((!src.scales && !embeds_scales) || src.group_size == 0 ||
+        groups_per_row <= 0)
+        return false;
+    view.scales = src.scales
+        ? src.scales + (size_t)row0 * (size_t)groups_per_row
+        : nullptr;
     view.group_size = src.group_size;
     view.groups_per_row = (uint32_t)groups_per_row;
     view.num_groups = (uint32_t)((size_t)rows * (size_t)groups_per_row);
@@ -228,6 +237,21 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     if (src.prec == Precision::INT4) {
         int row_stride = (K + 1) / 2;
         view.data = static_cast<char*>(src.data) + (size_t)row0 * (size_t)row_stride;
+
+        if (src.q4_g32_data) {
+            if ((row0 & 7) != 0 || src.group_size != 32 ||
+                (K % 32) != 0)
+                return false;
+            const char* p =
+                static_cast<const char*>(src.q4_g32_data) +
+                (size_t)(row0 / 8) * pack_b_q4dot_g32_bytes(8, K);
+            view.q4_g32_data = p;
+            if (src.is_q4_g32_packed) {
+                view.data = const_cast<char*>(p);
+                view.is_q4_g32_packed = true;
+                return true;
+            }
+        }
 
         if (src.is_q4_g128_packed && src.q4_g128_data) {
             if ((row0 & 7) != 0 || src.group_size != 128 || (K % 128) != 0) return false;

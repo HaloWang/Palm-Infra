@@ -204,14 +204,16 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
                      spec.weight_ref.c_str());
         return false;
     }
-    const bool has_embedded_bg128_scales =
+    const bool has_embedded_scales =
         spec.precision == Precision::INT4 &&
-        (spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
-        spec.group_size == 128 && spec.cols % 128 == 0 &&
+        (((spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
+          spec.group_size == 128 && spec.cols % 128 == 0) ||
+         ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
+          spec.group_size == 32 && spec.cols % 32 == 0)) &&
         matmul_int4_q4dot_kernel_available();
     if ((spec.precision == Precision::INT8 || spec.precision == Precision::INT4) &&
         (spec.group_size == 0 || spec.groups_per_row == 0 ||
-         (spec.scales_bytes == 0 && !has_embedded_bg128_scales))) {
+         (spec.scales_bytes == 0 && !has_embedded_scales))) {
         std::fprintf(stderr, "MoE SSD: quantized expert %s lacks scale metadata\n",
                      spec.weight_ref.c_str());
         return false;
@@ -558,7 +560,9 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.groups_per_row = s.groups_per_row;
         t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
         t.is_q4_repacked = (s.flags & MappedFile::FLAG_INT4_Q4DOT) != 0;
+        t.is_q4_g32_packed = (s.flags & MappedFile::FLAG_INT4_BG32) != 0;
         t.is_q4_g128_packed = (s.flags & MappedFile::FLAG_INT4_BG128) != 0;
+        if (t.is_q4_g32_packed) t.q4_g32_data = t.data;
         if (t.is_q4_g128_packed) t.q4_g128_data = t.data;
     }
     return t;

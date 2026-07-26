@@ -202,6 +202,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int8_t* b_int8_q8dot_data = nullptr;
     uint8_t* b_int4_data = nullptr;
     uint8_t* b_int4_q4dot_data = nullptr;
+    uint8_t* b_int4_q4g32_data = nullptr;
     uint8_t* b_int4_q4g128_data = nullptr;
     int8_t* b_int4_sparse_data = nullptr;
     float* scales_data = nullptr;
@@ -246,7 +247,10 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         b_raw = b_int4_data;
         if (g_matmul_config.use_interleave_pack && (K % 32) == 0 && (group_size % 32) == 0) {
             b_int4_q4dot_data = pack_b_q4dot_int4_full(b_int4_data, N, K, K);
-            if (group_size == 128 && (K % 128) == 0) {
+            if (group_size == 32) {
+                b_int4_q4g32_data = pack_b_q4dot_g32_full(
+                    b_int4_q4dot_data, scales_data, N, K, groups_per_row);
+            } else if (group_size == 128 && (K % 128) == 0) {
                 b_int4_q4g128_data = pack_b_q4dot_g128_full(
                     b_int4_q4dot_data, scales_data, N, K, groups_per_row);
                 if (cfg.sparse_a) {
@@ -291,6 +295,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
             if (cfg.sparse_a) B.sparse_data = b_int8_packed_data;
         } else {
             B.q4_repack_data = b_int4_q4dot_data;
+            B.q4_g32_data = b_int4_q4g32_data;
             B.q4_g128_data = b_int4_q4g128_data;
             B.sparse_data = b_int4_sparse_data;
         }
@@ -339,6 +344,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (b_int8_packed_data) delete[] b_int8_packed_data;
     if (b_int8_q8dot_data) delete[] b_int8_q8dot_data;
     if (b_int4_q4dot_data) delete[] b_int4_q4dot_data;
+    if (b_int4_q4g32_data) delete[] b_int4_q4g32_data;
     if (b_int4_q4g128_data) delete[] b_int4_q4g128_data;
     if (b_int4_sparse_data) delete[] b_int4_sparse_data;
     if (is_int8) {

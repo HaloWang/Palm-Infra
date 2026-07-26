@@ -56,6 +56,12 @@ struct alignas(16) Q4B8G128Block {
 };
 static_assert(sizeof(Q4B8G128Block) == 544, "unexpected Q4B8G128Block size");
 
+struct alignas(16) Q4B8G32Block {
+    float scales[8];
+    uint8_t q[8][16];
+};
+static_assert(sizeof(Q4B8G32Block) == 160, "unexpected Q4B8G32Block size");
+
 struct alignas(16) Q8A4Block {
     float scales[4];
     int8_t even[4][16];
@@ -135,6 +141,10 @@ void matmul_int4_i8mm_g128(const Q8A8I8MMBlock* qA8,
                            const Q4B8G128Block* B_g128, float* C, int M,
                            int N, int K, int ldc, int m_begin, int m_end,
                            int n_begin, int n_end);
+void matmul_int4_i8mm_g32(const Q8A8I8MMBlock* qA8,
+                          const Q4B8G32Block* B_g32, float* C, int M, int N,
+                          int K, int ldc, int m_begin, int m_end, int n_begin,
+                          int n_end);
 #endif
 void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,

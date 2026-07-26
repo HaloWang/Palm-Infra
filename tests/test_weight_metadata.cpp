@@ -45,6 +45,7 @@ int main() {
         weight.num_groups = 9;
         weight.groups_per_row = 3;
         weight.is_q4_repacked = true;
+        weight.is_q4_g32_packed = true;
         weight.is_q4_g128_packed = true;
         MappedFile::Header header{};
 
@@ -53,7 +54,8 @@ int main() {
               "accept non-quantized weight");
         CHECK(weight.scales == nullptr && weight.group_size == 0 &&
                   weight.num_groups == 0 && weight.groups_per_row == 0 &&
-                  !weight.is_q4_repacked && !weight.is_q4_g128_packed,
+                  !weight.is_q4_repacked && !weight.is_q4_g32_packed &&
+                  !weight.is_q4_g128_packed,
               "non-quantized weight clears stale quantization state");
     }
 
@@ -88,7 +90,8 @@ int main() {
         CHECK(mollm::detail::configure_weight_metadata(
                   weight, header, scales, "int4"),
               "accept valid plain INT4 metadata");
-        CHECK(!weight.is_q4_repacked && !weight.is_q4_g128_packed,
+        CHECK(!weight.is_q4_repacked && !weight.is_q4_g32_packed &&
+                  !weight.is_q4_g128_packed,
               "plain INT4 has no packed-layout flags");
 
         Tensor conflicting = make_weight(Precision::INT4, 8, 128);
@@ -99,6 +102,23 @@ int main() {
         CHECK(!mollm::detail::configure_weight_metadata(
                   conflicting, conflicting_header, scales, "conflicting"),
               "reject conflicting INT4 layout flags");
+    }
+
+    {
+        unsigned char packed[160] = {};
+        Tensor weight = make_weight(Precision::INT4, 8, 32);
+        weight.data = packed;
+        const MappedFile::Header header =
+            make_header(sizeof(packed), 0, 32, 8,
+                        MappedFile::FLAG_INT4_BG32);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  weight, header, nullptr, "bg32"),
+              "accept BG32 with embedded scales");
+        CHECK(weight.is_q4_g32_packed &&
+                  weight.q4_g32_data == packed &&
+                  weight.scales == nullptr &&
+                  weight.groups_per_row == 1,
+              "attach BG32 packed metadata");
     }
 
     {

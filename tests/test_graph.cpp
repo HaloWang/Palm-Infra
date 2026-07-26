@@ -89,6 +89,7 @@ int main() {
     // ---- all OpType values ----
     CHECK((int)OpType::INPUT == 0, "INPUT=0");
     CHECK((int)OpType::MATMUL == 10, "MATMUL=10");
+    CHECK((int)OpType::MATMUL_BATCH == 11, "MATMUL_BATCH=11");
     CHECK((int)OpType::SDPA == 50, "SDPA=50");
     CHECK((int)OpType::SDPA_MLA == 51, "SDPA_MLA=51");
 

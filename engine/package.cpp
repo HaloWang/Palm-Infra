@@ -454,18 +454,21 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         spec.data_offset =
                             ph.w_off + weight_offset + data_offset;
                         spec.data_bytes = data_bytes;
-                        const bool uses_embedded_bg128_scales =
+                        const bool uses_embedded_scales =
                             spec.precision == Precision::INT4 &&
-                            (spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
-                            spec.group_size == 128 &&
-                            spec.cols % 128 == 0 &&
+                            (((spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
+                              spec.group_size == 128 &&
+                              spec.cols % 128 == 0) ||
+                             ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
+                              spec.group_size == 32 &&
+                              spec.cols % 32 == 0)) &&
                             matmul_int4_q4dot_kernel_available();
                         spec.scales_offset =
-                            !uses_embedded_bg128_scales && scales_bytes
+                            !uses_embedded_scales && scales_bytes
                                 ? ph.w_off + weight_offset + scales_offset
                                 : 0;
                         spec.scales_bytes =
-                            uses_embedded_bg128_scales ? 0 : scales_bytes;
+                            uses_embedded_scales ? 0 : scales_bytes;
                         if (!cache->add_source(spec))
                             return false;
                         ++source_count;

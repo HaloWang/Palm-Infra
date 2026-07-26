@@ -624,6 +624,145 @@ int main() {
         }
     }
 
+    // BG32 uses the same batched-GEMV API with one embedded scale per
+    // 32-value dot block.
+    if (matmul_int4_q4dot_kernel_available()) {
+        constexpr int batch = 2;
+        constexpr int K = 64;
+        constexpr int N = 32;
+        constexpr int groups_per_row = K / 32;
+        std::vector<std::vector<float>> input(
+            batch, std::vector<float>(K));
+        for (int i = 0; i < batch; ++i)
+            for (int k = 0; k < K; ++k)
+                input[i][k] =
+                    ((k * (7 + i * 4)) % (29 + i * 2) - 14) * 0.015625f;
+
+        std::vector<std::vector<uint8_t>> packed(
+            batch, std::vector<uint8_t>((size_t)N * K / 2, 0));
+        std::vector<std::vector<float>> scales(
+            batch, std::vector<float>((size_t)N * groups_per_row));
+        std::vector<uint8_t*> q4dot(batch, nullptr);
+        std::vector<uint8_t*> bg32(batch, nullptr);
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs;
+        std::vector<Tensor> weights;
+        std::vector<Tensor> outputs;
+        for (int i = 0; i < batch; ++i) {
+            for (int n = 0; n < N; ++n) {
+                for (int g = 0; g < groups_per_row; ++g)
+                    scales[i][n * groups_per_row + g] =
+                        0.006f + 0.00025f * ((n + g + i) % 9);
+                for (int k = 0; k < K; ++k) {
+                    int q = ((n * 13 + k * 5 + i * 3) % 15) - 7;
+                    size_t index = (size_t)n * (K / 2) + k / 2;
+                    if (k & 1)
+                        packed[i][index] |= (uint8_t)((q & 15) << 4);
+                    else
+                        packed[i][index] |= (uint8_t)(q & 15);
+                }
+            }
+            q4dot[i] =
+                pack_b_q4dot_int4_full(packed[i].data(), N, K, K);
+            bg32[i] = pack_b_q4dot_g32_full(
+                q4dot[i], scales[i].data(), N, K, groups_per_row);
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input[i].data()));
+            weights.push_back(Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL, N, K, 1, 1,
+                bg32[i]));
+            weights.back().group_size = 32;
+            weights.back().groups_per_row = groups_per_row;
+            weights.back().is_q4_g32_packed = true;
+            weights.back().q4_g32_data = bg32[i];
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(inputs.back(), weights.back(), reference);
+        }
+
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_int4_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "INT4 BG32 batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(check_approx(
+                      actual[i].data(), expected[i].data(), N, 1e-5f),
+                  "INT4 BG32 batched GEMV matches individual GEMV");
+            delete[] q4dot[i];
+            delete[] bg32[i];
+        }
+    }
+
+    // Small RWKV LoRA projections use W8. Verify that independent inputs can
+    // share one worker dispatch without changing quantization or output.
+    if (matmul_int4_q4dot_kernel_available()) {
+        constexpr int batch = 2;
+        constexpr int K = 128;
+        constexpr int N = 64;
+        std::vector<std::vector<float>> input(
+            batch, std::vector<float>(K));
+        std::vector<std::vector<int8_t>> weight_data(
+            batch, std::vector<int8_t>((size_t)N * K));
+        std::vector<std::vector<float>> scales(
+            batch, std::vector<float>(N));
+        std::vector<int8_t*> packed(batch, nullptr);
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs, weights, outputs;
+        for (int i = 0; i < batch; ++i) {
+            for (int k = 0; k < K; ++k)
+                input[i][k] =
+                    ((k * (5 + i * 2)) % 31 - 15) * 0.0125f;
+            for (int n = 0; n < N; ++n) {
+                scales[i][n] = 0.003f + 0.0001f * ((n + i) % 7);
+                for (int k = 0; k < K; ++k)
+                    weight_data[i][(size_t)n * K + k] =
+                        (int8_t)(((n * 13 + k * 7 + i * 5) % 255) - 127);
+            }
+            packed[i] = pack_b_q8dot_int8_full(
+                weight_data[i].data(), N, K, K);
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input[i].data()));
+            weights.push_back(Tensor::create(
+                Precision::INT8, MemoryType::EXTERNAL, N, K, 1, 1,
+                weight_data[i].data()));
+            weights.back().scales = scales[i].data();
+            weights.back().group_size = 128;
+            weights.back().groups_per_row = 1;
+            weights.back().q8_repack_data = packed[i];
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(inputs.back(), weights.back(), reference);
+        }
+
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_int8_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "INT8 batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(check_approx(
+                      actual[i].data(), expected[i].data(), N, 1e-5f),
+                  "INT8 batched GEMV matches individual GEMV");
+            delete[] packed[i];
+        }
+    }
+
     {
         int M = 8, K = 128, N = 13;
         uint32_t group_size = 128;
@@ -786,6 +925,16 @@ int main() {
         kernel_matmul_fp32(A, B, C);
         CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
               "INT4 Q8-dot GEMM repacked matmul");
+        std::vector<float> c_repack = c_data;
+
+        uint8_t* q4_g32 = pack_b_q4dot_g32_full(
+            q4_repack, scales.data(), N, K, groups_per_row);
+        B.q4_g32_data = q4_g32;
+        kernel_matmul_fp32(A, B, C);
+        CHECK(check_approx(c_data.data(), c_repack.data(), M * N, 1e-5f),
+              "INT4 Q8-dot GEMM BG32 matches q4dot repack");
+        CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+              "INT4 Q8-dot GEMM BG32 reference");
 
         Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
                                          N, K, 1, 1, q4_repack);
@@ -799,6 +948,7 @@ int main() {
         CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
               "INT4 Q8-dot GEMM direct q4 layout matmul");
         delete[] q4_repack;
+        delete[] q4_g32;
     }
 
     {

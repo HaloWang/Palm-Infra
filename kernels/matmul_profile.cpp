@@ -1,6 +1,7 @@
 #include "kernels/matmul_profile.h"
 
 #include <algorithm>
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -9,11 +10,11 @@
 
 namespace {
 
-double g_pack_a_ms = 0;
-double g_matmul_ms = 0;
-double g_q8_quant_a_ms = 0;
-long long g_pack_a_calls = 0;
-long long g_q8_quant_a_calls = 0;
+std::atomic<long long> g_pack_a_ns{0};
+std::atomic<long long> g_matmul_ns{0};
+std::atomic<long long> g_q8_quant_a_ns{0};
+std::atomic<long long> g_pack_a_calls{0};
+std::atomic<long long> g_q8_quant_a_calls{0};
 std::mutex g_prof_mtx;
 
 bool env_flag_enabled(const char* name) {
@@ -58,11 +59,21 @@ void record_matmul_shape_profile_locked(const MatmulShapeProfileRow& key,
 
 } // namespace
 
-extern "C" double mollm_pack_a_total_ms() { return g_pack_a_ms; }
-extern "C" long long mollm_pack_a_calls() { return g_pack_a_calls; }
-extern "C" double mollm_matmul_total_ms() { return g_matmul_ms; }
-extern "C" double mollm_q8_quant_a_total_ms() { return g_q8_quant_a_ms; }
-extern "C" long long mollm_q8_quant_a_calls() { return g_q8_quant_a_calls; }
+extern "C" double mollm_pack_a_total_ms() {
+    return (double)g_pack_a_ns.load(std::memory_order_relaxed) / 1e6;
+}
+extern "C" long long mollm_pack_a_calls() {
+    return g_pack_a_calls.load(std::memory_order_relaxed);
+}
+extern "C" double mollm_matmul_total_ms() {
+    return (double)g_matmul_ns.load(std::memory_order_relaxed) / 1e6;
+}
+extern "C" double mollm_q8_quant_a_total_ms() {
+    return (double)g_q8_quant_a_ns.load(std::memory_order_relaxed) / 1e6;
+}
+extern "C" long long mollm_q8_quant_a_calls() {
+    return g_q8_quant_a_calls.load(std::memory_order_relaxed);
+}
 
 extern "C" int mollm_matmul_shape_profile_enabled() {
     return matmul_shape_profile_enabled() ? 1 : 0;
@@ -130,12 +141,11 @@ extern "C" void mollm_print_matmul_shape_profile(const char* title, int top_n) {
 }
 
 extern "C" void mollm_reset_pack_counters() {
-    std::lock_guard<std::mutex> lock(g_prof_mtx);
-    g_pack_a_ms = 0;
-    g_pack_a_calls = 0;
-    g_q8_quant_a_ms = 0;
-    g_q8_quant_a_calls = 0;
-    g_matmul_ms = 0;
+    g_pack_a_ns.store(0, std::memory_order_relaxed);
+    g_pack_a_calls.store(0, std::memory_order_relaxed);
+    g_q8_quant_a_ns.store(0, std::memory_order_relaxed);
+    g_q8_quant_a_calls.store(0, std::memory_order_relaxed);
+    g_matmul_ns.store(0, std::memory_order_relaxed);
 }
 
 MatmulTimer::MatmulTimer() : t0_(std::chrono::steady_clock::now()) {}
@@ -160,24 +170,25 @@ void MatmulTimer::set_shape(const char* path, int M, int N, int K,
 
 MatmulTimer::~MatmulTimer() {
     auto t1 = std::chrono::steady_clock::now();
-    double elapsed_ms =
-        std::chrono::duration<double, std::milli>(t1 - t0_).count();
-    std::lock_guard<std::mutex> lock(g_prof_mtx);
-    g_matmul_ms += elapsed_ms;
+    const auto elapsed_ns =
+        std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0_).count();
+    g_matmul_ns.fetch_add(elapsed_ns, std::memory_order_relaxed);
     if (shape_valid_ && matmul_shape_profile_enabled()) {
+        std::lock_guard<std::mutex> lock(g_prof_mtx);
+        double elapsed_ms = (double)elapsed_ns / 1e6;
         shape_.phase = g_matmul_profile_phase;
         record_matmul_shape_profile_locked(shape_, elapsed_ms);
     }
 }
 
 void matmul_record_pack_a(double elapsed_ms) {
-    std::lock_guard<std::mutex> lock(g_prof_mtx);
-    g_pack_a_ms += elapsed_ms;
-    g_pack_a_calls++;
+    g_pack_a_ns.fetch_add((long long)(elapsed_ms * 1e6),
+                          std::memory_order_relaxed);
+    g_pack_a_calls.fetch_add(1, std::memory_order_relaxed);
 }
 
 void matmul_record_q8_quant_a(double elapsed_ms) {
-    std::lock_guard<std::mutex> lock(g_prof_mtx);
-    g_q8_quant_a_ms += elapsed_ms;
-    g_q8_quant_a_calls++;
+    g_q8_quant_a_ns.fetch_add((long long)(elapsed_ms * 1e6),
+                              std::memory_order_relaxed);
+    g_q8_quant_a_calls.fetch_add(1, std::memory_order_relaxed);
 }

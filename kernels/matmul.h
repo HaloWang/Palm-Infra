@@ -26,8 +26,8 @@ extern bool g_mollm_force_fp32_acc; // debug: force FP32 accumulation
 // multiple layouts.
 using PackedWeightMap = std::unordered_map<std::string, std::vector<uint8_t>>;
 
-// Whether this build can consume the packed INT4 Q4-dot/BG128 layouts emitted
-// by the converter.
+// Whether this build can consume the packed INT4 Q4-dot/BG32/BG128 layouts
+// emitted by the converter.
 bool matmul_int4_q4dot_kernel_available();
 
 // Prepare load-time layouts consumed by the CPU matmul kernels. `weight_data`
@@ -80,6 +80,15 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
                                    const std::vector<Tensor>& weights,
                                    std::vector<Tensor>& outputs,
                                    ThreadPool* thread_pool);
+bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool);
+
+// Execute independent, same-shaped [A, weight] pairs into consecutive slices
+// of one output tensor. Decode can share a single worker-pool dispatch.
+void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
+                         Tensor& output, ThreadPool* thread_pool);
 
 void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool = nullptr);
@@ -108,6 +117,12 @@ int8_t* pack_b_q8dot_int8_full(const int8_t* B_original, int N, int K,
 // [N/8, K/32, 8, 16 packed bytes]. Padding output rows and K tail are zero.
 uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K,
                                 int K_weight);
+
+// Pack Q4-dot B plus W4G32 scales -> [N/8, K/32] blocks.
+// Each block stores float scales[8] then q4dot q[8][16].
+size_t pack_b_q4dot_g32_bytes(int N, int K);
+uint8_t* pack_b_q4dot_g32_full(const uint8_t* B_q4dot, const float* scales,
+                               int N, int K, int groups_per_row);
 
 // Pack Q4-dot B plus W4G128 scales -> [N/8, K/128] blocks.
 // Each block stores float scales[8] then q4dot q[4][8][16].
