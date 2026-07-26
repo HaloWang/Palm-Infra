@@ -94,43 +94,43 @@
   <line x1="200" y1="706" x2="200" y2="1042" class="grid"/><line x1="305" y1="706" x2="305" y2="1042" class="grid"/><line x1="410" y1="706" x2="410" y2="1042" class="grid"/><line x1="515" y1="706" x2="515" y2="1042" class="grid"/><line x1="620" y1="706" x2="620" y2="1042" class="grid"/>
   <line x1="700" y1="706" x2="700" y2="1042" class="grid"/><line x1="805" y1="706" x2="805" y2="1042" class="grid"/><line x1="910" y1="706" x2="910" y2="1042" class="grid"/><line x1="1015" y1="706" x2="1015" y2="1042" class="grid"/><line x1="1120" y1="706" x2="1120" y2="1042" class="grid"/>
   <text x="40" y="733" class="label">Qwen3.5-0.8B</text>
-  <rect x="200" y="712" width="356.2" height="13" rx="2" class="mollm"/><text x="563" y="723" class="value">678.41</text>
-  <rect x="200" y="730" width="407.4" height="13" rx="2" class="llama"/><text x="614" y="741" class="value">775.95</text>
-  <rect x="700" y="712" width="389.1" height="13" rx="2" class="mollm"/><text x="1096" y="723" class="value">259.43</text>
-  <rect x="700" y="730" width="286.3" height="13" rx="2" class="llama"/><text x="993" y="741" class="value">190.89</text>
+  <rect x="200" y="712" width="364.8" height="13" rx="2" class="mollm"/><text x="572" y="723" class="value">868.62</text>
+  <rect x="200" y="730" width="335.1" height="13" rx="2" class="llama"/><text x="542" y="741" class="value">797.85</text>
+  <rect x="700" y="712" width="305.1" height="13" rx="2" class="mollm"/><text x="1012" y="723" class="value">290.54</text>
+  <rect x="700" y="730" width="195.8" height="13" rx="2" class="llama"/><text x="903" y="741" class="value">186.52</text>
   <text x="40" y="779" class="label">Youtu-LLM-2B</text>
-  <rect x="200" y="758" width="159.4" height="13" rx="2" class="mollm"/><text x="366" y="769" class="value">303.67</text>
-  <rect x="200" y="776" width="133.4" height="13" rx="2" class="llama"/><text x="340" y="787" class="value">254.17</text>
-  <rect x="700" y="758" width="211.2" height="13" rx="2" class="mollm"/><text x="918" y="769" class="value">140.77</text>
-  <rect x="700" y="776" width="143.5" height="13" rx="2" class="llama"/><text x="851" y="787" class="value">95.69</text>
+  <rect x="200" y="758" width="127.5" height="13" rx="2" class="mollm"/><text x="335" y="769" class="value">303.67</text>
+  <rect x="200" y="776" width="106.8" height="13" rx="2" class="llama"/><text x="314" y="787" class="value">254.17</text>
+  <rect x="700" y="758" width="147.8" height="13" rx="2" class="mollm"/><text x="855" y="769" class="value">140.77</text>
+  <rect x="700" y="776" width="100.5" height="13" rx="2" class="llama"/><text x="807" y="787" class="value">95.69</text>
   <text x="40" y="825" class="label">Qwen3.5-4B</text>
-  <rect x="200" y="804" width="69.7" height="13" rx="2" class="mollm"/><text x="277" y="815" class="value">132.71</text>
-  <rect x="200" y="822" width="63.7" height="13" rx="2" class="llama"/><text x="271" y="833" class="value">121.39</text>
-  <rect x="700" y="804" width="104.7" height="13" rx="2" class="mollm"/><text x="812" y="815" class="value">69.78</text>
-  <rect x="700" y="822" width="60.5" height="13" rx="2" class="llama"/><text x="768" y="833" class="value">40.36</text>
+  <rect x="200" y="804" width="55.7" height="13" rx="2" class="mollm"/><text x="263" y="815" class="value">132.71</text>
+  <rect x="200" y="822" width="51.0" height="13" rx="2" class="llama"/><text x="258" y="833" class="value">121.39</text>
+  <rect x="700" y="804" width="73.3" height="13" rx="2" class="mollm"/><text x="780" y="815" class="value">69.78</text>
+  <rect x="700" y="822" width="42.4" height="13" rx="2" class="llama"/><text x="749" y="833" class="value">40.36</text>
   <text x="40" y="871" class="label">RWKV7-1.5B mixed</text>
-  <rect x="200" y="850" width="161.9" height="13" rx="2" class="mollm"/><text x="369" y="861" class="value">308.33</text>
-  <rect x="200" y="868" width="192.5" height="13" rx="2" class="llama"/><text x="400" y="879" class="value">366.76</text>
-  <rect x="700" y="850" width="203.8" height="13" rx="2" class="mollm"/><text x="911" y="861" class="value">135.85</text>
-  <rect x="700" y="868" width="166.0" height="13" rx="2" class="llama"/><text x="873" y="879" class="value">110.68</text>
+  <rect x="200" y="850" width="172.4" height="13" rx="2" class="mollm"/><text x="379" y="861" class="value">410.42</text>
+  <rect x="200" y="868" width="182.2" height="13" rx="2" class="llama"/><text x="389" y="879" class="value">433.71</text>
+  <rect x="700" y="850" width="169.5" height="13" rx="2" class="mollm"/><text x="877" y="861" class="value">161.47</text>
+  <rect x="700" y="868" width="89.3" height="13" rx="2" class="llama"/><text x="796" y="879" class="value">85.02</text>
   <text x="40" y="917" class="label">Qwen3.6-35B-A3B</text>
-  <rect x="200" y="896" width="73.3" height="13" rx="2" class="mollm"/><text x="281" y="907" class="value">139.63</text>
-  <rect x="200" y="914" width="61.4" height="13" rx="2" class="llama"/><text x="269" y="925" class="value">116.93</text>
-  <rect x="700" y="896" width="98.0" height="13" rx="2" class="mollm"/><text x="806" y="907" class="value">65.32</text>
-  <rect x="700" y="914" width="65.6" height="13" rx="2" class="llama"/><text x="773" y="925" class="value">43.73</text>
+  <rect x="200" y="896" width="58.6" height="13" rx="2" class="mollm"/><text x="266" y="907" class="value">139.63</text>
+  <rect x="200" y="914" width="49.1" height="13" rx="2" class="llama"/><text x="256" y="925" class="value">116.93</text>
+  <rect x="700" y="896" width="68.6" height="13" rx="2" class="mollm"/><text x="776" y="907" class="value">65.32</text>
+  <rect x="700" y="914" width="45.9" height="13" rx="2" class="llama"/><text x="753" y="925" class="value">43.73</text>
   <text x="40" y="963" class="label">Qwen3-30B-A3B</text>
-  <rect x="200" y="942" width="75.3" height="13" rx="2" class="mollm"/><text x="283" y="953" class="value">143.50</text>
-  <rect x="200" y="960" width="57.9" height="13" rx="2" class="llama"/><text x="266" y="971" class="value">110.34</text>
-  <rect x="700" y="942" width="95.8" height="13" rx="2" class="mollm"/><text x="804" y="953" class="value">63.85</text>
-  <rect x="700" y="960" width="91.2" height="13" rx="2" class="llama"/><text x="799" y="971" class="value">60.77</text>
+  <rect x="200" y="942" width="60.3" height="13" rx="2" class="mollm"/><text x="268" y="953" class="value">143.50</text>
+  <rect x="200" y="960" width="46.3" height="13" rx="2" class="llama"/><text x="253" y="971" class="value">110.34</text>
+  <rect x="700" y="942" width="67.0" height="13" rx="2" class="mollm"/><text x="774" y="953" class="value">63.85</text>
+  <rect x="700" y="960" width="63.8" height="13" rx="2" class="llama"/><text x="771" y="971" class="value">60.77</text>
   <text x="40" y="1009" class="label">Qwen3.5-122B SSD</text>
-  <rect x="200" y="988" width="19.9" height="13" rx="2" class="mollm"/><text x="227" y="999" class="value">37.99</text>
+  <rect x="200" y="988" width="16.0" height="13" rx="2" class="mollm"/><text x="223" y="999" class="value">37.99</text>
   <text x="200" y="1017" class="value">0 (OOM)</text>
-  <rect x="700" y="988" width="24.3" height="13" rx="2" class="mollm"/><text x="732" y="999" class="value">16.22</text>
+  <rect x="700" y="988" width="17.0" height="13" rx="2" class="mollm"/><text x="725" y="999" class="value">16.22</text>
   <text x="700" y="1017" class="value">0 (OOM)</text>
   <line x1="200" y1="1042" x2="620" y2="1042" class="axis"/>
-  <text x="196" y="1060" class="tick">0</text><text x="296" y="1060" class="tick">200</text><text x="401" y="1060" class="tick">400</text><text x="506" y="1060" class="tick">600</text><text x="611" y="1060" class="tick">800</text>
+  <text x="196" y="1060" class="tick">0</text><text x="292" y="1060" class="tick">250</text><text x="397" y="1060" class="tick">500</text><text x="502" y="1060" class="tick">750</text><text x="603" y="1060" class="tick">1000</text>
   <line x1="700" y1="1042" x2="1120" y2="1042" class="axis"/>
-  <text x="696" y="1060" class="tick">0</text><text x="799" y="1060" class="tick">70</text><text x="901" y="1060" class="tick">140</text><text x="1009" y="1060" class="tick">210</text><text x="1111" y="1060" class="tick">280</text>
+  <text x="696" y="1060" class="tick">0</text><text x="793" y="1060" class="tick">100</text><text x="898" y="1060" class="tick">200</text><text x="1003" y="1060" class="tick">300</text><text x="1108" y="1060" class="tick">400</text>
   <text x="40" y="1098" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 256-token output, 16 GiB cache, 3-run median.</text>
 </svg>

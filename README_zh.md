@@ -66,7 +66,8 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 当前 W4 中位数在 Youtu-LLM-2B 和 Qwen3.5-4B 上分别达到 140.77 和
 69.78 decode tokens/s，是对应 llama.cpp Q4_0 CPU 结果的 1.47 倍和
 1.73 倍。W4A8 decode 将激活与权重统一为 128-value 分组，先在整数寄存器
-中累计四个 dot-product block，再统一应用 scale。
+中累计四个 dot-product block，再统一应用 scale。图中的所有 dense 与
+recurrent W4 行均使用当前模型包与二进制重新测试。
 
 ![CPU 吞吐量对比](assets/performance_cpu.svg)
 

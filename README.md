@@ -76,7 +76,8 @@ independent-process medians unless noted.
 
 Current W4 medians reach 140.77 decode tokens/s on Youtu-LLM-2B and 69.78
 tokens/s on Qwen3.5-4B, respectively 1.47x and 1.73x the matched llama.cpp
-Q4_0 CPU results.
+Q4_0 CPU results. All dense and recurrent W4 rows in the chart use current
+packages and binaries.
 
 ![CPU throughput comparison](assets/performance_cpu.svg)
 
