@@ -1262,10 +1262,11 @@ kernel void gemm_selected_w4a8_i8a_i4b_f32c(
     for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N)C[p.c_offset+(ulong)sel*p.c_row_stride+gn]=facc[i]*SCALE_A[ar];}
 }
 
-// Decode-specialized native-BG128 GEMV. Unlike the tensor kernel above, this
-// computes exactly one output value per SIMD-group instead of materializing a
-// mostly-unused 64x64 tile for M=1.
-kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
+// Decode-specialized BG128 GEMV that computes one native eight-channel tile per
+// SIMD group. The channels share the same activation values and BG128 block,
+// cutting activation traffic and SIMD-group scheduling while keeping a compact
+// 128-thread threadgroup.
+kernel void gemv_selected_slots_bg128_tile8_i8a_i4b_f32c(
     device const int8_t* A [[buffer(0)]], device const uint8_t* B [[buffer(1)]],
     device float* C [[buffer(2)]], constant SelectedW4A8Params& p [[buffer(3)]],
     device const float* SCALE_A [[buffer(4)]],
@@ -1275,48 +1276,68 @@ kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
     ushort lane [[thread_index_in_simdgroup]],
     ushort sg [[simdgroup_index_in_threadgroup]]) {
     const int sel = (int)tg.z;
-    const int row = (int)tg.x * 4 + (int)sg;
-    if (sel >= p.selections || row >= p.N) return;
+    const int row0 = (int)tg.x * 32 + (int)sg * 8;
+    if (sel >= p.selections || row0 >= p.N) return;
 
     const int output_sel = (int)selection_indices[sel];
     const int ar = output_sel / max(p.activation_repeat, 1);
     device const int8_t* activation = A + (ulong)ar * p.K;
     device const uint8_t* weight = B + weight_offsets[sel];
-    const int channel = row & 7;
-    const int row_tile = row >> 3;
+    const int channel0 = row0 & 7;
+    const int row_tile = row0 >> 3;
     const ulong BG128_BYTES = 544;
-    float sum = 0.0f;
+    float sums[8] = {0.0f, 0.0f, 0.0f, 0.0f,
+                     0.0f, 0.0f, 0.0f, 0.0f};
 
     for (int g = 0; g < p.groups_per_row; ++g) {
         device const uint8_t* block =
             weight + ((ulong)row_tile * p.groups_per_row + g) *
                          BG128_BYTES;
-        int partial = 0;
-        // One 128-value group contains 64 packed bytes. Each lane consumes
-        // two bytes (four activation values).
+        int partials[8] = {0, 0, 0, 0, 0, 0, 0, 0};
         for (int packed = (int)lane; packed < 64; packed += 32) {
             const int qgi = packed >> 4;
             const int byte_in_qgi = packed & 15;
-            const uint8_t q = block[
-                32 + (qgi * 8 + channel) * 16 + byte_in_qgi];
-            const int lo = (q & 15) >= 8 ? (int)(q & 15) - 16
-                                         : (int)(q & 15);
-            const int hi = (q >> 4) >= 8 ? (int)(q >> 4) - 16
-                                         : (int)(q >> 4);
+            const int weight_base = 32 + qgi * 128 + byte_in_qgi;
             const int k = g * 128 + packed * 2;
-            partial += (int)activation[k] * lo;
-            partial += (int)activation[k + 1] * hi;
+            const int a0 = (int)activation[k];
+            const int a1 = (int)activation[k + 1];
+            #pragma unroll
+            for (int channel_offset = 0; channel_offset < 8;
+                 ++channel_offset) {
+                const uint8_t q =
+                    block[weight_base +
+                          (channel0 + channel_offset) * 16];
+                const int lo = (q & 15) >= 8 ? (int)(q & 15) - 16
+                                             : (int)(q & 15);
+                const int hi = (q >> 4) >= 8 ? (int)(q >> 4) - 16
+                                             : (int)(q >> 4);
+                partials[channel_offset] += a0 * lo + a1 * hi;
+            }
         }
-        const int group_dot = simd_sum(partial);
-        if (lane == 0) {
-            const float weight_scale =
-                ((device const float*)block)[channel];
-            sum += (float)group_dot * weight_scale;
+        #pragma unroll
+        for (int channel_offset = 0; channel_offset < 8;
+             ++channel_offset) {
+            const int group_dot = simd_sum(partials[channel_offset]);
+            if (lane == 0) {
+                device const float* weight_scales =
+                    (device const float*)block;
+                sums[channel_offset] +=
+                    (float)group_dot *
+                    weight_scales[channel0 + channel_offset];
+            }
         }
     }
     if (lane == 0) {
-        C[p.c_offset + (ulong)output_sel * p.c_row_stride + row] =
-            sum * SCALE_A[ar];
+        const float activation_scale = SCALE_A[ar];
+        #pragma unroll
+        for (int channel_offset = 0; channel_offset < 8;
+             ++channel_offset) {
+            const int row = row0 + channel_offset;
+            if (row < p.N) {
+                C[p.c_offset + (ulong)output_sel * p.c_row_stride + row] =
+                    sums[channel_offset] * activation_scale;
+            }
+        }
     }
 }
 #endif // MOLLM_METAL_TENSOR
