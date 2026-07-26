@@ -78,21 +78,21 @@ static inline void gdn_recurrence_neon(
     {
         float32x4_t g4 = vdupq_n_f32(g_t_exp);
         int dv = 0;
-        for (; dv + 32 <= v_dim; dv += 32) {
-            float32x4_t acc[8];
-            for (int j = 0; j < 8; j++)
+        for (; dv + 64 <= v_dim; dv += 64) {
+            float32x4_t acc[16];
+            for (int j = 0; j < 16; j++)
                 acc[j] = vdupq_n_f32(0.f);
             for (int dk = 0; dk < k_dim; dk++) {
                 float32x4_t k4 = vdupq_n_f32(k[dk]);
                 float* row = state_h + dk * v_dim + dv;
-                for (int j = 0; j < 8; j++) {
+                for (int j = 0; j < 16; j++) {
                     float32x4_t rv = vld1q_f32(row + j * 4);
                     rv = vmulq_f32(rv, g4);
                     vst1q_f32(row + j * 4, rv);
                     acc[j] = vmlaq_f32(acc[j], rv, k4);
                 }
             }
-            for (int j = 0; j < 8; j++)
+            for (int j = 0; j < 16; j++)
                 vst1q_f32(kv_mem + dv + j * 4, acc[j]);
         }
         for (; dv < v_dim; dv += 4) {
