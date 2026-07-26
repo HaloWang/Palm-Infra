@@ -66,6 +66,7 @@ struct MetalBackend::Impl {
     struct SsdExpertBuffers {
         id<MTLBuffer> gate_up = nil;
         id<MTLBuffer> down = nil;
+        id<MTLSharedEvent> ready_event = nil;
         size_t gate_up_offset = 0;
         size_t down_offset = 0;
         size_t slot = 0;
@@ -76,14 +77,13 @@ struct MetalBackend::Impl {
     struct SsdExpertView {
         id<MTLBuffer> gate_up = nil;
         id<MTLBuffer> down = nil;
+        id<MTLSharedEvent> ready_event = nil;
         size_t gate_up_offset = 0;
         size_t down_offset = 0;
         uint64_t ready_value = 0;
     };
     id<MTLIOCommandQueue> ssd_io_queue = nil;
     id<MTLIOFileHandle> ssd_file = nil;
-    id<MTLSharedEvent> ssd_io_event = nil;
-    uint64_t ssd_io_event_value = 0;
     id<MTLCommandQueue> ssd_shared_compute_queue = nil;
     id<MTLSharedEvent> ssd_shared_compute_event = nil;
     uint64_t ssd_shared_compute_event_value = 0;
@@ -167,11 +167,9 @@ struct MetalBackend::Impl {
                              const MoeSsdTensorSpec& down,
                              const std::vector<int>& experts,
                              std::vector<SsdExpertView>& views,
-                             uint64_t& ready_value,
                              bool speculative = false) {
         views.clear();
-        ready_value = 0;
-        if (!ssd_io_queue || !ssd_file || !ssd_io_event ||
+        if (!ssd_io_queue || !ssd_file ||
             gate.layer != down.layer ||
             gate.precision != Precision::INT4 ||
             down.precision != Precision::INT4 ||
@@ -218,8 +216,6 @@ struct MetalBackend::Impl {
                 }
             } else {
                 found->second.used_at = ++ssd_clock;
-                ready_value =
-                    std::max(ready_value, found->second.ready_value);
                 if (first_request)
                     ++ssd_hits;
             }
@@ -229,10 +225,11 @@ struct MetalBackend::Impl {
         while (ssd_resident_bytes + required > ssd_capacity_bytes) {
             auto victim = ssd_experts.end();
             int victim_priority = std::numeric_limits<int>::max();
-            const uint64_t completed_value = ssd_io_event.signaledValue;
             for (auto it = ssd_experts.begin(); it != ssd_experts.end(); ++it) {
                 if (requested.count(it->first) ||
-                    it->second.ready_value > completed_value)
+                    (it->second.ready_event &&
+                     it->second.ready_event.signaledValue <
+                         it->second.ready_value))
                     continue;
                 const int entry_layer =
                     static_cast<int>(it->first >> 32);
@@ -268,11 +265,16 @@ struct MetalBackend::Impl {
             id<MTLIOCommandBuffer> io = [ssd_io_queue commandBuffer];
             if (!io)
                 return false;
-            if (ssd_io_event_value != 0) {
-                [io waitForEvent:ssd_io_event value:ssd_io_event_value];
-            }
-            const uint64_t load_ready_value = ++ssd_io_event_value;
-            ready_value = std::max(ready_value, load_ready_value);
+            // Give every load batch its own completion event. A single global
+            // monotonically-valued event would require command N+1 to wait for
+            // N: otherwise a fast later signal could incorrectly make an
+            // earlier load appear complete. Independent events preserve slot
+            // readiness while allowing the concurrent MTLIO queue to let a
+            // demand read bypass an older speculative prefetch.
+            id<MTLSharedEvent> load_ready_event = [device newSharedEvent];
+            if (!load_ready_event)
+                return false;
+            constexpr uint64_t load_ready_value = 1;
             for (int expert : missing) {
                 if (ssd_free_slots.empty())
                     return false;
@@ -281,6 +283,7 @@ struct MetalBackend::Impl {
                 ssd_free_slots.pop_back();
                 entry.gate_up = ssd_arena;
                 entry.down = ssd_arena;
+                entry.ready_event = load_ready_event;
                 entry.gate_up_offset = entry.slot * ssd_slot_bytes;
                 entry.down_offset =
                     entry.gate_up_offset + static_cast<size_t>(gate.data_bytes);
@@ -303,7 +306,7 @@ struct MetalBackend::Impl {
                                     std::move(entry));
             }
             const uint64_t start = mollm_trace::now_ns();
-            [io signalEvent:ssd_io_event value:load_ready_value];
+            [io signalEvent:load_ready_event value:load_ready_value];
             const int layer = gate.layer;
             const size_t expert_count = missing.size();
             [io addCompletedHandler:^(id<MTLIOCommandBuffer> completed) {
@@ -335,6 +338,7 @@ struct MetalBackend::Impl {
             views.push_back({
                 found->second.gate_up,
                 found->second.down,
+                found->second.ready_event,
                 found->second.gate_up_offset,
                 found->second.down_offset,
                 found->second.ready_value,
@@ -1051,17 +1055,14 @@ bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
         else
             impl_->ssd_file = [impl_->device newIOHandleWithURL:url
                                                            error:&error];
-        impl_->ssd_io_event = [impl_->device newSharedEvent];
         impl_->ssd_shared_compute_queue = [impl_->device newCommandQueue];
         impl_->ssd_shared_compute_event = [impl_->device newSharedEvent];
         if (!impl_->ssd_io_queue || !impl_->ssd_file ||
-            !impl_->ssd_io_event || !impl_->ssd_shared_compute_queue ||
-            !impl_->ssd_shared_compute_event) {
+            !impl_->ssd_shared_compute_queue || !impl_->ssd_shared_compute_event) {
             fprintf(stderr, "MetalBackend: Metal SSD I/O setup failed: %s\n",
                     error ? error.localizedDescription.UTF8String : "?");
             impl_->ssd_io_queue = nil;
             impl_->ssd_file = nil;
-            impl_->ssd_io_event = nil;
             impl_->ssd_shared_compute_queue = nil;
             impl_->ssd_shared_compute_event = nil;
             return false;
@@ -3216,11 +3217,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                 std::vector<int> experts(exact_routes,
                                          exact_routes + seq * top_k);
                 std::vector<Impl::SsdExpertView> expert_views;
-                uint64_t experts_ready = 0;
                 const uint64_t demand_start = mollm_trace::now_ns();
                 if (!impl_->acquire_ssd_experts(
                         ssd_gate->spec, ssd_down->spec, experts,
-                        expert_views, experts_ready)) {
+                        expert_views)) {
                     fprintf(stderr,
                             "MetalBackend: failed to load SSD experts for "
                             "layer %d\n",
@@ -3243,17 +3243,16 @@ void MetalBackend::dispatch(const GraphNode& node,
                         predicted_routes +
                             seq * predicted_layer->top_k);
                     std::vector<Impl::SsdExpertView> predicted_views;
-                    uint64_t predicted_ready = 0;
                     // Demand I/O was submitted first. This speculative command
-                    // waits behind it on the I/O queue, then overlaps the
-                    // current layer's expert compute.
+                    // may execute concurrently with it and overlaps the current
+                    // layer's expert compute. Per-batch readiness events keep
+                    // cache slots safe without globally serializing MTLIO.
                     const uint64_t prefetch_start =
                         mollm_trace::now_ns();
                     impl_->acquire_ssd_experts(
                         predicted_layer->gate_up->spec,
                         predicted_layer->down->spec,
-                        predicted_experts, predicted_views,
-                        predicted_ready, true);
+                        predicted_experts, predicted_views, true);
                     mollm_trace::record_duration(
                         "metal.ssd", "prefetch_schedule", prefetch_start,
                         mollm_trace::now_ns(),
@@ -3295,14 +3294,16 @@ void MetalBackend::dispatch(const GraphNode& node,
                 id<MTLBuffer> shared_output =
                     (__bridge id<MTLBuffer>)shared_output_h;
                 uint64_t shared_ready_value = shared_work.ready_value;
-                const uint64_t completed_io =
-                    impl_->ssd_io_event.signaledValue;
                 std::vector<int> ordered_selections;
                 ordered_selections.reserve(selections);
+                auto selection_ready = [&](int selection) {
+                    const auto& view = expert_views[selection];
+                    return !view.ready_event ||
+                           view.ready_event.signaledValue >= view.ready_value;
+                };
                 for (int selection = 0; selection < selections;
                      ++selection) {
-                    if (expert_views[selection].ready_value <=
-                        completed_io) {
+                    if (selection_ready(selection)) {
                         ordered_selections.push_back(selection);
                     }
                 }
@@ -3319,20 +3320,35 @@ void MetalBackend::dispatch(const GraphNode& node,
                          ++selection) {
                         ordered_selections.push_back(selection);
                     }
-                    if (experts_ready != 0) {
-                        [impl_->cmd
-                            encodeWaitForEvent:impl_->ssd_io_event
-                                         value:experts_ready];
-                    }
                 } else {
                     for (int selection = 0; selection < selections;
                          ++selection) {
-                        if (expert_views[selection].ready_value >
-                            completed_io) {
+                        if (!selection_ready(selection)) {
                             ordered_selections.push_back(selection);
                         }
                     }
                 }
+                auto encode_io_waits = [&](int ordered_begin) {
+                    std::unordered_set<void*> waited_events;
+                    for (int ordered = ordered_begin;
+                         ordered < selections; ++ordered) {
+                        const auto& view =
+                            expert_views[ordered_selections[ordered]];
+                        if (!view.ready_event ||
+                            view.ready_event.signaledValue >=
+                                view.ready_value)
+                            continue;
+                        void* event_key =
+                            (__bridge void*)view.ready_event;
+                        if (waited_events.insert(event_key).second) {
+                            [impl_->cmd
+                                encodeWaitForEvent:view.ready_event
+                                             value:view.ready_value];
+                        }
+                    }
+                };
+                if (ready_selections == 0)
+                    encode_io_waits(0);
                 impl_->enc = [impl_->cmd computeCommandEncoder];
                 impl_->enc.label = @"mollm Metal SSD expert";
                 enc = impl_->enc;
@@ -3455,11 +3471,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     ready_selections > 0) {
                     [enc endEncoding];
                     impl_->enc = nil;
-                    if (experts_ready != 0) {
-                        [impl_->cmd
-                            encodeWaitForEvent:impl_->ssd_io_event
-                                         value:experts_ready];
-                    }
+                    encode_io_waits(ready_selections);
                     impl_->enc =
                         [impl_->cmd computeCommandEncoder];
                     impl_->enc.label =
