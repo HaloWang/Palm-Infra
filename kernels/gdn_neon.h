@@ -73,20 +73,38 @@ static inline void gdn_recurrence_neon(
     alignas(16) float attn_out[128] = {0};
 
     // ---- Pass 1: fused decay + matvec1 (kv_mem = state @ k) ----
-    // For each row dk: row = state[dk]; row *= g; kv_mem += row * k[dk]; state[dk] = row
+    // Block value columns so the matvec accumulators stay in registers across
+    // the complete K loop instead of being loaded/stored for every state row.
     {
         float32x4_t g4 = vdupq_n_f32(g_t_exp);
-        for (int dk = 0; dk < k_dim; dk++) {
-            float32x4_t k4 = vdupq_n_f32(k[dk]);
-            float* row = state_h + dk * v_dim;
-            for (int dv = 0; dv < v_dim; dv += 4) {
-                float32x4_t rv = vld1q_f32(row + dv);
-                rv = vmulq_f32(rv, g4);                  // decay in-place
-                vst1q_f32(row + dv, rv);                  // write back decayed row
-                float32x4_t kv = vld1q_f32(kv_mem + dv);
-                kv = vmlaq_f32(kv, rv, k4);               // kv_mem += row * k[dk]
-                vst1q_f32(kv_mem + dv, kv);
+        int dv = 0;
+        for (; dv + 32 <= v_dim; dv += 32) {
+            float32x4_t acc[8];
+            for (int j = 0; j < 8; j++)
+                acc[j] = vdupq_n_f32(0.f);
+            for (int dk = 0; dk < k_dim; dk++) {
+                float32x4_t k4 = vdupq_n_f32(k[dk]);
+                float* row = state_h + dk * v_dim + dv;
+                for (int j = 0; j < 8; j++) {
+                    float32x4_t rv = vld1q_f32(row + j * 4);
+                    rv = vmulq_f32(rv, g4);
+                    vst1q_f32(row + j * 4, rv);
+                    acc[j] = vmlaq_f32(acc[j], rv, k4);
+                }
             }
+            for (int j = 0; j < 8; j++)
+                vst1q_f32(kv_mem + dv + j * 4, acc[j]);
+        }
+        for (; dv < v_dim; dv += 4) {
+            float32x4_t acc = vdupq_n_f32(0.f);
+            for (int dk = 0; dk < k_dim; dk++) {
+                float32x4_t k4 = vdupq_n_f32(k[dk]);
+                float* row = state_h + dk * v_dim + dv;
+                float32x4_t rv = vmulq_f32(vld1q_f32(row), g4);
+                vst1q_f32(row, rv);
+                acc = vmlaq_f32(acc, rv, k4);
+            }
+            vst1q_f32(kv_mem + dv, acc);
         }
     }
 
@@ -102,21 +120,43 @@ static inline void gdn_recurrence_neon(
     }
 
     // ---- Pass 2: fused rank1_update + matvec2 (attn_out = state @ q) ----
-    // For each row dk: row = state[dk]; row += k[dk] * delta; attn_out += row * q[dk]; state[dk] = row
+    // Keep both delta and output accumulators resident for a 32-value block.
     {
-        for (int dk = 0; dk < k_dim; dk++) {
-            float32x4_t k4 = vdupq_n_f32(k[dk]);
-            float32x4_t q4 = vdupq_n_f32(q[dk]);
-            float* row = state_h + dk * v_dim;
-            for (int dv = 0; dv < v_dim; dv += 4) {
-                float32x4_t rv = vld1q_f32(row + dv);
-                float32x4_t dv4 = vld1q_f32(delta + dv);
-                rv = vmlaq_f32(rv, dv4, k4);              // row += k[dk] * delta
-                vst1q_f32(row + dv, rv);                  // write back updated row
-                float32x4_t av = vld1q_f32(attn_out + dv);
-                av = vmlaq_f32(av, rv, q4);               // attn_out += row * q[dk]
-                vst1q_f32(attn_out + dv, av);
+        int dv = 0;
+        for (; dv + 32 <= v_dim; dv += 32) {
+            float32x4_t delta_v[8];
+            float32x4_t acc[8];
+            for (int j = 0; j < 8; j++) {
+                delta_v[j] = vld1q_f32(delta + dv + j * 4);
+                acc[j] = vdupq_n_f32(0.f);
             }
+            for (int dk = 0; dk < k_dim; dk++) {
+                float32x4_t k4 = vdupq_n_f32(k[dk]);
+                float32x4_t q4 = vdupq_n_f32(q[dk]);
+                float* row = state_h + dk * v_dim + dv;
+                for (int j = 0; j < 8; j++) {
+                    float32x4_t rv = vld1q_f32(row + j * 4);
+                    rv = vmlaq_f32(rv, delta_v[j], k4);
+                    vst1q_f32(row + j * 4, rv);
+                    acc[j] = vmlaq_f32(acc[j], rv, q4);
+                }
+            }
+            for (int j = 0; j < 8; j++)
+                vst1q_f32(attn_out + dv + j * 4, acc[j]);
+        }
+        for (; dv < v_dim; dv += 4) {
+            float32x4_t delta_v = vld1q_f32(delta + dv);
+            float32x4_t acc = vdupq_n_f32(0.f);
+            for (int dk = 0; dk < k_dim; dk++) {
+                float32x4_t k4 = vdupq_n_f32(k[dk]);
+                float32x4_t q4 = vdupq_n_f32(q[dk]);
+                float* row = state_h + dk * v_dim + dv;
+                float32x4_t rv = vld1q_f32(row);
+                rv = vmlaq_f32(rv, delta_v, k4);
+                vst1q_f32(row, rv);
+                acc = vmlaq_f32(acc, rv, q4);
+            }
+            vst1q_f32(attn_out + dv, acc);
         }
     }
 
