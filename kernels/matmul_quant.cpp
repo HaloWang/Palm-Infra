@@ -247,3 +247,68 @@ void quantize_a_q8_blocks_even_odd(const float* A, int K,
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     matmul_record_q8_quant_a(ms);
 }
+
+void quantize_a_q8_g128_even_odd(const float* A, int K,
+                                 std::vector<int8_t>& qA_even,
+                                 std::vector<int8_t>& qA_odd,
+                                 std::vector<float>& a_scales) {
+    auto t0 = std::chrono::steady_clock::now();
+    // Callers only select this path for the physical BG128 weight layout.
+    int groups = K / 128;
+    int blocks = groups * 4;
+    qA_even.resize((size_t)blocks * 16);
+    qA_odd.resize((size_t)blocks * 16);
+    a_scales.resize((size_t)groups);
+
+    for (int g = 0; g < groups; g++) {
+        const float* src = A + (size_t)g * 128;
+        float amax = 0.f;
+#if HAS_NEON && defined(__aarch64__)
+        float32x4_t vmax = vdupq_n_f32(0.f);
+        for (int k = 0; k < 128; k += 4)
+            vmax = vmaxq_f32(vmax, vabsq_f32(vld1q_f32(src + k)));
+        amax = vmaxvq_f32(vmax);
+#else
+        for (int k = 0; k < 128; k++)
+            amax = std::max(amax, std::fabs(src[k]));
+#endif
+        float scale = (amax > 0.f) ? (amax / 127.f) : 1.f;
+        float inv_scale = (amax > 0.f) ? (127.f / amax) : 0.f;
+        a_scales[g] = scale;
+
+        for (int qgi = 0; qgi < 4; qgi++) {
+            int qb = g * 4 + qgi;
+            int8_t* even = qA_even.data() + (size_t)qb * 16;
+            int8_t* odd = qA_odd.data() + (size_t)qb * 16;
+            const float* block = src + qgi * 32;
+#if HAS_NEON && defined(__aarch64__)
+            int32x4_t q[8];
+            for (int i = 0; i < 8; i++) {
+                q[i] = vcvtnq_s32_f32(
+                    vmulq_n_f32(vld1q_f32(block + i * 4), inv_scale));
+            }
+            int16x8_t q01 = vcombine_s16(vqmovn_s32(q[0]), vqmovn_s32(q[1]));
+            int16x8_t q23 = vcombine_s16(vqmovn_s32(q[2]), vqmovn_s32(q[3]));
+            int16x8_t q45 = vcombine_s16(vqmovn_s32(q[4]), vqmovn_s32(q[5]));
+            int16x8_t q67 = vcombine_s16(vqmovn_s32(q[6]), vqmovn_s32(q[7]));
+            int8x16_t q_lo =
+                vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23));
+            int8x16_t q_hi =
+                vcombine_s8(vqmovn_s16(q45), vqmovn_s16(q67));
+            vst1q_s8(even, vuzp1q_s8(q_lo, q_hi));
+            vst1q_s8(odd, vuzp2q_s8(q_lo, q_hi));
+#else
+            for (int i = 0; i < 16; i++) {
+                int q0 = (int)std::nearbyint(block[i * 2] * inv_scale);
+                int q1 = (int)std::nearbyint(block[i * 2 + 1] * inv_scale);
+                even[i] = (int8_t)std::max(-127, std::min(127, q0));
+                odd[i] = (int8_t)std::max(-127, std::min(127, q1));
+            }
+#endif
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    matmul_record_q8_quant_a(
+        std::chrono::duration<double, std::milli>(t1 - t0).count());
+}

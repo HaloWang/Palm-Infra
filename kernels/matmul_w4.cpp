@@ -21,9 +21,11 @@ static inline void load_int4x32_signed_scaled16(const uint8_t* src,
     odd_scaled = vreinterpretq_s8_u8(vandq_u8(packed, vdupq_n_u8(0xF0)));
 }
 
-static inline int32x4_t q4_q8_dot32(int8x16_t q4_even, int8x16_t q4_odd,
-                                    int8x16_t qa_even, int8x16_t qa_odd) {
-    int32x4_t d = vdupq_n_s32(0);
+static inline int32x4_t q4_q8_dot32_acc(int32x4_t d,
+                                        int8x16_t q4_even,
+                                        int8x16_t q4_odd,
+                                        int8x16_t qa_even,
+                                        int8x16_t qa_odd) {
 #if defined(__aarch64__)
     // Keep the M=1 path on SDOT even when the translation unit enables i8mm.
     // Clang otherwise recognizes the eight independent column dots as a
@@ -40,6 +42,11 @@ static inline int32x4_t q4_q8_dot32(int8x16_t q4_even, int8x16_t q4_odd,
     d = vdotq_s32(d, q4_odd, qa_odd);
 #endif
     return d;
+}
+
+static inline int32x4_t q4_q8_dot32(int8x16_t q4_even, int8x16_t q4_odd,
+                                    int8x16_t qa_even, int8x16_t qa_odd) {
+    return q4_q8_dot32_acc(vdupq_n_s32(0), q4_even, q4_odd, qa_even, qa_odd);
 }
 
 static inline float32x4_t q4_scaled16_dot_to_f32(int32x4_t dots) {
@@ -219,26 +226,29 @@ static void matmul_int4_q8dot_neon_gemv_g128_range(
             float32x4_t bscale_lo = vld1q_f32(b_group.scales);
             float32x4_t bscale_hi = vld1q_f32(b_group.scales + 4);
 
+            // A and B now share one scale for the complete 128-value group.
+            // Accumulate its four dot blocks in integer space so horizontal
+            // reduction, conversion, and scale application happen only once.
+            int32x4_t d0 = vdupq_n_s32(0);
+            int32x4_t d1 = vdupq_n_s32(0);
+            int32x4_t d2 = vdupq_n_s32(0);
+            int32x4_t d3 = vdupq_n_s32(0);
+            int32x4_t d4 = vdupq_n_s32(0);
+            int32x4_t d5 = vdupq_n_s32(0);
+            int32x4_t d6 = vdupq_n_s32(0);
+            int32x4_t d7 = vdupq_n_s32(0);
+
             for (int qgi = 0; qgi < 4; qgi++) {
                 int qb = g * 4 + qgi;
                 int8x16_t qa_even = vld1q_s8(qA_even_pre + (size_t)qb * 16);
                 int8x16_t qa_odd = vld1q_s8(qA_odd_pre + (size_t)qb * 16);
-
-                int32x4_t d0 = vdupq_n_s32(0);
-                int32x4_t d1 = vdupq_n_s32(0);
-                int32x4_t d2 = vdupq_n_s32(0);
-                int32x4_t d3 = vdupq_n_s32(0);
-                int32x4_t d4 = vdupq_n_s32(0);
-                int32x4_t d5 = vdupq_n_s32(0);
-                int32x4_t d6 = vdupq_n_s32(0);
-                int32x4_t d7 = vdupq_n_s32(0);
 
                 auto dot_col = [&](int c, int32x4_t& d) {
                     int8x16_t q4_even;
                     int8x16_t q4_odd;
                     load_int4x32_signed_scaled16(b_group.q[qgi][c], q4_even,
                                                  q4_odd);
-                    d = q4_q8_dot32(q4_even, q4_odd, qa_even, qa_odd);
+                    d = q4_q8_dot32_acc(d, q4_even, q4_odd, qa_even, qa_odd);
                 };
 
                 if (c_valid > 0)
@@ -258,19 +268,20 @@ static void matmul_int4_q8dot_neon_gemv_g128_range(
                 if (c_valid > 7)
                     dot_col(7, d7);
 
-                int32x4_t p01 = vpaddq_s32(d0, d1);
-                int32x4_t p23 = vpaddq_s32(d2, d3);
-                int32x4_t p45 = vpaddq_s32(d4, d5);
-                int32x4_t p67 = vpaddq_s32(d6, d7);
-                int32x4_t dots_lo = vpaddq_s32(p01, p23);
-                int32x4_t dots_hi = vpaddq_s32(p45, p67);
-
-                float a_scale = a_scales[qb];
-                acc_lo = vfmaq_f32(acc_lo, q4_scaled16_dot_to_f32(dots_lo),
-                                   vmulq_n_f32(bscale_lo, a_scale));
-                acc_hi = vfmaq_f32(acc_hi, q4_scaled16_dot_to_f32(dots_hi),
-                                   vmulq_n_f32(bscale_hi, a_scale));
             }
+
+            int32x4_t p01 = vpaddq_s32(d0, d1);
+            int32x4_t p23 = vpaddq_s32(d2, d3);
+            int32x4_t p45 = vpaddq_s32(d4, d5);
+            int32x4_t p67 = vpaddq_s32(d6, d7);
+            int32x4_t dots_lo = vpaddq_s32(p01, p23);
+            int32x4_t dots_hi = vpaddq_s32(p45, p67);
+
+            float a_scale = a_scales[g];
+            acc_lo = vfmaq_f32(acc_lo, q4_scaled16_dot_to_f32(dots_lo),
+                               vmulq_n_f32(bscale_lo, a_scale));
+            acc_hi = vfmaq_f32(acc_hi, q4_scaled16_dot_to_f32(dots_hi),
+                               vmulq_n_f32(bscale_hi, a_scale));
         }
 
         float tmp[4];
@@ -342,7 +353,7 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
         if (input_index == i) {
             Q4GemvScratch& quantized =
                 batch_scratch.quantized_inputs[input_index];
-            quantize_a_q8_blocks_even_odd(
+            quantize_a_q8_g128_even_odd(
                 input.ptr<float>(), K, quantized.qA_even, quantized.qA_odd,
                 quantized.a_scales);
         }
@@ -881,8 +892,13 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         timer.set_shape(path, M, N, K, group_size, groups_per_row,
                         use_q4_gemv_bg128 || use_q4_repack, false, n_threads);
         static thread_local Q4GemvScratch scratch;
-        quantize_a_q8_blocks_even_odd(a_ptr, K, scratch.qA_even, scratch.qA_odd,
-                                      scratch.a_scales);
+        if (use_q4_gemv_bg128) {
+            quantize_a_q8_g128_even_odd(a_ptr, K, scratch.qA_even,
+                                       scratch.qA_odd, scratch.a_scales);
+        } else {
+            quantize_a_q8_blocks_even_odd(a_ptr, K, scratch.qA_even,
+                                          scratch.qA_odd, scratch.a_scales);
+        }
         const int8_t* qA_even_data = scratch.qA_even.data();
         const int8_t* qA_odd_data = scratch.qA_odd.data();
         const float* a_scales_data = scratch.a_scales.data();

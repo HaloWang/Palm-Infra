@@ -140,6 +140,11 @@ void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,
                                    std::vector<int8_t>& qA_odd,
                                    std::vector<float>& a_scales);
+// BG128 decode variant: one activation scale covers four 32-value dot blocks.
+void quantize_a_q8_g128_even_odd(const float* A, int K,
+                                 std::vector<int8_t>& qA_even,
+                                 std::vector<int8_t>& qA_odd,
+                                 std::vector<float>& a_scales);
 
 void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool, Activation act,
