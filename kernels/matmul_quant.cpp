@@ -34,16 +34,6 @@ static inline void quantize_q8_block32_neon(const float* src, float& scale,
     int32x4_t q5 = vcvtnq_s32_f32(vmulq_n_f32(v5, inv_scale));
     int32x4_t q6 = vcvtnq_s32_f32(vmulq_n_f32(v6, inv_scale));
     int32x4_t q7 = vcvtnq_s32_f32(vmulq_n_f32(v7, inv_scale));
-    int32x4_t qmin = vdupq_n_s32(-127);
-    int32x4_t qmax = vdupq_n_s32(127);
-    q0 = vmaxq_s32(qmin, vminq_s32(qmax, q0));
-    q1 = vmaxq_s32(qmin, vminq_s32(qmax, q1));
-    q2 = vmaxq_s32(qmin, vminq_s32(qmax, q2));
-    q3 = vmaxq_s32(qmin, vminq_s32(qmax, q3));
-    q4 = vmaxq_s32(qmin, vminq_s32(qmax, q4));
-    q5 = vmaxq_s32(qmin, vminq_s32(qmax, q5));
-    q6 = vmaxq_s32(qmin, vminq_s32(qmax, q6));
-    q7 = vmaxq_s32(qmin, vminq_s32(qmax, q7));
 
     int16x8_t q01 = vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
     int16x8_t q23 = vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
