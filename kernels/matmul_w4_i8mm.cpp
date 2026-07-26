@@ -1,0 +1,212 @@
+#include "kernels/matmul_internal.h"
+
+#include <algorithm>
+#include <cstdint>
+
+#if HAS_NEON && defined(__ARM_FEATURE_MATMUL_INT8)
+__attribute__((always_inline)) static inline void
+i8mm_w4_8x4_accumulate_qblock(const int8_t* aq, const uint8_t* bq,
+                              const float* a_scales, const float* b_scales,
+                              float32x4_t out[8]) {
+    __asm__ __volatile__(
+        "movi v16.4s, #0\n"
+        "movi v17.4s, #0\n"
+        "movi v18.4s, #0\n"
+        "movi v19.4s, #0\n"
+        "movi v20.4s, #0\n"
+        "movi v21.4s, #0\n"
+        "movi v22.4s, #0\n"
+        "movi v23.4s, #0\n"
+
+        // Load four existing BG128 columns, then ZIP their lower and upper
+        // 8-byte halves into the column-pair vectors needed by SMMLA.
+        "ldr q28, [%[bq], #0]\n"
+        "ldr q30, [%[bq], #16]\n"
+        "ldr q29, [%[bq], #32]\n"
+        "ldr q31, [%[bq], #48]\n"
+        "zip2 v24.2d, v28.2d, v30.2d\n"
+        "zip1 v28.2d, v28.2d, v30.2d\n"
+        "mov v30.16b, v24.16b\n"
+        "zip2 v24.2d, v29.2d, v31.2d\n"
+        "zip1 v29.2d, v29.2d, v31.2d\n"
+        "mov v31.16b, v24.16b\n"
+
+        // Even K[0:16] (low nibbles in the lower byte halves).
+        "shl v24.16b, v28.16b, #4\n"
+        "shl v25.16b, v29.16b, #4\n"
+        "ldr q26, [%[aq], #0]\n"
+        "smmla v16.4s, v26.16b, v24.16b\n"
+        "smmla v17.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #16]\n"
+        "smmla v18.4s, v26.16b, v24.16b\n"
+        "smmla v19.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #32]\n"
+        "smmla v20.4s, v26.16b, v24.16b\n"
+        "smmla v21.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #48]\n"
+        "smmla v22.4s, v26.16b, v24.16b\n"
+        "smmla v23.4s, v26.16b, v25.16b\n"
+
+        // Even K[16:32] (low nibbles in the upper byte halves).
+        "shl v24.16b, v30.16b, #4\n"
+        "shl v25.16b, v31.16b, #4\n"
+        "ldr q26, [%[aq], #64]\n"
+        "smmla v16.4s, v26.16b, v24.16b\n"
+        "smmla v17.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #80]\n"
+        "smmla v18.4s, v26.16b, v24.16b\n"
+        "smmla v19.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #96]\n"
+        "smmla v20.4s, v26.16b, v24.16b\n"
+        "smmla v21.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #112]\n"
+        "smmla v22.4s, v26.16b, v24.16b\n"
+        "smmla v23.4s, v26.16b, v25.16b\n"
+
+        // Odd K[0:16] and K[16:32] live in the corresponding high nibbles.
+        "movi v27.16b, #0xf0\n"
+        "and v24.16b, v28.16b, v27.16b\n"
+        "and v25.16b, v29.16b, v27.16b\n"
+        "ldr q26, [%[aq], #128]\n"
+        "smmla v16.4s, v26.16b, v24.16b\n"
+        "smmla v17.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #144]\n"
+        "smmla v18.4s, v26.16b, v24.16b\n"
+        "smmla v19.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #160]\n"
+        "smmla v20.4s, v26.16b, v24.16b\n"
+        "smmla v21.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #176]\n"
+        "smmla v22.4s, v26.16b, v24.16b\n"
+        "smmla v23.4s, v26.16b, v25.16b\n"
+
+        "and v24.16b, v30.16b, v27.16b\n"
+        "and v25.16b, v31.16b, v27.16b\n"
+        "ldr q26, [%[aq], #192]\n"
+        "smmla v16.4s, v26.16b, v24.16b\n"
+        "smmla v17.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #208]\n"
+        "smmla v18.4s, v26.16b, v24.16b\n"
+        "smmla v19.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #224]\n"
+        "smmla v20.4s, v26.16b, v24.16b\n"
+        "smmla v21.4s, v26.16b, v25.16b\n"
+        "ldr q26, [%[aq], #240]\n"
+        "smmla v22.4s, v26.16b, v24.16b\n"
+        "smmla v23.4s, v26.16b, v25.16b\n"
+
+        "ldr q28, [%[bs]]\n"
+
+        "uzp1 v24.2d, v16.2d, v17.2d\n"
+        "uzp2 v25.2d, v16.2d, v17.2d\n"
+        "scvtf v24.4s, v24.4s, #4\n"
+        "scvtf v25.4s, v25.4s, #4\n"
+        "ldr s26, [%[as], #0]\n"
+        "ldr s27, [%[as], #4]\n"
+        "fmul v26.4s, v28.4s, v26.s[0]\n"
+        "fmul v27.4s, v28.4s, v27.s[0]\n"
+        "fmla %[o0].4s, v24.4s, v26.4s\n"
+        "fmla %[o1].4s, v25.4s, v27.4s\n"
+
+        "uzp1 v24.2d, v18.2d, v19.2d\n"
+        "uzp2 v25.2d, v18.2d, v19.2d\n"
+        "scvtf v24.4s, v24.4s, #4\n"
+        "scvtf v25.4s, v25.4s, #4\n"
+        "ldr s26, [%[as], #8]\n"
+        "ldr s27, [%[as], #12]\n"
+        "fmul v26.4s, v28.4s, v26.s[0]\n"
+        "fmul v27.4s, v28.4s, v27.s[0]\n"
+        "fmla %[o2].4s, v24.4s, v26.4s\n"
+        "fmla %[o3].4s, v25.4s, v27.4s\n"
+
+        "uzp1 v24.2d, v20.2d, v21.2d\n"
+        "uzp2 v25.2d, v20.2d, v21.2d\n"
+        "scvtf v24.4s, v24.4s, #4\n"
+        "scvtf v25.4s, v25.4s, #4\n"
+        "ldr s26, [%[as], #16]\n"
+        "ldr s27, [%[as], #20]\n"
+        "fmul v26.4s, v28.4s, v26.s[0]\n"
+        "fmul v27.4s, v28.4s, v27.s[0]\n"
+        "fmla %[o4].4s, v24.4s, v26.4s\n"
+        "fmla %[o5].4s, v25.4s, v27.4s\n"
+
+        "uzp1 v24.2d, v22.2d, v23.2d\n"
+        "uzp2 v25.2d, v22.2d, v23.2d\n"
+        "scvtf v24.4s, v24.4s, #4\n"
+        "scvtf v25.4s, v25.4s, #4\n"
+        "ldr s26, [%[as], #24]\n"
+        "ldr s27, [%[as], #28]\n"
+        "fmul v26.4s, v28.4s, v26.s[0]\n"
+        "fmul v27.4s, v28.4s, v27.s[0]\n"
+        "fmla %[o6].4s, v24.4s, v26.4s\n"
+        "fmla %[o7].4s, v25.4s, v27.4s\n"
+        : [o0] "+w"(out[0]), [o1] "+w"(out[1]), [o2] "+w"(out[2]),
+          [o3] "+w"(out[3]), [o4] "+w"(out[4]), [o5] "+w"(out[5]),
+          [o6] "+w"(out[6]), [o7] "+w"(out[7])
+        : [aq] "r"(aq), [bq] "r"(bq), [as] "r"(a_scales),
+          [bs] "r"(b_scales)
+        : "cc", "memory", "v16", "v17", "v18", "v19", "v20", "v21",
+          "v22", "v23", "v24", "v25", "v26", "v27", "v28", "v29",
+          "v30", "v31");
+}
+
+void matmul_int4_i8mm_g128(
+    const Q8A8I8MMBlock* qA8, const Q4B8G128Block* B_g128, float* C,
+    int M, int N, int K, int ldc, int m_begin, int m_end) {
+    int blocks_per_row = K / MATMUL_Q8_BLOCK;
+    int groups_per_row = K / 128;
+
+    for (int m = m_begin; m < m_end; m += 8) {
+        int r_valid = std::min(8, M - m);
+        const Q8A8I8MMBlock* a_tile =
+            qA8 + (size_t)(m / 8) * blocks_per_row;
+        for (int n = 0; n < N; n += 8) {
+            int c_valid = std::min(8, N - n);
+            float32x4_t out_lo[8];
+            float32x4_t out_hi[8];
+            for (int r = 0; r < 8; r++) {
+                out_lo[r] = vdupq_n_f32(0.f);
+                out_hi[r] = vdupq_n_f32(0.f);
+            }
+
+            const Q4B8G128Block* b_tile =
+                B_g128 + (size_t)(n / 8) * groups_per_row;
+            for (int g = 0; g < groups_per_row; g++) {
+                const Q4B8G128Block& bg = b_tile[g];
+                for (int qgi = 0; qgi < 4; qgi++) {
+                    const Q8A8I8MMBlock& ab = a_tile[g * 4 + qgi];
+                    i8mm_w4_8x4_accumulate_qblock(
+                        &ab.q[0][0][0], &bg.q[qgi][0][0], ab.scales,
+                        bg.scales, out_lo);
+                    if (c_valid > 4) {
+                        i8mm_w4_8x4_accumulate_qblock(
+                            &ab.q[0][0][0], &bg.q[qgi][4][0], ab.scales,
+                            bg.scales + 4, out_hi);
+                    }
+                }
+            }
+
+            for (int r = 0; r < r_valid; r++) {
+                float* dst = C + (size_t)(m + r) * ldc + n;
+                if (c_valid >= 4)
+                    vst1q_f32(dst, out_lo[r]);
+                else {
+                    float tmp[4];
+                    vst1q_f32(tmp, out_lo[r]);
+                    for (int c = 0; c < c_valid; c++)
+                        dst[c] = tmp[c];
+                }
+                if (c_valid == 8)
+                    vst1q_f32(dst + 4, out_hi[r]);
+                else if (c_valid > 4) {
+                    float tmp[4];
+                    vst1q_f32(tmp, out_hi[r]);
+                    for (int c = 4; c < c_valid; c++)
+                        dst[c] = tmp[c - 4];
+                }
+            }
+        }
+    }
+}
+
+#endif

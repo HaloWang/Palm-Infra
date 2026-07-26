@@ -765,197 +765,6 @@ static void matmul_int4_q8dot_neon_8x8_g128packed_range(
     }
 }
 
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-template <bool PackedA4>
-static void matmul_int4_q8dot_neon_4x8_repacked_i8mm_range(
-    const int8_t* qA, const float* a_scales, const uint8_t* B_repack,
-    const float* scales, int group_size, int groups_per_row, float* C, int M,
-    int N, int K, int K_padded, int ldc, int m_begin, int m_end,
-    const Q8A4Block* qA4) {
-    (void)M;
-    if (group_size <= 0)
-        group_size = K;
-    int blocks_per_row = K / MATMUL_Q8_BLOCK;
-    constexpr int bytes_per_block = MATMUL_Q8_BLOCK / 2;
-    W8ScaleMode scale_mode = w8_scale_mode(group_size, groups_per_row);
-    bool scale_per_channel = scale_mode == W8ScaleMode::PerChannel;
-
-    for (int m = m_begin; m < m_end; m += 4) {
-        int m_tile_end = std::min(m + 4, m_end);
-
-        for (int n = 0; n < N; n += 8) {
-            int n_tile_end = std::min(n + 8, N);
-            int c_valid = n_tile_end - n;
-            const uint8_t* b_tile = B_repack + (size_t)(n / 8) *
-                                                   blocks_per_row * 8 *
-                                                   bytes_per_block;
-
-            float32x4_t bscale_lo_pc = vdupq_n_f32(0.f);
-            float32x4_t bscale_hi_pc = vdupq_n_f32(0.f);
-            if (scale_per_channel) {
-                load_w8_b_scales8(scales, n, c_valid, groups_per_row, 0,
-                                  bscale_lo_pc, bscale_hi_pc);
-            }
-
-            float32x4_t c0_lo = vdupq_n_f32(0.f);
-            float32x4_t c0_hi = vdupq_n_f32(0.f);
-            float32x4_t c1_lo = vdupq_n_f32(0.f);
-            float32x4_t c1_hi = vdupq_n_f32(0.f);
-            float32x4_t c2_lo = vdupq_n_f32(0.f);
-            float32x4_t c2_hi = vdupq_n_f32(0.f);
-            float32x4_t c3_lo = vdupq_n_f32(0.f);
-            float32x4_t c3_hi = vdupq_n_f32(0.f);
-
-            for (int qb = 0; qb < blocks_per_row; qb++) {
-                int group = w8_scale_group(scale_mode, qb, group_size);
-                const uint8_t* b_block =
-                    b_tile + (size_t)qb * 8 * bytes_per_block;
-
-                int8x16_t b_even[8];
-                int8x16_t b_odd[8];
-                for (int c = 0; c < 8; c++) {
-                    if (c < c_valid) {
-                        load_int4x32_signed_scaled16(
-                            b_block + (size_t)c * bytes_per_block, b_even[c],
-                            b_odd[c]);
-                    } else {
-                        b_even[c] = vdupq_n_s8(0);
-                        b_odd[c] = vdupq_n_s8(0);
-                    }
-                }
-
-                int32x4_t acc01_01 = vdupq_n_s32(0);
-                int32x4_t acc01_23 = vdupq_n_s32(0);
-                int32x4_t acc23_01 = vdupq_n_s32(0);
-                int32x4_t acc23_23 = vdupq_n_s32(0);
-                int32x4_t acc01_45 = vdupq_n_s32(0);
-                int32x4_t acc01_67 = vdupq_n_s32(0);
-                int32x4_t acc23_45 = vdupq_n_s32(0);
-                int32x4_t acc23_67 = vdupq_n_s32(0);
-
-                auto load_even_odd = [&](int row, int8x16_t& even,
-                                         int8x16_t& odd, float& a_scale) {
-                    int row_load = (row < m_tile_end) ? row : m;
-                    if constexpr (PackedA4) {
-                        const Q8A4Block& a_block =
-                            qA4[(size_t)(row_load / 4) * blocks_per_row + qb];
-                        int ar = row_load & 3;
-                        even = vld1q_s8(a_block.even[ar]);
-                        odd = vld1q_s8(a_block.odd[ar]);
-                        a_scale = a_block.scales[ar];
-                    } else {
-                        const int8_t* qa = qA + (size_t)row_load * K_padded +
-                                           qb * MATMUL_Q8_BLOCK;
-                        int8x16_t qa0v = vld1q_s8(qa);
-                        int8x16_t qa1v = vld1q_s8(qa + 16);
-                        even = vuzp1q_s8(qa0v, qa1v);
-                        odd = vuzp2q_s8(qa0v, qa1v);
-                        a_scale =
-                            a_scales[(size_t)row_load * blocks_per_row + qb];
-                    }
-                };
-
-                int8x16_t a0_even, a0_odd, a1_even, a1_odd;
-                int8x16_t a2_even, a2_odd, a3_even, a3_odd;
-                float a_scale0, a_scale1, a_scale2, a_scale3;
-                load_even_odd(m + 0, a0_even, a0_odd, a_scale0);
-                load_even_odd(m + 1, a1_even, a1_odd, a_scale1);
-                load_even_odd(m + 2, a2_even, a2_odd, a_scale2);
-                load_even_odd(m + 3, a3_even, a3_odd, a_scale3);
-
-                auto run_half = [&](bool high_half, bool odd_lane) {
-                    auto half8 = [&](int8x16_t v) -> int8x8_t {
-                        return high_half ? vget_high_s8(v) : vget_low_s8(v);
-                    };
-                    int8x16_t a01 =
-                        vcombine_s8(half8(odd_lane ? a0_odd : a0_even),
-                                    half8(odd_lane ? a1_odd : a1_even));
-                    int8x16_t a23 =
-                        vcombine_s8(half8(odd_lane ? a2_odd : a2_even),
-                                    half8(odd_lane ? a3_odd : a3_even));
-
-                    const int8x16_t* b = odd_lane ? b_odd : b_even;
-                    int8x16_t b01 = vcombine_s8(half8(b[0]), half8(b[1]));
-                    int8x16_t b23 = vcombine_s8(half8(b[2]), half8(b[3]));
-                    int8x16_t b45 = vcombine_s8(half8(b[4]), half8(b[5]));
-                    int8x16_t b67 = vcombine_s8(half8(b[6]), half8(b[7]));
-
-                    acc01_01 = vmmlaq_s32(acc01_01, a01, b01);
-                    acc01_23 = vmmlaq_s32(acc01_23, a01, b23);
-                    acc23_01 = vmmlaq_s32(acc23_01, a23, b01);
-                    acc23_23 = vmmlaq_s32(acc23_23, a23, b23);
-                    acc01_45 = vmmlaq_s32(acc01_45, a01, b45);
-                    acc01_67 = vmmlaq_s32(acc01_67, a01, b67);
-                    acc23_45 = vmmlaq_s32(acc23_45, a23, b45);
-                    acc23_67 = vmmlaq_s32(acc23_67, a23, b67);
-                };
-
-                run_half(false, false);
-                run_half(true, false);
-                run_half(false, true);
-                run_half(true, true);
-
-                int32x4_t row0_lo = vcombine_s32(vget_low_s32(acc01_01),
-                                                 vget_low_s32(acc01_23));
-                int32x4_t row0_hi = vcombine_s32(vget_low_s32(acc01_45),
-                                                 vget_low_s32(acc01_67));
-                int32x4_t row1_lo = vcombine_s32(vget_high_s32(acc01_01),
-                                                 vget_high_s32(acc01_23));
-                int32x4_t row1_hi = vcombine_s32(vget_high_s32(acc01_45),
-                                                 vget_high_s32(acc01_67));
-                int32x4_t row2_lo = vcombine_s32(vget_low_s32(acc23_01),
-                                                 vget_low_s32(acc23_23));
-                int32x4_t row2_hi = vcombine_s32(vget_low_s32(acc23_45),
-                                                 vget_low_s32(acc23_67));
-                int32x4_t row3_lo = vcombine_s32(vget_high_s32(acc23_01),
-                                                 vget_high_s32(acc23_23));
-                int32x4_t row3_hi = vcombine_s32(vget_high_s32(acc23_45),
-                                                 vget_high_s32(acc23_67));
-
-                float32x4_t bs0 = bscale_lo_pc;
-                float32x4_t bs1 = bscale_hi_pc;
-                if (!scale_per_channel) {
-                    load_w8_b_scales8(scales, n, c_valid, groups_per_row, group,
-                                      bs0, bs1);
-                }
-
-                auto add_row = [&](int row, int32x4_t lo, int32x4_t hi,
-                                   float32x4_t& dst_lo, float32x4_t& dst_hi,
-                                   float a_scale) {
-                    if (row >= m_tile_end)
-                        return;
-                    dst_lo = vfmaq_f32(dst_lo, q4_scaled16_dot_to_f32(lo),
-                                       vmulq_n_f32(bs0, a_scale));
-                    dst_hi = vfmaq_f32(dst_hi, q4_scaled16_dot_to_f32(hi),
-                                       vmulq_n_f32(bs1, a_scale));
-                };
-                add_row(m + 0, row0_lo, row0_hi, c0_lo, c0_hi, a_scale0);
-                add_row(m + 1, row1_lo, row1_hi, c1_lo, c1_hi, a_scale1);
-                add_row(m + 2, row2_lo, row2_hi, c2_lo, c2_hi, a_scale2);
-                add_row(m + 3, row3_lo, row3_hi, c3_lo, c3_hi, a_scale3);
-            }
-
-            auto store_row = [&](int row, float32x4_t lo, float32x4_t hi) {
-                if (row >= m_tile_end)
-                    return;
-                float* c_row = C + row * ldc;
-                float tmp[4];
-                vst1q_f32(tmp, lo);
-                for (int c = 0; c < 4 && n + c < n_tile_end; c++)
-                    c_row[n + c] = tmp[c];
-                vst1q_f32(tmp, hi);
-                for (int c = 0; c < 4 && n + 4 + c < n_tile_end; c++)
-                    c_row[n + 4 + c] = tmp[c];
-            };
-            store_row(m + 0, c0_lo, c0_hi);
-            store_row(m + 1, c1_lo, c1_hi);
-            store_row(m + 2, c2_lo, c2_hi);
-            store_row(m + 3, c3_lo, c3_hi);
-        }
-    }
-}
-
-#endif
 #endif
 
 #if !(HAS_NEON && defined(__ARM_FEATURE_DOTPROD))
@@ -1045,6 +854,11 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     bool use_q4_repack = can_use_q4_dot && b_q4_repack;
     bool can_use_q4_bg128 =
         can_use_q4_dot && b_q4_g128 && group_size == 128 && (K % 128 == 0);
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    bool can_use_q4_i8mm = M > 1 && can_use_q4_bg128;
+#else
+    bool can_use_q4_i8mm = false;
+#endif
     if (M == 1 && can_use_q4_dot) {
         bool use_q4_gemv_bg128 = can_use_q4_bg128;
         const char* path =
@@ -1095,18 +909,11 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     }
     if (can_use_q4_dot) {
         constexpr bool force_4x8 = false;
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-        constexpr bool use_q4_dot_gemm_i8mm = false;
-#else
-        constexpr bool use_q4_dot_gemm_i8mm = false;
-#endif
         constexpr bool use_q4_dot_gemm_a4 = true;
-        bool use_q4_dot_gemm_bg128 =
-            can_use_q4_bg128 && !use_q4_dot_gemm_i8mm && !force_4x8;
+        bool use_q4_dot_gemm_bg128 = can_use_q4_bg128 && !force_4x8;
         const char* path =
-            use_q4_dot_gemm_i8mm
-                ? (use_q4_dot_gemm_a4 ? "q4dot_gemm_repack_i8mm_a4"
-                                      : "q4dot_gemm_repack_i8mm")
+            can_use_q4_i8mm
+                ? "q4_i8mm_g128_a8"
                 : (use_q4_dot_gemm_bg128
                        ? (use_q4_dot_gemm_a4 ? "q4dot_gemm_bg128_a4"
                                              : "q4dot_gemm_bg128")
@@ -1121,7 +928,10 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         std::vector<float> a_scales;
         std::vector<int8_t> qA;
         std::vector<Q8A4Block> qA4;
-        if (use_q4_dot_gemm_a4) {
+        std::vector<Q8A8I8MMBlock> qA8;
+        if (can_use_q4_i8mm) {
+            quantize_a_q8_blocks_i8mm_a8(a_ptr, M, K, lda, qA8);
+        } else if (use_q4_dot_gemm_a4) {
             quantize_a_q8_blocks_a4(a_ptr, M, K, lda, qA4);
         } else {
             quantize_a_q8_blocks(a_ptr, M, K, lda, K, qA, a_scales);
@@ -1132,18 +942,12 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
 
         auto run_q4_gemm = [&](int m_begin, int m_end, int n_begin, int n_end) {
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-            if (use_q4_dot_gemm_i8mm) {
-                if (use_q4_dot_gemm_a4) {
-                    matmul_int4_q8dot_neon_4x8_repacked_i8mm_range<true>(
-                        nullptr, nullptr, b_q4_repack, scales, group_size,
-                        groups_per_row, c_ptr, M, N, K, K, ldc, m_begin, m_end,
-                        qA4_data);
-                } else {
-                    matmul_int4_q8dot_neon_4x8_repacked_i8mm_range<false>(
-                        qA_data, a_scales_data, b_q4_repack, scales, group_size,
-                        groups_per_row, c_ptr, M, N, K, K, ldc, m_begin, m_end,
-                        nullptr);
-                }
+            if (can_use_q4_i8mm) {
+                (void)n_begin;
+                (void)n_end;
+                matmul_int4_i8mm_g128(
+                    qA8.data(), b_q4_g128, c_ptr, M, N, K, ldc, m_begin,
+                    m_end);
                 return;
             } else
 #endif

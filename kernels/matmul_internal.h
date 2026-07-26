@@ -62,6 +62,13 @@ struct alignas(16) Q8A4Block {
     int8_t odd[4][16];
 };
 
+struct alignas(16) Q8A8I8MMBlock {
+    float scales[8];
+    int8_t q[4][8][8];
+};
+static_assert(sizeof(Q8A8I8MMBlock) == 288,
+              "unexpected Q8A8I8MMBlock size");
+
 struct Q4GemvScratch {
     std::vector<int8_t> qA_even;
     std::vector<int8_t> qA_odd;
@@ -121,6 +128,13 @@ void quantize_a_q8_blocks(const float* A, int M, int K, int lda, int K_padded,
                           std::vector<float>& a_scales);
 void quantize_a_q8_blocks_a4(const float* A, int M, int K, int lda,
                              std::vector<Q8A4Block>& qA4);
+void quantize_a_q8_blocks_i8mm_a8(const float* A, int M, int K, int lda,
+                                  std::vector<Q8A8I8MMBlock>& qA8);
+#if HAS_NEON && defined(__ARM_FEATURE_MATMUL_INT8)
+void matmul_int4_i8mm_g128(const Q8A8I8MMBlock* qA8,
+                           const Q4B8G128Block* B_g128, float* C, int M,
+                           int N, int K, int ldc, int m_begin, int m_end);
+#endif
 void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,
                                    std::vector<int8_t>& qA_odd,

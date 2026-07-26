@@ -47,6 +47,7 @@ set(SOURCES
     kernels/matmul_quant.cpp
     kernels/matmul_sparse.cpp
     kernels/matmul_w4.cpp
+    kernels/matmul_w4_i8mm.cpp
     kernels/matmul_w8.cpp
     kernels/elementwise.cpp
     kernels/layout.cpp

@@ -165,6 +165,43 @@ void quantize_a_q8_blocks_a4(const float* A, int M, int K, int lda,
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     matmul_record_q8_quant_a(ms);
 }
+
+void quantize_a_q8_blocks_i8mm_a8(const float* A, int M, int K, int lda,
+                                  std::vector<Q8A8I8MMBlock>& qA8) {
+    auto t0 = std::chrono::steady_clock::now();
+    int blocks_per_row = K / MATMUL_Q8_BLOCK;
+    int m_tiles = (M + 7) / 8;
+    qA8.assign((size_t)m_tiles * blocks_per_row, {});
+
+    for (int mt = 0; mt < m_tiles; mt++) {
+        for (int qb = 0; qb < blocks_per_row; qb++) {
+            Q8A8I8MMBlock& block =
+                qA8[(size_t)mt * blocks_per_row + qb];
+            for (int ar = 0; ar < 8; ar++) {
+                int m = mt * 8 + ar;
+                if (m >= M)
+                    continue;
+                float scale = 1.f;
+                int8x16_t q_lo;
+                int8x16_t q_hi;
+                quantize_q8_block32_neon(
+                    A + (size_t)m * lda + qb * MATMUL_Q8_BLOCK, scale, q_lo,
+                    q_hi);
+                block.scales[ar] = scale;
+                int8x16_t q_even = vuzp1q_s8(q_lo, q_hi);
+                int8x16_t q_odd = vuzp2q_s8(q_lo, q_hi);
+                vst1_s8(block.q[0][ar], vget_low_s8(q_even));
+                vst1_s8(block.q[1][ar], vget_high_s8(q_even));
+                vst1_s8(block.q[2][ar], vget_low_s8(q_odd));
+                vst1_s8(block.q[3][ar], vget_high_s8(q_odd));
+            }
+        }
+    }
+
+    auto t1 = std::chrono::steady_clock::now();
+    double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+    matmul_record_q8_quant_a(ms);
+}
 #endif
 
 void quantize_a_q8_blocks_even_odd(const float* A, int K,
