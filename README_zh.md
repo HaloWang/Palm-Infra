@@ -22,7 +22,7 @@ mobile-oriented LLM inference engine.
 `mollm` 可以在 48GB Apple Silicon Mac 上运行 W4 量化的
 Qwen3.5-122B-A10B：稠密权重保留在 RAM 中，仅从 SSD 读取被路由到的 MoE
 expert。在当前 256-token cache sweep 中，通过有界的 16 GiB 共享 expert
-cache 和跨层预取，decode 达到 13.50 t/s。
+cache 和跨层预取，decode 达到 16.22 t/s。
 
 cache 容量可配置，并不要求把模型完整常驻内存。在下面的真实 prompt sweep
 中，1 GiB expert cache 配置的峰值 RSS 仅 5.90 GiB；增大 cache 可以用更多内存
@@ -30,14 +30,14 @@ cache 容量可配置，并不要求把模型完整常驻内存。在下面的�
 
 | Expert RAM cache | Decode | Peak RSS | Cache 命中率 | SSD 读取量 |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 9.84 t/s | **5.90 GiB** | 0.0% | 587.1 GB |
-| **10 GiB** | 13.21 t/s | 14.69 GiB | 83.3% | 206.1 GB |
-| **16 GiB** | **13.50 t/s** | 20.61 GiB | **88.6%** | **141.4 GB** |
+| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
+| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
+| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
 
 该 sweep 使用 16-token 真实 prompt、生成 256 tokens、greedy decoding、
-`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-24 重新运行。
-10 GiB 以约少 5.9 GiB 的峰值 RSS 保留了大部分 16 GiB 吞吐；1 GiB 则展示了
-低内存运行能力。
+`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-26 重新运行。
+10 GiB cache 的 decode 吞吐与 16 GiB 相差不到 0.5%，同时峰值 RSS 少约
+6 GiB；1 GiB 则展示了低内存运行能力。
 
 cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 [122B MoE SSD offload](docs/ssd-offload.md)。
@@ -62,6 +62,11 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 
 除非另有说明，Apple M5 Pro 数据使用 4 CPU 线程、`pp256 + tg64`、
 `warmup=3` 和独立进程中位数。
+
+当前 W4 中位数在 Youtu-LLM-2B 和 Qwen3.5-4B 上分别达到 140.77 和
+69.78 decode tokens/s，是对应 llama.cpp Q4_0 CPU 结果的 1.47 倍和
+1.73 倍。W4A8 decode 将激活与权重统一为 128-value 分组，先在整数寄存器
+中累计四个 dot-product block，再统一应用 scale。
 
 ![CPU 吞吐量对比](assets/performance_cpu.svg)
 

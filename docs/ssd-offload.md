@@ -19,7 +19,7 @@ inside matmul. This can make a larger cache slower despite a higher hit rate.
 Use `--no-lock-expert-cache` when system-memory headroom matters more than stable
 decode throughput.
 
-Real chat prompt, four CPU threads, 16 prompt tokens, 128 generated tokens,
+Historical cache-policy isolation run: real chat prompt, four CPU threads, 16 prompt tokens, 128 generated tokens,
 `warmup=1`, and five independent process runs:
 
 | 16 GiB cache policy | Decode | Expert-cache hit rate | SSD reads |
@@ -34,19 +34,19 @@ interactive decode. With a longer 256-token context, the strict `pp256 + tg64`,
 
 ## Cache-size sweep
 
-This sweep was rerun on 2026-07-24 using the prompt “给我讲一个故事”, greedy
+This sweep was rerun on 2026-07-26 using the prompt “给我讲一个故事”, greedy
 decoding, 16 prompt tokens, 256 generated tokens, `warmup=0`, and three
 independent processes per cache size.
 
 | Expert RAM cache | Decode | Peak RSS | Expert-cache hit rate | SSD reads |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 9.84 t/s | **5.90 GiB** | 0.0% | 587.1 GB |
-| **10 GiB** | 13.21 t/s | 14.69 GiB | 83.3% | 206.1 GB |
-| **16 GiB** | **13.50 t/s** | 20.61 GiB | **88.6%** | **141.4 GB** |
+| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
+| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
+| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
 
-Ten GiB retains most of the 16 GiB throughput while using about 5.9 GiB less
+Ten GiB is within 0.5% of the 16 GiB throughput while using about 6 GiB less
 peak RSS. The 1 GiB configuration demonstrates that the 122B package can run
-at under 6 GiB peak RSS, at the cost of a zero cache-hit rate and much more SSD
+at about 6 GiB peak RSS, at the cost of a zero cache-hit rate and much more SSD
 I/O.
 
 Cache capacity must leave room for dense weights, KV cache, runtime buffers, and

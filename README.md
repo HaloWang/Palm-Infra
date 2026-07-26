@@ -29,7 +29,7 @@ or int4 kernels optimized for ARM dot-product instructions.
 `mollm` can run Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping
 dense weights in RAM and fetching only routed MoE experts from SSD. In the
 current 256-token cache sweep, a bounded, shared 16 GiB expert cache and
-cross-layer prefetching provide 13.50 t/s interactive decode.
+cross-layer prefetching provide 16.22 t/s interactive decode.
 
 The cache is configurable rather than tied to a resident copy of the model. In
 the following real-prompt sweep, the 1 GiB expert-cache configuration runs with
@@ -38,14 +38,15 @@ higher throughput.
 
 | Expert RAM cache | Decode | Peak RSS | Cache hit rate | SSD reads |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 9.84 t/s | **5.90 GiB** | 0.0% | 587.1 GB |
-| **10 GiB** | 13.21 t/s | 14.69 GiB | 83.3% | 206.1 GB |
-| **16 GiB** | **13.50 t/s** | 20.61 GiB | **88.6%** | **141.4 GB** |
+| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
+| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
+| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
 
 This sweep uses a 16-token real prompt, 256 generated tokens, greedy decoding,
 `warmup=0`, and three independent process runs per cache size. The rows were
-rerun on 2026-07-24. 10 GiB retains most of the 16 GiB throughput with about
-5.9 GiB less peak RSS; 1 GiB demonstrates the low-memory operating point.
+rerun on 2026-07-26. The 10 GiB cache is within 0.5% of the 16 GiB decode
+throughput while using about 6 GiB less peak RSS; 1 GiB demonstrates the
+low-memory operating point.
 
 See [Running 122B MoE models with SSD offload](docs/ssd-offload.md) for cache
 policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
@@ -73,6 +74,10 @@ in W8 when pure W4 loses too much quality.
 Apple M5 Pro results use four CPU threads, `pp256 + tg64`, `warmup=3`, and
 independent-process medians unless noted.
 
+Current W4 medians reach 140.77 decode tokens/s on Youtu-LLM-2B and 69.78
+tokens/s on Qwen3.5-4B, respectively 1.47x and 1.73x the matched llama.cpp
+Q4_0 CPU results.
+
 ![CPU throughput comparison](assets/performance_cpu.svg)
 
 ### Metal (experimental)
@@ -90,6 +95,8 @@ context, and both runtimes keep model weights on Metal.
 - Highly optimized AArch64 GEMV kernels for FP16, W8, and W4 decode.
 - Decode-friendly packed weight layouts, including direct W4G128 package
   layout.
+- W4A8 decode aligns activation and weight groups at 128 values, accumulating
+  four dot-product blocks in integer registers before applying their scale.
 - Static reusable decode workspace to avoid per-token allocation churn.
 - Prefill is still the main optimization target on dense models.
 
