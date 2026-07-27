@@ -50,7 +50,7 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 | Qwen3-30B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.6-35B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
-| Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4 |
+| Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
 
@@ -163,7 +163,7 @@ python3 models/converter.py \
 |---|---|
 | `qwen3` | Qwen3 dense text models |
 | `qwen3_moe` | Qwen3 MoE text models |
-| `qwen3_5` | Qwen3.5 dense text models |
+| `qwen3_5` | Qwen3.5 dense text 与单图视觉模型 |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
 
@@ -196,6 +196,23 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
     --threads 4 \
     --temperature 0
 ```
+
+实验性的 Qwen3.5 单图对话（macOS，CPU vision encoder）：
+
+```bash
+./build_i8mm/mollm_chat \
+    --package qwen35_0.8b_w4g128.mollm \
+    --image photo.png \
+    --prompt "描述一下这张图片。" \
+    --max-new-tokens 128
+```
+
+converter 会将 checkpoint 的 FP16 vision tower 与量化后的文本模型一起写入
+`.mollm` 包。当前首版支持 single-shot chat 中的一张静态图片；暂未支持多图、
+视频、server 接口及 Metal vision encoder。图片默认按 262,144 像素预算缩放
+（约 512x512）；可用 `--image-max-pixels` 在速度和细节间调整，最高
+1,048,576 像素。如果不需要视觉能力，转换时可传 `--text-only`，避免 vision
+tower 带来的包体与常驻内存开销。
 
 采样生成：
 
@@ -250,7 +267,8 @@ mollm/
 - 提升实验性 Metal 性能，重点是量化 prefill、MoE prefill 与 CPU/GPU 同步开销。
 - 基于当前单用户 REPL cache，为 serving 工作负载实现完整的 prefix cache。
 - 扩展 accelerator 覆盖范围，同时保持 CPU runtime 作为可移植基线。
-- 增加更多模型系列、视觉模型支持以及 SSD offload。
+- 增加更多模型系列，并将当前 Qwen3.5 单图路径扩展到多图、视频、serving 与
+  Metal vision encoder；继续优化 SSD offload。
 
 ## 许可证
 

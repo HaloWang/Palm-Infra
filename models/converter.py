@@ -2,7 +2,7 @@
 """mollm model converter — auto-detect model type from config.json and dispatch.
 
 Usage:
-    python3 models/converter.py <model_dir|checkpoint.pth> <output.mollm> [quant]
+    python3 models/converter.py <model_dir|checkpoint.pth> <output.mollm> [quant] [--text-only]
 
 The converter reads <model_dir>/config.json to determine the model type:
     - model_type "qwen3"    → Qwen3 decoder-only converter (qwen3.py)
@@ -61,8 +61,8 @@ def _looks_like_qwen3_moe(cfg: dict) -> bool:
 
 def main():
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant]")
-        print("Quant modes: fp16, w8pc, w4g128, w4mixg128")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant] [--text-only]")
+        print("Quant modes: fp16, w8pc, w4g128, w4g32, w4mixg128, w4mixg32")
         print()
         print("Supported model types:")
         for mt, (mod, func) in SUPPORTED_MODELS.items():
@@ -85,6 +85,8 @@ def main():
     quant = "fp16"
 
     extra = sys.argv[3:]
+    text_only = "--text-only" in extra
+    extra = [arg for arg in extra if arg != "--text-only"]
     if len(extra) == 1:
         quant = extra[0]
     elif len(extra) == 3 and extra[0].isdigit() and extra[1].isdigit():
@@ -94,8 +96,8 @@ def main():
         prefill_seq_len = int(extra[1])
         quant = extra[2]
     elif len(extra) != 0:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant]")
-        print("Quant modes: fp16, w8pc, w4g128, w4mixg128")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant] [--text-only]")
+        print("Quant modes: fp16, w8pc, w4g128, w4g32, w4mixg128, w4mixg32")
         sys.exit(1)
 
     # Detect model type
@@ -105,6 +107,9 @@ def main():
         print(f"Error: unsupported model_type '{model_type}' in {model_dir}/config.json")
         print(f"Supported types: {supported}")
         sys.exit(1)
+    if text_only and model_type != "qwen3_5":
+        print("Error: --text-only currently applies only to qwen3_5 checkpoints")
+        sys.exit(1)
 
     mod_name, func_name = SUPPORTED_MODELS[model_type]
 
@@ -113,12 +118,20 @@ def main():
     print(f"  output:          {output_path}")
     print(f"  prefill_chunk:   {prefill_seq_len} (internal)")
     print(f"  quant:           {quant}")
+    if model_type == "qwen3_5":
+        print(f"  vision:          {'excluded' if text_only else 'included'}")
     print()
 
     # Import and dispatch
     module = __import__(mod_name)
     convert_fn = getattr(module, func_name)
-    convert_fn(model_dir, output_path, prefill_seq_len=prefill_seq_len, quant=quant)
+    kwargs = {
+        "prefill_seq_len": prefill_seq_len,
+        "quant": quant,
+    }
+    if model_type == "qwen3_5":
+        kwargs["include_vision"] = not text_only
+    convert_fn(model_dir, output_path, **kwargs)
 
 
 if __name__ == "__main__":

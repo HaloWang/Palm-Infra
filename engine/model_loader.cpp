@@ -111,13 +111,16 @@ void LLMEngine::clear_model_state() {
     // Drop the graphs and their execution pools before either owner.
     graph_prefill_ = Graph{};
     graph_decode_ = Graph{};
+    graph_vision_ = Graph{};
     exec_ctx_prefill_ = ExecContext{};
     exec_ctx_decode_ = ExecContext{};
+    exec_ctx_vision_ = ExecContext{};
     metal_backend_.reset();
 
     caches_.clear();
     embed_weight_ = nullptr;
     lm_head_weight_ = nullptr;
+    vision_pos_embed_ = nullptr;
     persistent_pool_.clear();
     hidden_output_copy_.clear();
 
@@ -151,6 +154,11 @@ void LLMEngine::clear_model_state() {
 
     package_metadata_.clear();
     past_len_ = 0;
+    rope_position_delta_ = 0;
+    multimodal_position_ids_.clear();
+    active_vision_ = nullptr;
+    active_image_token_id_ = -1;
+    active_vision_cursor_ = 0;
     cfg_ = EngineConfig{};
     sampler_.configure(cfg_.sampling, nullptr, true);
     sampler_.reset();
@@ -396,9 +404,12 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     return false;
                 }
 
-                prepare_matmul_weight(t, wref, data, packed_weights_,
-                                      wref.find("embed_tokens") ==
-                                          std::string::npos);
+                const bool lookup_table =
+                    wref.find("embed_tokens") != std::string::npos ||
+                    wref.find("vision_pos_embed.weights") !=
+                        std::string::npos;
+                prepare_matmul_weight(
+                    t, wref, data, packed_weights_, !lookup_table);
                 finalize_metal_weight();
                 continue;
             }
@@ -431,11 +442,14 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             return false;
         }
 
-        // embed_tokens stays row-major for lookup; all other linear weights,
-        // including lm_head, receive their CPU matmul layouts at load time.
-        prepare_matmul_weight(t, wpath, t.data, packed_weights_,
-                              node.params.str[0].find("embed_tokens") ==
-                                  std::string::npos);
+        // Lookup tables stay row-major; linear weights, including lm_head,
+        // receive their CPU matmul layouts at load time.
+        const bool lookup_table =
+            node.params.str[0].find("embed_tokens") != std::string::npos ||
+            node.params.str[0].find("vision_pos_embed.weights") !=
+                std::string::npos;
+        prepare_matmul_weight(
+            t, wpath, t.data, packed_weights_, !lookup_table);
         finalize_metal_weight();
     }
 
@@ -448,6 +462,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 embed_weight_ = &g.runtime.tensors[node.id];
             } else if (wref.find("lm_head") != std::string::npos) {
                 lm_head_weight_ = &g.runtime.tensors[node.id];
+            } else if (wref.find("vision_pos_embed.weights") !=
+                       std::string::npos) {
+                vision_pos_embed_ = &g.runtime.tensors[node.id];
             }
         }
     }
@@ -646,6 +663,14 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    if (cfg_.image_max_pixels < EngineConfig::kMinImageMaxPixels ||
+        cfg_.image_max_pixels > EngineConfig::kAbsoluteImageMaxPixels) {
+        std::fprintf(
+            stderr, "Engine: image_max_pixels must be in [%d, %d]\n",
+            EngineConfig::kMinImageMaxPixels,
+            EngineConfig::kAbsoluteImageMaxPixels);
+        return false;
+    }
     std::string sampling_error;
     if (!sampler_.configure(cfg_.sampling, &sampling_error, true)) {
         fprintf(stderr, "Engine: invalid sampling parameters: %s\n",
@@ -670,14 +695,17 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     thread_pool_.resize(cfg_.num_threads);
     exec_ctx_prefill_.thread_pool = &thread_pool_;
     exec_ctx_decode_.thread_pool = &thread_pool_;
+    exec_ctx_vision_.thread_pool = &thread_pool_;
     exec_ctx_prefill_.trace_label = "prefill";
     exec_ctx_decode_.trace_label = "decode";
+    exec_ctx_vision_.trace_label = "vision";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
     exec_ctx_decode_.moe_cross_layer_prefetch =
         !cfg_.metal_ssd_full && cfg_.moe_ssd_global_cache &&
         cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
+    exec_ctx_vision_.backend = &cpu_backend_;
     metal_backend_.reset();
     if (cfg_.device == Device::METAL) {
 #ifdef MOLLM_METAL
@@ -728,10 +756,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: package_path is required (use .mollm package)\n");
         return false;
     }
-    std::string pf_path, dc_path;
+    std::string pf_path, dc_path, vi_path;
     {
         std::string tok_tmp;
-        if (!load_package(cfg.package_path, pf_path, dc_path, tok_tmp)) {
+        if (!load_package(cfg.package_path, pf_path, dc_path, vi_path,
+                          tok_tmp)) {
             return false;
         }
         if (!tok_tmp.empty()) {
@@ -780,6 +809,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     const std::string& pf_path_load =
         cfg_.use_decode_as_prefill ? dc_path : pf_path;
     if (!load_graph(graph_prefill_, exec_ctx_prefill_, pf_path_load.c_str())) {
+        return false;
+    }
+    if (!vi_path.empty() &&
+        !load_graph(graph_vision_, exec_ctx_vision_, vi_path.c_str())) {
         return false;
     }
     // RWKV state and token-shift buffers are persistent INPUT tensors, so the

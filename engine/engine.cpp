@@ -209,6 +209,11 @@ void LLMEngine::reset() {
     invalidate_workspace_key(exec_ctx_decode_);
     clear_graph_borrowed_views(graph_prefill_);
     past_len_ = 0;
+    rope_position_delta_ = 0;
+    multimodal_position_ids_.clear();
+    active_vision_ = nullptr;
+    active_image_token_id_ = -1;
+    active_vision_cursor_ = 0;
     sampler_.reset();
     // KV cache: only clear metadata header (current_seq_len = 0).
     // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
@@ -287,6 +292,33 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
                 float* dst = t.ptr<float>() + s * hidden_dim;
                 for (int d = 0; d < hidden_dim; d++) {
                     dst[d] = embed_data[tid * hidden_dim + d];
+                }
+            }
+        }
+        if (active_vision_) {
+            if (active_vision_->hidden_size != hidden_dim) {
+                fprintf(stderr,
+                        "embed: vision hidden size %d does not match text "
+                        "hidden size %d\n",
+                        active_vision_->hidden_size, hidden_dim);
+            } else {
+                for (int s = 0; s < n; ++s) {
+                    if (token_ids[s] != active_image_token_id_) continue;
+                    if (active_vision_cursor_ >= active_vision_->tokens) {
+                        fprintf(stderr,
+                                "embed: more image placeholder tokens than "
+                                "vision embeddings\n");
+                        break;
+                    }
+                    const float* src =
+                        active_vision_->values.data() +
+                        static_cast<size_t>(active_vision_cursor_) * hidden_dim;
+                    std::memcpy(t.ptr<float>() +
+                                    static_cast<size_t>(s) * hidden_dim,
+                                src,
+                                static_cast<size_t>(hidden_dim) *
+                                    sizeof(float));
+                    ++active_vision_cursor_;
                 }
             }
         }
@@ -459,8 +491,9 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos, Tensor& cos,
     cos.storage_id = graph_prefill_.runtime.pool.storage_id(cb);
     sin.storage_id = graph_prefill_.runtime.pool.storage_id(sb);
 
-    mollm::detail::fill_rope_cache(cos.ptr<float>(), sin.ptr<float>(), seq_len,
-                                   start_pos, cfg_.rope_dim, cfg_.rope_theta);
+    mollm::detail::fill_rope_cache(
+        cos.ptr<float>(), sin.ptr<float>(), seq_len,
+        start_pos + rope_position_delta_, cfg_.rope_dim, cfg_.rope_theta);
 }
 
 // ---------------------------------------------------------------------------
@@ -824,7 +857,11 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         h = embed(token_ids, graph_seq_len); // zero-padded to graph_seq_len
         h.shape[1] = graph_seq_len;
         h.compute_strides();
-        generate_rope_cache(graph_seq_len, past, cos, sin);
+        if (active_vision_)
+            generate_multimodal_rope_cache(
+                graph_seq_len, past - multimodal_base_past_, cos, sin);
+        else
+            generate_rope_cache(graph_seq_len, past, cos, sin);
         mask = build_causal_mask(graph_seq_len, past);
     } else {
         exec_ctx_prefill_.runtime_seq_len = n;
@@ -834,7 +871,11 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         h = embed(token_ids);
         h.shape[1] = n;
         h.compute_strides();
-        generate_rope_cache(n, past, cos, sin);
+        if (active_vision_)
+            generate_multimodal_rope_cache(
+                n, past - multimodal_base_past_, cos, sin);
+        else
+            generate_rope_cache(n, past, cos, sin);
         mask = build_causal_mask(n, past);
     }
 

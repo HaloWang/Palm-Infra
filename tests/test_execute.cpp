@@ -3,6 +3,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
+#include <vector>
 
 static int failures = 0;
 
@@ -372,6 +373,51 @@ int main() {
         CHECK(gd.runtime.tensors[2].shape[1] == 2, "dynamic changed-shape output updates shape");
         CHECK(pool_d.acquire_count() > dyn_acquires,
               "dynamic changed-shape workspace reacquires buffer");
+    }
+
+    // ---- test: exact dynamic sequence division (vision patch merger) ----
+    {
+        Graph gd;
+        GraphNode input;
+        input.id = 0;
+        input.op_type = OpType::INPUT;
+        input.out_shape[0] = 4;
+        input.out_shape[1] = 256;
+        input.dim_expr[1].kind = DIM_SEQ;
+        input.out_prec = Precision::FP32;
+        gd.nodes.push_back(input);
+
+        GraphNode merged;
+        merged.id = 1;
+        merged.op_type = OpType::RESHAPE;
+        merged.inputs = {0};
+        merged.out_shape[0] = 16;
+        merged.out_shape[1] = 64;
+        merged.dim_expr[1].kind = DIM_DIV;
+        merged.dim_expr[1].coeff = 4;
+        merged.out_prec = Precision::FP32;
+        merged.params.i32 = {16, 64, 1, 1};
+        gd.nodes.push_back(merged);
+        gd.graph_inputs = {0};
+        gd.graph_outputs = {1};
+        gd.runtime.tensors.resize(2);
+
+        std::vector<float> data(4 * 280);
+        gd.runtime.tensors[0] = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 4, 280, 1, 1,
+            data.data());
+        BufferPool pool_d;
+        ExecContext ctx_d;
+        ctx_d.graph = &gd;
+        ctx_d.pool = &pool_d;
+        ctx_d.backend = &cpu_backend;
+        ctx_d.runtime_seq_len = 280;
+        prepare_execution(ctx_d);
+        execute_graph(ctx_d);
+        CHECK(gd.runtime.tensors[0].shape[1] == 280,
+              "dynamic SEQ input follows runtime patch count");
+        CHECK(gd.runtime.tensors[1].shape[1] == 70,
+              "dynamic DIV output exactly follows merged patch count");
     }
 
     // ---- test: view-aware liveness releases materialized producer after view consumer ----

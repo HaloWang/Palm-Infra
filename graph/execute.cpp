@@ -20,6 +20,16 @@ static inline int64_t eval_dim(const DimExpr& e, int64_t out_shape_val,
         case DIM_MUL:   return (int64_t)e.coeff * seq_val;
         case DIM_ADD:   return (int64_t)e.coeff + seq_val;
         case DIM_BATCH: return batch_val;
+        case DIM_DIV:
+            if (e.coeff <= 0 || seq_val % e.coeff != 0) {
+                std::fprintf(
+                    stderr,
+                    "execute_graph: sequence length %lld is not divisible "
+                    "by dynamic shape divisor %d\n",
+                    static_cast<long long>(seq_val), e.coeff);
+                return 0;
+            }
+            return seq_val / e.coeff;
         case DIM_CONST:
         default:        return out_shape_val;
     }

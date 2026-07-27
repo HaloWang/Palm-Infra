@@ -20,9 +20,14 @@ def main():
     check(_quant_spec("w8pc", 2048), ("w8", 2048), "w8pc uses K as group")
     check(_quant_spec("w8g128", 2048), ("w8", 128), "w8g128 parses")
     check(_quant_spec("w4g128", 2048), ("w4", 128), "w4g128 parses")
+    check(_quant_spec("w4g32", 2048), ("w4", 32), "w4g32 parses")
 
     check(_quant_spec("w4mixg128", 2048, "lm_head.weight"), ("w8", 128),
           "mixed W4 promotes explicit lm_head")
+    check(_quant_spec("w4mixg32", 2048, "lm_head.weight"), ("w8", 32),
+          "mixed W4G32 reuses the promotion policy")
+    check(_quant_spec("w4mixg32", 2048, "model.layers.7.mlp.gate_up_proj.weight"),
+          ("w4", 32), "mixed W4G32 leaves ordinary matrices at W4")
 
     kv_b = "model.layers.7.self_attn.kv_b_proj.weight"
     check(_quant_spec("w4mixg128", 512, kv_b), ("w8", 128),

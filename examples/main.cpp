@@ -279,8 +279,33 @@ private:
 };
 
 bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
-                       const std::string& prompt, int max_new_tokens) {
-    std::vector<int> prompt_ids = tokenizer.apply_chat(prompt);
+                       const std::string& prompt, int max_new_tokens,
+                       const std::string& image_path) {
+    VisionEmbedding vision;
+    int image_token_id = -1;
+    std::string user_content = prompt;
+    if (!image_path.empty()) {
+        std::string vision_error;
+        if (!engine.encode_image_file(image_path, vision, &vision_error)) {
+            std::fprintf(stderr, "[error] image: %s\n", vision_error.c_str());
+            return false;
+        }
+        try {
+            image_token_id = std::stoi(
+                meta_get(engine.package_metadata(), "image_token_id"));
+        } catch (...) {
+            std::fprintf(stderr,
+                         "[error] package is missing image_token_id metadata\n");
+            return false;
+        }
+        const std::string image_pad = "<|image_pad|>";
+        user_content = "<|vision_start|>";
+        for (int i = 0; i < vision.tokens; ++i)
+            user_content += image_pad;
+        user_content += "<|vision_end|>";
+        user_content += prompt;
+    }
+    std::vector<int> prompt_ids = tokenizer.apply_chat(user_content);
     if (prompt_ids.empty()) {
         std::fprintf(stderr, "[error] prompt is empty after tokenization\n");
         return false;
@@ -298,7 +323,9 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
         error,
         [&](int, const std::string& piece) {
             stream.append(piece);
-        });
+        },
+        /*reset_context=*/true,
+        image_path.empty() ? nullptr : &vision, image_token_id);
     stream.flush();
 
     if (!ok) {
@@ -427,9 +454,15 @@ int main(int argc, char** argv) {
     }
     if (!prompt_text.empty()) {
         return run_prompt_single(engine, tokenizer, prompt_text,
-                                  opts.max_new_tokens)
+                                  opts.max_new_tokens, opts.image_path)
                    ? 0
                    : 1;
+    }
+    if (!opts.image_path.empty()) {
+        std::fprintf(
+            stderr,
+            "chat: --image currently requires --prompt or --prompt-file\n");
+        return 1;
     }
 
     // REPL mode: multi-turn conversation

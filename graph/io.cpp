@@ -159,7 +159,7 @@ bool valid_precision(uint32_t value) {
 }
 
 bool valid_dim_expr(int8_t kind) {
-    return kind >= DIM_CONST && kind <= DIM_BATCH;
+    return kind >= DIM_CONST && kind <= DIM_DIV;
 }
 
 bool validate_graph(const Graph& graph, std::string& error) {

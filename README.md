@@ -59,7 +59,7 @@ policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
 | Qwen3-30B-A3B MoE | text-only W4 path |
 | Qwen3.6-35B-A3B MoE | text-only W4 path |
 | Qwen3.5-122B-A10B MoE | CPU W4 with SSD expert offload |
-| Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4 |
+| Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 | RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
 
@@ -209,7 +209,7 @@ Supported `config.json` model types:
 |---|---|
 | `qwen3` | Qwen3 dense text models |
 | `qwen3_moe` | Qwen3 MoE text models |
-| `qwen3_5` | Qwen3.5 dense text models |
+| `qwen3_5` | Qwen3.5 dense text and single-image vision models |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
 | RWKV7 `.pth` | Use `models/rwkv7.py` directly. |
@@ -251,6 +251,24 @@ One-shot deterministic smoke test:
     --threads 4 \
     --temperature 0
 ```
+
+Experimental Qwen3.5 single-image chat (macOS, CPU vision encoder):
+
+```bash
+./build_i8mm/mollm_chat \
+    --package qwen35_0.8b_w4g128.mollm \
+    --image photo.png \
+    --prompt "Describe this image." \
+    --max-new-tokens 128
+```
+
+The converter packages the checkpoint's FP16 vision tower alongside the
+quantized text model. The first implementation supports one static image in
+single-shot chat; multi-image/video input, server integration, and Metal vision
+execution are not enabled yet. Images default to a 262,144-pixel resize budget
+(roughly 512x512); use `--image-max-pixels` to trade speed for detail, up to
+1,048,576 pixels. Use converter option `--text-only` when the vision tower is
+not needed, avoiding its package and resident-memory overhead.
 
 Sampled generation:
 
@@ -325,7 +343,8 @@ mollm/
 - Broader accelerator coverage while keeping the CPU runtime as the portable
   baseline.
 - More model families beyond the current Qwen, Youtu, and Qwen-MoE coverage.
-- Vision model support, including multimodal Qwen-style architectures.
+- Broader vision support beyond the current Qwen3.5 single-image path,
+  including multi-image/video input, serving, and Metal execution.
 - SSD offload for larger models and MoE experts that do not fit comfortably in
   memory.
 

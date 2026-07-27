@@ -96,6 +96,7 @@ class Precision(IntEnum):
 #   MUL:   value = coeff * runtime_seq_len   (covers N * SEQ)
 #   ADD:   value = coeff + runtime_seq_len   (covers N + SEQ, rare)
 #   BATCH: value = runtime_batch_size         (reserved)
+#   DIV:   value = runtime_seq_len // coeff   (vision spatial merge)
 #
 # Transpile-time symbolic propagation flows these from INPUT nodes through
 # every op. The C++ runtime evaluates them via eval_dim().
@@ -106,6 +107,7 @@ class DimKind(IntEnum):
     MUL   = 2
     ADD   = 3
     BATCH = 4
+    DIV   = 5
 
 
 @dataclass
@@ -130,6 +132,10 @@ class DimExpr:
     def add(coeff):
         return DimExpr(DimKind.ADD, coeff)
 
+    @staticmethod
+    def div(coeff):
+        return DimExpr(DimKind.DIV, coeff)
+
 
 # Module-level SEQ symbol for use in reshape() target shapes.
 # Usage: g.reshape(x, (head_dim, num_heads * SEQ))  # dim 1 = MUL(num_heads, seq)
@@ -141,7 +147,7 @@ class DimExpr:
 class _SeqSymbol:
     """Symbol representing runtime seq_len in reshape() target shapes.
 
-    Supports arithmetic: SEQ, N * SEQ, N + SEQ. Detected by reshape()
+    Supports arithmetic: SEQ, N * SEQ, N + SEQ, SEQ // N. Detected by reshape()
     to construct the appropriate DimExpr.
 
     The build-time value (default 0) is used for shape serialization;
@@ -173,6 +179,14 @@ class _SeqSymbol:
     def __radd__(self, other):
         if isinstance(other, int):
             return _DimExprSymbol(DimExpr(DimKind.ADD, other), self._build_value + other)
+        return NotImplemented
+    def __floordiv__(self, other):
+        if isinstance(other, int) and other > 0:
+            if self._build_value % other != 0:
+                raise ValueError(
+                    f"build-time SEQ={self._build_value} is not divisible by {other}")
+            return _DimExprSymbol(
+                DimExpr(DimKind.DIV, other), self._build_value // other)
         return NotImplemented
 
 
@@ -619,6 +633,20 @@ class GraphBuilder:
                            prec=self._nodes[v_cache].out_prec,
                            i32=list(self._nodes[v_cache].out_shape))
         return attn, kc_out, vc_out
+
+    def sdpa_no_cache(self, q: int, k: int, v: int,
+                      causal: bool = False, scale: float = 0.0,
+                      num_heads: int = 16, num_kv_heads: int = 16,
+                      head_dim: int = 64, v_head_dim: int = 64) -> int:
+        """Self-attention without persistent KV state, used by vision graphs."""
+        sq = self._nodes[q].out_shape
+        return self._add(
+            OpType.SDPA, [q, k, v],
+            (v_head_dim, sq[1], num_heads),
+            prec=self._nodes[q].out_prec,
+            i32=[0, 1 if causal else 0, num_heads, num_kv_heads,
+                 head_dim, v_head_dim],
+            f32=[scale])
 
     # ---- shape ops (zero-copy views) ----
 
@@ -1256,7 +1284,8 @@ def _write_weight_file(path: str, data: np.ndarray,
 #     prefill_graph_offset (8) + prefill_graph_len (8)
 #     decode_graph_offset (8) + decode_graph_len (8)
 #     weights_offset (8) + weights_len (8)
-#     reserved (16)
+#     vision_graph_offset (8) + vision_graph_len (8)
+#     reserved (8)
 #   [metadata JSON] — includes "weights" map: {filename: [offset, len]}
 #   [tokenizer.json bytes]
 #   [chat_template.jinja bytes]
@@ -1379,8 +1408,9 @@ def save_package(output_path: str,
                  metadata: dict,
                  tokenizer_path: str = "",
                  jinja_path: str = "",
+                 g_vision: 'GraphBuilder | None' = None,
                  remove_weight_files: bool = False):
-    """Pack prefill+decode graphs + weights + tokenizer + jinja into a single .mollm file.
+    """Pack model graphs + weights + tokenizer + jinja into one .mollm file.
 
     Graphs are saved via the standard save() format (to temp files), then
     their bytes are embedded in the package. Weight file paths in the graphs
@@ -1397,12 +1427,18 @@ def save_package(output_path: str,
         # Step 1: save graphs to temp dir (standard format)
         g_prefill.save(os.path.join(tmp_dir, "model_prefill"))
         g_decode.save(os.path.join(tmp_dir, "model_decode"))
+        if g_vision is not None:
+            g_vision.save(os.path.join(tmp_dir, "model_vision"))
 
         # Step 2: read graph bytes
         with open(os.path.join(tmp_dir, "model_prefill.graph"), 'rb') as f:
             pf_bytes = f.read()
         with open(os.path.join(tmp_dir, "model_decode.graph"), 'rb') as f:
             dc_bytes = f.read()
+        vi_bytes = b""
+        if g_vision is not None:
+            with open(os.path.join(tmp_dir, "model_vision.graph"), 'rb') as f:
+                vi_bytes = f.read()
 
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
@@ -1410,7 +1446,10 @@ def save_package(output_path: str,
         weight_entries = []  # (path, size), in package order
         weights_len = 0
 
-        for g in [g_prefill, g_decode]:
+        graphs = [g_prefill, g_decode]
+        if g_vision is not None:
+            graphs.append(g_vision)
+        for g in graphs:
             for node in g._nodes:
                 if node.op_type != OpType.CONSTANT or not node.params_str:
                     continue
@@ -1455,7 +1494,8 @@ def save_package(output_path: str,
         jin_off = tok_off + len(tok_bytes)
         pf_off = jin_off + len(jinja_bytes)
         dc_off = pf_off + len(pf_bytes)
-        w_off = dc_off + len(dc_bytes)
+        vi_off = dc_off + len(dc_bytes) if vi_bytes else 0
+        w_off = dc_off + len(dc_bytes) + len(vi_bytes)
 
         with open(output_path, 'wb') as f:
             f.write(struct.pack('<II', PACKAGE_MAGIC, PACKAGE_VERSION))
@@ -1465,12 +1505,14 @@ def save_package(output_path: str,
             f.write(struct.pack('<QQ', pf_off, len(pf_bytes)))
             f.write(struct.pack('<QQ', dc_off, len(dc_bytes)))
             f.write(struct.pack('<QQ', w_off, weights_len))
-            f.write(b'\x00' * (hs - 4 - 4 - 8 * 12))  # pad to 128
+            f.write(struct.pack('<QQ', vi_off, len(vi_bytes)))
+            f.write(b'\x00' * 8)  # pad to 128
             f.write(meta_json)
             f.write(tok_bytes)
             f.write(jinja_bytes)
             f.write(pf_bytes)
             f.write(dc_bytes)
+            f.write(vi_bytes)
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
             for wpath, _ in weight_entries:
@@ -1488,9 +1530,10 @@ def save_package(output_path: str,
                     os.remove(wpath)
 
         total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
-                 + len(pf_bytes) + len(dc_bytes) + weights_len)
+                 + len(pf_bytes) + len(dc_bytes) + len(vi_bytes) + weights_len)
         print(f"Saved {output_path} ({weights_len} weights + {len(tok_bytes)} tokenizer + "
-              f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + {len(dc_bytes)} decode = {total} bytes)")
+              f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + "
+              f"{len(dc_bytes)} decode + {len(vi_bytes)} vision = {total} bytes)")
 
     finally:
         shutil.rmtree(tmp_dir)

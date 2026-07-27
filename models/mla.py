@@ -484,7 +484,7 @@ def convert_mla(model_dir: str, output_path: str, num_layers: int | None = None,
 
 if __name__ == '__main__':
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4mixg128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4g32|w4mixg128|w4mixg32]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]

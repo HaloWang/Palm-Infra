@@ -27,7 +27,7 @@ from transpile import (
 from model_metadata import infer_hf_model_name
 from qwen35 import (
     _build_full_attn_layer, _build_linear_attn_layer,
-    _query_then_gate_rows,
+    _query_then_gate_rows, _w4mix_promote_to_w8,
 )
 
 
@@ -55,7 +55,7 @@ def _canonical_quant(quant: str) -> str:
     return q
 
 
-def _quant_spec(quant: str, k: int) -> tuple[str, int] | None:
+def _quant_spec(quant: str, k: int, wname: str = "") -> tuple[str, int] | None:
     quant = _canonical_quant(quant)
     if quant == "fp16":
         return None
@@ -63,10 +63,13 @@ def _quant_spec(quant: str, k: int) -> tuple[str, int] | None:
         return ("w8", k)
     if quant.startswith("w8g"):
         return ("w8", int(quant[3:]))
+    if quant.startswith("w4mixg"):
+        group_size = int(quant[6:])
+        if _w4mix_promote_to_w8(wname):
+            return ("w8", group_size)
+        return ("w4", group_size)
     if quant.startswith("w4g"):
         return ("w4", int(quant[3:]))
-    if quant.startswith("w4mixg"):
-        return ("w4", int(quant[6:]))
     raise ValueError(f"unsupported quant mode: {quant}")
 
 
@@ -227,7 +230,7 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict, num_layers: int
              raw_name: str = ""):
         wpath = os.path.join(weights_dir, f"{name}.weights")
         quant_spec = (
-            _quant_spec(quant, data.shape[1])
+            _quant_spec(quant, data.shape[1], raw_name or name)
             if quantizable and data.ndim == 2 else None
         )
         if quant_spec is not None:

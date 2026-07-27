@@ -198,6 +198,17 @@ def test_reshape_with_mul_symbol():
           f"RESHAPE with 8*SEQ marks dim 1 as MUL(coeff=8), got kind={e.kind} coeff={e.coeff}")
 
 
+def test_reshape_with_div_symbol():
+    """reshape() with SEQ//N marks that dimension as exact integer division."""
+    g = GraphBuilder()
+    h = g.input('hidden', (1024, 256), dynamic=SEQ_DIM1)
+    r = g.reshape(h, (4096, SEQ // 4))
+    propagate_dim_exprs(g._nodes)
+    e = de_of(g, r)[1]
+    check(e.kind == DimKind.DIV and e.coeff == 4,
+          f"RESHAPE with SEQ//4 marks dim 1 as DIV(coeff=4), got kind={e.kind} coeff={e.coeff}")
+
+
 def test_no_seq_propagates_to_all_const():
     """Graph with no SEQ INPUTs has all CONST nodes."""
     g = GraphBuilder()
@@ -228,6 +239,7 @@ def main():
         test_decode_graph_all_const,
         test_reshape_with_seq_symbol,
         test_reshape_with_mul_symbol,
+        test_reshape_with_div_symbol,
         test_no_seq_propagates_to_all_const,
     ]
     for t in tests:

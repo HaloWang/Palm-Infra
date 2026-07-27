@@ -20,7 +20,8 @@
 // ---------------------
 // Each GraphNode carries a `dim_expr[4]` array of DimExpr structs, one per
 // output dimension.  When a dim depends on runtime seq_len, its size is
-// expressed as a symbolic expression (SEQ, N*SEQ, N+SEQ) evaluated at runtime.
+// expressed as a symbolic expression (SEQ, N*SEQ, N+SEQ, SEQ/N) evaluated at
+// runtime.
 // STATIC dims use out_shape[i] verbatim.  The transpiler does full symbolic
 // shape propagation (ONNX style): expr information flows from INPUT nodes
 // through every op, so every tensor's dim_expr[] is baked into the graph.
@@ -35,12 +36,13 @@
 //   MUL:   value = coeff * runtime_seq_len    (covers N * SEQ)
 //   ADD:   value = coeff + runtime_seq_len    (covers N + SEQ, rare)
 //   BATCH: value = runtime_batch_size          (reserved)
+//   DIV:   value = runtime_seq_len / coeff     (exact integer division)
 //
 // Serialized as 8 bytes (kind + coeff + padding). The coeff field is only
-// used by MUL and ADD; CONST/SEQ/BATCH ignore it.
+// used by MUL, ADD, and DIV; CONST/SEQ/BATCH ignore it.
 struct DimExpr {
-    int8_t  kind  = 0;   // 0=CONST, 1=SEQ, 2=MUL, 3=ADD, 4=BATCH
-    int32_t coeff = 0;   // multiplier (MUL) or constant term (ADD)
+    int8_t  kind  = 0;   // 0=CONST, 1=SEQ, 2=MUL, 3=ADD, 4=BATCH, 5=DIV
+    int32_t coeff = 0;   // multiplier/addend/divisor
 
     bool is_static() const { return kind == 0; }
     bool is_dynamic() const { return kind != 0; }
@@ -53,6 +55,7 @@ enum : int8_t {
     DIM_MUL   = 2,
     DIM_ADD   = 3,
     DIM_BATCH = 4,
+    DIM_DIV   = 5,
 };
 
 // ---- op types ----

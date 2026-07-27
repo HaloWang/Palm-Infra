@@ -59,6 +59,19 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         } else if (arg == "--prompt-file") {
             if (!require_value(argc, argv, i, "--prompt-file", value, error)) return false;
             opts.prompt_file = value;
+        } else if (arg == "--image") {
+            if (!require_value(argc, argv, i, "--image", value, error)) return false;
+            opts.image_path = value;
+        } else if (arg == "--image-max-pixels") {
+            if (!require_value(argc, argv, i, "--image-max-pixels", value, error)) return false;
+            if (!parse_int(value, opts.image_max_pixels) ||
+                opts.image_max_pixels < EngineConfig::kMinImageMaxPixels ||
+                opts.image_max_pixels >
+                    EngineConfig::kAbsoluteImageMaxPixels) {
+                error = "invalid value for --image-max-pixels "
+                        "(expected 65536..1048576)";
+                return false;
+            }
         } else if (arg == "--prompt-tokens") {
             if (!require_value(argc, argv, i, "--prompt-tokens", value, error)) return false;
             if (!parse_int(value, opts.prompt_tokens) || opts.prompt_tokens < 1) {
@@ -265,6 +278,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --package <file.mollm>    Single-file model package (required)\n");
     std::printf("  --prompt <text>           Run one prompt and exit\n");
     std::printf("  --prompt-file <path>      Read prompt text from file, run and exit\n");
+    std::printf("  --image <path>            Attach one image (Qwen3.5-VL, single-shot)\n");
+    std::printf("  --image-max-pixels <int>  Resize budget; default 262144, max 1048576\n");
     std::printf("  --prompt-tokens <int>     Use N dummy tokens (skip chat template)\n");
     std::printf("  --max-new-tokens <int>    Default: 2048\n");
     std::printf("  --n-ctx <int>             Default: 16384\n");
@@ -317,6 +332,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.num_threads = opts.num_threads;
     cfg.sampling = opts.sampling;
     cfg.static_padded = opts.static_padded;
+    cfg.image_max_pixels = opts.image_max_pixels;
     cfg.device = opts.device;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
@@ -386,7 +402,8 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token,
-                     bool reset_context) {
+                     bool reset_context, const VisionEmbedding* vision,
+                     int image_token_id) {
     result = GenerationResult();
     if (prompt_ids.empty()) {
         error = "prompt is empty after tokenization";
@@ -404,7 +421,10 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
     }
 
     auto prefill_start = std::chrono::steady_clock::now();
-    int next = engine.prefill(prompt_ids);
+    int next = vision
+                   ? engine.prefill_with_image(
+                         prompt_ids, image_token_id, *vision, &error)
+                   : engine.prefill(prompt_ids);
     auto prefill_end = std::chrono::steady_clock::now();
     result.prefill_ms = std::chrono::duration<double, std::milli>(prefill_end - prefill_start).count();
     if (next < 0) {

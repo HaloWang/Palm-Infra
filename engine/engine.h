@@ -81,6 +81,10 @@ inline constexpr bool kDefaultLockMoeSsdCache = false;
 #endif
 
 struct EngineConfig {
+    static constexpr int kMinImageMaxPixels = 256 * 256;
+    static constexpr int kDefaultImageMaxPixels = 512 * 512;
+    static constexpr int kAbsoluteImageMaxPixels = 1024 * 1024;
+
     std::string package_path;         // .mollm single-file package (required)
     Device device = Device::CPU;      // compute backend (METAL requires MOLLM_METAL)
     int n_ctx = 4096;                 // max sequence length
@@ -128,6 +132,18 @@ struct EngineConfig {
     // Stateful ops still receive n_real_tokens to skip padding positions.
     // For A/B benchmark comparison against DYNAMIC mode.
     bool static_padded = false;
+    // CPU vision attention is quadratic in the number of image patches.
+    // Resize ordinary high-resolution photos to a practical default budget.
+    int image_max_pixels = kDefaultImageMaxPixels;
+};
+
+struct VisionEmbedding {
+    std::vector<float> values; // token-major [tokens, hidden_size]
+    int tokens = 0;
+    int hidden_size = 0;
+    int grid_t = 0;
+    int grid_h = 0;
+    int grid_w = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -144,6 +160,15 @@ public:
     /// Process a full sequence of tokens (prefill).
     int prefill(const std::vector<int>& token_ids);
 
+    /// Prefill one Qwen3.5 prompt containing exactly `vision.tokens`
+    /// occurrences of image_token_id. The corresponding token embeddings are
+    /// replaced by the vision encoder output and text RoPE uses Qwen's 3-axis
+    /// multimodal positions.
+    int prefill_with_image(const std::vector<int>& token_ids,
+                           int image_token_id,
+                           const VisionEmbedding& vision,
+                           std::string* error = nullptr);
+
     /// Like prefill() but returns the raw hidden states instead of the sampled token.
     /// Used by tests for perplexity computation.
     Tensor prefill_hidden(const std::vector<int>& token_ids);
@@ -153,6 +178,18 @@ public:
 
     /// Process a single token (decode step).
     int decode(int token_id);
+
+    /// Run the packaged Qwen3.5 vision tower on processor-compatible flattened
+    /// patches. `pixel_values` is token-major [grid_t*grid_h*grid_w, patch_dim].
+    bool encode_vision_patches(const std::vector<float>& pixel_values,
+                               int grid_t, int grid_h, int grid_w,
+                               VisionEmbedding& output,
+                               std::string* error = nullptr);
+
+    /// Decode and preprocess one image using the package's Qwen3.5 processor
+    /// metadata, then run the packaged vision tower.
+    bool encode_image_file(const std::string& path, VisionEmbedding& output,
+                           std::string* error = nullptr);
 
     /// Reset KV cache and past length.
     void reset();
@@ -166,6 +203,7 @@ public:
         return true;
     }
     int past_len() const { return past_len_; }
+    bool has_vision_encoder() const { return !graph_vision_.nodes.empty(); }
     // Package-level metadata fields (model_name, architecture, quantization,
     // num_layers, hidden_size, num_heads, n_ctx, vocab_size, prefill_seq_len).
     // Empty for packages without a metadata JSON section.
@@ -230,8 +268,10 @@ private:
     Sampler sampler_;
     Graph graph_prefill_;
     Graph graph_decode_;
+    Graph graph_vision_;
     ExecContext exec_ctx_prefill_;
     ExecContext exec_ctx_decode_;
+    ExecContext exec_ctx_vision_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
     // Owned Metal backend (as base Backend* so the header needs no ObjC/Metal
@@ -311,6 +351,12 @@ private:
     Tensor build_causal_mask(int seq_len, int past_len);
     void generate_rope_cache(int seq_len, int start_pos,
                              Tensor& cos, Tensor& sin);
+    void generate_multimodal_rope_cache(int seq_len, int token_offset,
+                                        Tensor& cos, Tensor& sin);
+    bool prepare_multimodal_positions(const std::vector<int>& token_ids,
+                                      int image_token_id,
+                                      const VisionEmbedding& vision,
+                                      std::string* error);
 
     /// Run lm_head on the last hidden state.
     int run_lmhead(const Tensor& hidden, int n_tokens = 1,
@@ -329,7 +375,8 @@ private:
     /// Load a single graph and set up its CONSTANT nodes from shared weights.
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
     bool load_package(const std::string& path, std::string& pf_path,
-                      std::string& dc_path, std::string& tok_path);
+                      std::string& dc_path, std::string& vi_path,
+                      std::string& tok_path);
     size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.
@@ -342,4 +389,12 @@ private:
     // weight tensors
     Tensor* embed_weight_ = nullptr;   // [vocab_size, hidden_dim], row-major FP16/FP32 for lookup
     Tensor* lm_head_weight_ = nullptr; // [vocab_size, hidden_dim], regular matmul weight
+    Tensor* vision_pos_embed_ = nullptr; // [positions, vision_hidden]
+
+    const VisionEmbedding* active_vision_ = nullptr;
+    int active_image_token_id_ = -1;
+    int active_vision_cursor_ = 0;
+    int multimodal_base_past_ = 0;
+    int rope_position_delta_ = 0;
+    std::vector<int> multimodal_position_ids_; // axis-major [3, prompt_tokens]
 };

@@ -75,6 +75,7 @@ set(SOURCES
     engine/sampler.cpp
     engine/tokenizer.cpp
     engine/tokenizer_rwkv.cpp
+    engine/vision.cpp
     engine/weight_metadata.cpp
 )
 
@@ -171,10 +172,16 @@ endif()
 # Apple-specific: link Accelerate for optional BLAS (future use)
 if(APPLE)
     find_library(ACCELERATE_LIBRARY Accelerate)
+    find_library(COREFOUNDATION_LIBRARY CoreFoundation REQUIRED)
+    find_library(COREGRAPHICS_LIBRARY CoreGraphics REQUIRED)
+    find_library(IMAGEIO_LIBRARY ImageIO REQUIRED)
     if(ACCELERATE_LIBRARY)
         target_link_libraries(mollm_lib PUBLIC ${ACCELERATE_LIBRARY})
         target_compile_definitions(mollm_lib PRIVATE ACCELERATE_NEW_LAPACK)
     endif()
+    target_link_libraries(
+        mollm_lib PUBLIC ${COREFOUNDATION_LIBRARY} ${COREGRAPHICS_LIBRARY}
+                         ${IMAGEIO_LIBRARY})
 endif()
 
 # ---------------------------------------------------------------------------
@@ -315,6 +322,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_mmap_file     tests/test_mmap_file.cpp)
     add_mollm_test(test_weight_metadata tests/test_weight_metadata.cpp)
     add_mollm_test(test_sampler       tests/test_sampler.cpp)
+    add_executable(vision_probe       tests/vision_probe.cpp)
+    target_link_libraries(vision_probe PRIVATE mollm_lib)
     add_mollm_test(test_graph         tests/test_graph.cpp)
     add_mollm_test(test_io            tests/test_io.cpp)
     add_mollm_test(test_execute       tests/test_execute.cpp)

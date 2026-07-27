@@ -11,6 +11,8 @@ struct CliCommonOptions {
     std::string package_path;   // .mollm single-file package (required)
     std::string prompt;
     std::string prompt_file;  // read prompt text from file (--prompt-file)
+    std::string image_path;   // one static image for Qwen3.5-VL (--image)
+    int image_max_pixels = EngineConfig::kDefaultImageMaxPixels;
     int prompt_tokens = 0;   // >0: use N dummy tokens instead of --prompt text
     int max_new_tokens = 2048;
     int n_ctx = 16384;
@@ -77,7 +79,9 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token = {},
-                     bool reset_context = true);
+                     bool reset_context = true,
+                     const VisionEmbedding* vision = nullptr,
+                     int image_token_id = -1);
 
 /// Apply Qwen3.5 ChatML template: wrap user message with special tokens.
 /// Format: <|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{msg}<|im_end|>\n<|im_start|>assistant\n

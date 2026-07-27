@@ -1,12 +1,12 @@
 """
-mollm model builder for Qwen3.5-0.8B (text only).
+mollm model builder for dense Qwen3.5 models.
 
 Hybrid architecture:
   - 18 layers of linear attention (Gated Delta Rule)
   - 6 layers of full attention (GQA + QK norm + output gate)
   - Standard SwiGLU MLP
 
-Text-only: vision encoder weights are ignored.
+Packages include the FP16 vision tower when the checkpoint provides one.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ from transpile import (
     write_quantized_weight_file_cpp,
 )
 from model_metadata import infer_hf_model_name
+from qwen35_vision import build_vision_graph, export_vision_weights
 
 
 def _layer_index(wname: str) -> int | None:
@@ -754,7 +755,7 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
 
 def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = None,
                     prefill_seq_len: int = 256, n_ctx: int = 4096,
-                    quant: str = "fp16"):
+                    quant: str = "fp16", include_vision: bool = True):
     """Main entry point: export weights + build graphs → single .mollm file.
 
     Args:
@@ -763,6 +764,7 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
         num_layers: deprecated; layer count is read from config.json
         prefill_seq_len: prefill sequence length
         n_ctx: max context length
+        include_vision: package the FP16 vision tower when present
     """
     model_dir = Path(model_dir)
     quant = _canonical_quant(quant)
@@ -795,6 +797,12 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
     # ---- Step 1: Export weights to temp dir ----
     print("Exporting weights...")
     export_weights(weights, str(weights_dir), cfg, quant=quant)
+    g_vision = None
+    if include_vision and "vision_config" in cfg:
+        print("Exporting vision weights...")
+        export_vision_weights(weights, str(weights_dir), cfg)
+        print("\nBuilding vision graph...")
+        g_vision = build_vision_graph(weights_rel, cfg)
 
     # ---- Step 2: Build prefill graph ----
     print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
@@ -822,9 +830,34 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
         "layer_types": tc['layer_types'],
         "quantization": quant,
     }
+    if g_vision is not None:
+        vc = cfg["vision_config"]
+        processor_path = model_dir / "preprocessor_config.json"
+        with open(processor_path) as f:
+            processor_cfg = json.load(f)
+        metadata.update({
+            "vision": True,
+            "image_token_id": cfg["image_token_id"],
+            "vision_start_token_id": cfg["vision_start_token_id"],
+            "vision_end_token_id": cfg["vision_end_token_id"],
+            "vision_hidden_size": vc["hidden_size"],
+            "vision_num_heads": vc["num_heads"],
+            "vision_depth": vc["depth"],
+            "vision_patch_size": vc["patch_size"],
+            "vision_temporal_patch_size": vc["temporal_patch_size"],
+            "vision_spatial_merge_size": vc["spatial_merge_size"],
+            "vision_num_position_embeddings":
+                vc["num_position_embeddings"],
+            "mrope_section_t": tc["rope_parameters"]["mrope_section"][0],
+            "mrope_section_h": tc["rope_parameters"]["mrope_section"][1],
+            "mrope_section_w": tc["rope_parameters"]["mrope_section"][2],
+            "vision_min_pixels": processor_cfg["size"]["shortest_edge"],
+            "vision_max_pixels": processor_cfg["size"]["longest_edge"],
+        })
     save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                  tokenizer_path=str(model_dir / "tokenizer.json"),
-                 jinja_path=str(model_dir / "chat_template.jinja"))
+                 jinja_path=str(model_dir / "chat_template.jinja"),
+                 g_vision=g_vision)
 
     # Cleanup temp dir
     import shutil
@@ -835,7 +868,7 @@ def convert_qwen35(model_dir: str, output_path: str, num_layers: int | None = No
 if __name__ == '__main__':
     import sys
     if len(sys.argv) < 3:
-        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4mixg128]")
+        print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant=fp16|w8pc|w4g128|w4g32|w4mixg128|w4mixg32]")
         sys.exit(1)
     model_dir = sys.argv[1]
     output_path = sys.argv[2]
