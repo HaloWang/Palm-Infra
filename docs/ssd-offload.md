@@ -30,7 +30,7 @@ Historical cache-policy isolation run: real chat prompt, four CPU threads, 16 pr
 The default row locks both dense weights and the expert cache. The prediction
 uses somewhat more SSD bandwidth but hides enough latency to improve
 interactive decode. With a longer 256-token context, the strict `pp256 + tg64`,
-`warmup=3` five-process median is 37.99 pp / 8.46 tg.
+`warmup=3` five-process median refreshed on 2026-07-27 is 51.06 pp / 13.11 tg.
 
 ## Cache-size sweep
 
