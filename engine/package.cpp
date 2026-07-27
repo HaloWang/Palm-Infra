@@ -369,12 +369,33 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                     return false;
                 }
                 auto cache = std::make_unique<MoeSsdCache>();
-                if (!cache->open(path, cfg_.moe_ssd_cache_bytes,
+                // Full-Metal decode uses this host cache only for short CPU
+                // prefill and for carrying expert-source metadata. Giving it
+                // the full Metal arena budget temporarily doubles residency:
+                // a 16 GiB CPU prefill cache is filled, cleared, then followed
+                // by a separate 16 GiB Metal cache. Keep the staging cache
+                // bounded while preserving the user budget for Metal.
+                constexpr size_t kMetalCpuPrefillCacheBytes =
+                    size_t{1024} * 1024 * 1024;
+                const size_t host_cache_bytes =
+                    cfg_.metal_ssd_full
+                        ? std::min(cfg_.moe_ssd_cache_bytes,
+                                   kMetalCpuPrefillCacheBytes)
+                        : cfg_.moe_ssd_cache_bytes;
+                if (!cache->open(path, host_cache_bytes,
                                  cfg_.moe_ssd_io_workers,
                                  cfg_.moe_ssd_global_cache &&
                                      cfg_.moe_ssd_cross_layer_prefetch,
                                  cfg_.lock_moe_ssd_cache))
                     return false;
+                if (cfg_.metal_ssd_full &&
+                    host_cache_bytes < cfg_.moe_ssd_cache_bytes) {
+                    std::fprintf(
+                        stderr,
+                        "Engine: CPU prefill expert staging cache capped at "
+                        "%.1f MB; full budget reserved for Metal\n",
+                        host_cache_bytes / 1e6);
+                }
                 if (cfg_.lock_moe_ssd_cache) {
                     std::fprintf(stderr,
                                  "Engine: expert RAM cache pages will be locked on demand\n");

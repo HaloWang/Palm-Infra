@@ -3498,7 +3498,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     sp.activation_repeat = activation_repeat;
                     [enc setComputePipelineState:
                              impl_->pipeline(
-                                 "gemv_selected_slots_bg128_tile8_i8a_i4b_f32c")];
+                                 "gemv_selected_slots_bg128_i8a_i4b_f32c")];
                     [enc setBuffer:activation offset:0 atIndex:0];
                     [enc setBuffer:weight offset:0 atIndex:1];
                     [enc setBuffer:dst offset:0 atIndex:2];

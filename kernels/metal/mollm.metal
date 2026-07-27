@@ -1262,11 +1262,11 @@ kernel void gemm_selected_w4a8_i8a_i4b_f32c(
     for(int i=tid;i<NRA;i+=NT){int gn=ra+i;if(gn<p.N)C[p.c_offset+(ulong)sel*p.c_row_stride+gn]=facc[i]*SCALE_A[ar];}
 }
 
-// Decode-specialized BG128 GEMV that computes one native eight-channel tile per
-// SIMD group. The channels share the same activation values and BG128 block,
-// cutting activation traffic and SIMD-group scheduling while keeping a compact
-// 128-thread threadgroup.
-kernel void gemv_selected_slots_bg128_tile8_i8a_i4b_f32c(
+// Decode-specialized native BG128 GEMV. Four lanes cooperate on one
+// quantization group, so a SIMD group evaluates eight groups concurrently.
+// Each lane reads one contiguous 32-value qgi slice and reuses its activation
+// values across all eight output channels in the native block.
+kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
     device const int8_t* A [[buffer(0)]], device const uint8_t* B [[buffer(1)]],
     device float* C [[buffer(2)]], constant SelectedW4A8Params& p [[buffer(3)]],
     device const float* SCALE_A [[buffer(4)]],
@@ -1283,62 +1283,64 @@ kernel void gemv_selected_slots_bg128_tile8_i8a_i4b_f32c(
     const int ar = output_sel / max(p.activation_repeat, 1);
     device const int8_t* activation = A + (ulong)ar * p.K;
     device const uint8_t* weight = B + weight_offsets[sel];
-    const int channel0 = row0 & 7;
     const int row_tile = row0 >> 3;
+    const int group_lane = (int)lane >> 2;
+    const int lane_in_group = (int)lane & 3;
     const ulong BG128_BYTES = 544;
     float lane_sums[8] = {0.0f, 0.0f, 0.0f, 0.0f,
                           0.0f, 0.0f, 0.0f, 0.0f};
 
-    // Apply each BG128 weight scale to the lane-local integer partial, then
-    // reduce once after the K loop. Reduction is linear, so this replaces
-    // 8 * groups_per_row SIMD reductions with eight total reductions.
-    for (int g = 0; g < p.groups_per_row; ++g) {
+    for (int group_base = 0; group_base < p.groups_per_row;
+         group_base += 8) {
+        const int g = group_base + group_lane;
+        if (g >= p.groups_per_row) continue;
+        const int k0 = g * 128 + lane_in_group * 32;
         device const uint8_t* block =
             weight + ((ulong)row_tile * p.groups_per_row + g) *
                          BG128_BYTES;
         int partials[8] = {0, 0, 0, 0, 0, 0, 0, 0};
-        for (int packed = (int)lane; packed < 64; packed += 32) {
-            const int qgi = packed >> 4;
-            const int byte_in_qgi = packed & 15;
-            const int weight_base = 32 + qgi * 128 + byte_in_qgi;
-            const int k = g * 128 + packed * 2;
-            const int a0 = (int)activation[k];
-            const int a1 = (int)activation[k + 1];
+        #pragma unroll
+        for (int segment = 0; segment < 4; ++segment) {
+            const char4 av0 =
+                *(device const char4*)(activation + k0 + segment * 8);
+            const char4 av1 =
+                *(device const char4*)(activation + k0 + segment * 8 + 4);
+            const int4 ae = int4(av0.x, av0.z, av1.x, av1.z);
+            const int4 ao = int4(av0.y, av0.w, av1.y, av1.w);
             #pragma unroll
-            for (int channel_offset = 0; channel_offset < 8;
-                 ++channel_offset) {
-                const uint8_t q =
-                    block[weight_base +
-                          (channel0 + channel_offset) * 16];
-                const int lo = (q & 15) >= 8 ? (int)(q & 15) - 16
-                                             : (int)(q & 15);
-                const int hi = (q >> 4) >= 8 ? (int)(q >> 4) - 16
-                                             : (int)(q >> 4);
-                partials[channel_offset] += a0 * lo + a1 * hi;
+            for (int channel = 0; channel < 8; ++channel) {
+                const uchar4 q = *(device const uchar4*)(
+                    block + 32 + lane_in_group * 128 +
+                    channel * 16 + segment * 4);
+                int4 lo = int4(q & uchar4(15));
+                int4 hi = int4(q >> 4);
+                lo = select(lo, lo - 16, lo >= 8);
+                hi = select(hi, hi - 16, hi >= 8);
+                const int4 products = ae * lo + ao * hi;
+                partials[channel] +=
+                    products.x + products.y + products.z + products.w;
             }
         }
         device const float* weight_scales =
             (device const float*)block;
         #pragma unroll
-        for (int channel_offset = 0; channel_offset < 8;
-             ++channel_offset)
-            lane_sums[channel_offset] +=
-                (float)partials[channel_offset] *
-                weight_scales[channel0 + channel_offset];
+        for (int channel = 0; channel < 8; ++channel)
+            lane_sums[channel] +=
+                (float)partials[channel] * weight_scales[channel];
     }
     const float activation_scale = SCALE_A[ar];
     #pragma unroll
-    for (int channel_offset = 0; channel_offset < 8;
-         ++channel_offset) {
-        const float sum = simd_sum(lane_sums[channel_offset]);
+    for (int channel = 0; channel < 8; ++channel) {
+        const float sum = simd_sum(lane_sums[channel]);
         if (lane == 0) {
-            const int row = row0 + channel_offset;
+            const int row = row0 + channel;
             if (row < p.N)
                 C[p.c_offset + (ulong)output_sel * p.c_row_stride + row] =
                     sum * activation_scale;
         }
     }
 }
+
 #endif // MOLLM_METAL_TENSOR
 
 // ===========================================================================

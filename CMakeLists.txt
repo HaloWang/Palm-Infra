@@ -345,6 +345,15 @@ if(MOLLM_BUILD_TESTS)
 
     if(MOLLM_METAL)
         add_mollm_test(test_metal_ops tests/test_metal_ops.cpp)
+
+        # Developer-only microbenchmark for the decode-time Metal SSD-MoE
+        # selected-expert kernel. It is intentionally not registered with
+        # CTest because it allocates full 122B expert working sets.
+        add_executable(bench_metal_moe tests/bench_metal_moe.mm)
+        target_link_libraries(bench_metal_moe PRIVATE mollm_lib)
+        set_source_files_properties(
+            tests/bench_metal_moe.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     endif()
 endif()
 
