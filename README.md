@@ -64,8 +64,10 @@ policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
 | RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
-the fastest decode speed in mollm. `w4mixg128` keeps selected sensitive tensors
-in W8 when pure W4 loses too much quality.
+the fastest decode speed in mollm. All config-based converters also accept
+`w4g32` and `w4mixg32`. The smaller groups improve W4 quality at the cost of
+more scales and potentially lower throughput; mixed modes reuse each model's
+`w4mixg128` policy for deciding which sensitive tensors remain W8.
 
 ## Performance
 
@@ -183,6 +185,13 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 
 # Mixed W4 quality package.
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg128
+
+# Smaller-group W4, pure or with the same model-specific mixed policy.
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g32.mollm w4g32
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg32.mollm w4mixg32
+
+# RWKV7
+python3 models/rwkv7.py /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm --tokenizer /path/to/tokenizer.txt --quant w4mixg32
 ```
 
 MoE example:
@@ -213,6 +222,8 @@ Quantization choices:
 | `w8pc` | You want int8 weight-only quantization with small quality drift. |
 | `w4g128` | You want the smallest package and fastest decode. This is the usual performance choice. |
 | `w4mixg128` | Pure W4 quality is too low and you can spend more memory for selected W8 tensors. |
+| `w4g32` | You want better W4 quality from smaller 32-value groups and accept extra scales and possible throughput loss. |
+| `w4mixg32` | You want W4G32 plus the same model-specific W8 tensor promotions used by `w4mixg128`. |
 
 Notes:
 

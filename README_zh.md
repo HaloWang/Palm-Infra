@@ -54,7 +54,10 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
 
-当前测试最充分的运行路径是 `w4g128`：它占用内存最少，且具有 mollm 中最快的 decode 速度。若纯 W4 的质量不足，可使用 `w4mixg128`，它会保留部分敏感 tensor 为 W8。
+当前测试最充分的运行路径是 `w4g128`：它占用内存最少，且具有 mollm 中最快的
+decode 速度。所有基于 `config.json` 的 converter 也支持 `w4g32` 和
+`w4mixg32`。更小的 group 能改善 W4 质量，代价是更多 scale 和潜在的吞吐下降；
+mixed 模式沿用各模型 `w4mixg128` 的 policy，决定哪些敏感 tensor 保留为 W8。
 
 ## 性能
 
@@ -138,6 +141,13 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 
 # 混合 W4 质量包。
 python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg128.mollm w4mixg128
+
+# 更小 group 的纯 W4，以及沿用同一模型 mixed policy 的版本。
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g32.mollm w4g32
+python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4mixg32.mollm w4mixg32
+
+# RWKV7
+python3 models/rwkv7.py /path/to/rwkv7-g1h-1.5b.pth rwkv7_1.5b_w4mixg32.mollm --tokenizer /path/to/tokenizer.txt --quant w4mixg32
 ```
 
 MoE 示例：
@@ -163,8 +173,12 @@ python3 models/converter.py \
 | `w8pc` | 需要 weight-only int8 量化，允许轻微质量偏移。 |
 | `w4g128` | 需要最小包大小和最快 decode；通常是性能首选。 |
 | `w4mixg128` | 纯 W4 质量不足，可使用更多内存保留部分 W8 tensor。 |
+| `w4g32` | 使用更小的 32-value group 改善 W4 质量，并接受更多 scale 和潜在吞吐损失。 |
+| `w4mixg32` | 在 W4G32 基础上，沿用该模型 `w4mixg128` 的 W8 tensor promotion policy。 |
 
-W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。prefill 图内部以 256 token 为分块大小，但 CPU runtime 使用 dynamic prefill；除非显式指定 `--static-padded`，短 prompt 不会 padding 到 256。
+W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。prefill
+图内部以 256 token 为分块大小，但 CPU runtime 使用 dynamic prefill；除非
+显式指定 `--static-padded`，短 prompt 不会 padding 到 256。
 
 ## 运行对话
 
