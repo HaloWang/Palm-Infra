@@ -152,6 +152,8 @@ void LLMEngine::clear_model_state() {
     package_metadata_.clear();
     past_len_ = 0;
     cfg_ = EngineConfig{};
+    sampler_.configure(cfg_.sampling, nullptr, true);
+    sampler_.reset();
 }
 
 size_t LLMEngine::warmup_package_weights() {
@@ -644,6 +646,13 @@ bool LLMEngine::load(const EngineConfig& cfg) {
 bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_ = cfg;
     cfg_.num_threads = std::max(cfg_.num_threads, 1);
+    std::string sampling_error;
+    if (!sampler_.configure(cfg_.sampling, &sampling_error, true)) {
+        fprintf(stderr, "Engine: invalid sampling parameters: %s\n",
+                sampling_error.c_str());
+        return false;
+    }
+    sampler_.reset();
     if (cfg_.metal_ssd_full &&
         (cfg_.device != Device::METAL || cfg_.moe_ssd_cache_bytes == 0)) {
         fprintf(stderr,

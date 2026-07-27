@@ -22,7 +22,7 @@ int main() {
     EngineConfig cfg;
     cfg.package_path = package;
     cfg.num_threads = 4;
-    cfg.temperature = 0.f;
+    cfg.sampling.temperature = 0.f;
     const char* device = std::getenv("MOLLM_RWKV_DEVICE");
     if (device && std::strcmp(device, "metal") == 0)
         cfg.device = Device::METAL;

@@ -175,22 +175,60 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
             }
         } else if (arg == "--temperature") {
             if (!require_value(argc, argv, i, "--temperature", value, error)) return false;
-            opts.temperature = (float)std::atof(value);
+            if (!parse_float(value, opts.sampling.temperature)) {
+                error = "invalid value for --temperature";
+                return false;
+            }
         } else if (arg == "--top-k") {
             if (!require_value(argc, argv, i, "--top-k", value, error)) return false;
-            if (!parse_int(value, opts.top_k) || opts.top_k < 0) {
+            if (!parse_int(value, opts.sampling.top_k)) {
                 error = "invalid value for --top-k";
                 return false;
             }
         } else if (arg == "--top-p") {
             if (!require_value(argc, argv, i, "--top-p", value, error)) return false;
-            opts.top_p = (float)std::atof(value);
+            if (!parse_float(value, opts.sampling.top_p)) {
+                error = "invalid value for --top-p";
+                return false;
+            }
+        } else if (arg == "--min-p") {
+            if (!require_value(argc, argv, i, "--min-p", value, error)) return false;
+            if (!parse_float(value, opts.sampling.min_p)) {
+                error = "invalid value for --min-p";
+                return false;
+            }
+        } else if (arg == "--repeat-penalty") {
+            if (!require_value(argc, argv, i, "--repeat-penalty", value, error)) return false;
+            if (!parse_float(value, opts.sampling.repeat_penalty)) {
+                error = "invalid value for --repeat-penalty";
+                return false;
+            }
+        } else if (arg == "--repeat-last-n") {
+            if (!require_value(argc, argv, i, "--repeat-last-n", value, error)) return false;
+            if (!parse_int(value, opts.sampling.repeat_last_n)) {
+                error = "invalid value for --repeat-last-n";
+                return false;
+            }
+        } else if (arg == "--presence-penalty") {
+            if (!require_value(argc, argv, i, "--presence-penalty", value, error)) return false;
+            if (!parse_float(value, opts.sampling.presence_penalty)) {
+                error = "invalid value for --presence-penalty";
+                return false;
+            }
+        } else if (arg == "--frequency-penalty") {
+            if (!require_value(argc, argv, i, "--frequency-penalty", value, error)) return false;
+            if (!parse_float(value, opts.sampling.frequency_penalty)) {
+                error = "invalid value for --frequency-penalty";
+                return false;
+            }
         } else if (arg == "--seed") {
             if (!require_value(argc, argv, i, "--seed", value, error)) return false;
-            if (!parse_int(value, opts.seed)) {
+            int seed = 0;
+            if (!parse_int(value, seed) || seed < 0) {
                 error = "invalid value for --seed";
                 return false;
             }
+            opts.sampling.seed = static_cast<unsigned int>(seed);
         } else if (arg == "--output") {
             if (!require_value(argc, argv, i, "--output", value, error)) return false;
             opts.output_format = value;
@@ -208,6 +246,8 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         error = "missing required --package <file.mollm>";
         return false;
     }
+    if (!validate_sampling_params(opts.sampling, &error))
+        return false;
     if (opts.ssd_cache_mb > 0) {
         // SSD offload uses explicit pread() rather than touching aggregate
         // expert mappings. Keep default startup light, but honour an explicit
@@ -255,6 +295,11 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --temperature <float>     Default: 0.6 (0 = greedy)\n");
     std::printf("  --top-k <int>             Default: 50 (0 = disabled)\n");
     std::printf("  --top-p <float>           Default: 0.9 (0 = disabled)\n");
+    std::printf("  --min-p <float>           Default: 0 (disabled)\n");
+    std::printf("  --repeat-penalty <float>  Default: 1 (disabled)\n");
+    std::printf("  --repeat-last-n <int>     Default: 64 (-1 = full context, 0 = disabled)\n");
+    std::printf("  --presence-penalty <float>  Default: 0, range: [-2, 2]\n");
+    std::printf("  --frequency-penalty <float> Default: 0, range: [-2, 2]\n");
     std::printf("  --seed <int>              Default: 42\n");
     std::printf("  --output <kv|human>       bench output format (default: kv)\n");
     if (extra_usage && *extra_usage) {
@@ -270,10 +315,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.rope_dim = opts.rope_dim;
     cfg.rope_theta = opts.rope_theta;
     cfg.num_threads = opts.num_threads;
-    cfg.temperature = opts.temperature;
-    cfg.top_k = opts.top_k;
-    cfg.top_p = opts.top_p;
-    cfg.seed = (unsigned int)opts.seed;
+    cfg.sampling = opts.sampling;
     cfg.static_padded = opts.static_padded;
     cfg.device = opts.device;
     cfg.weight_loading = opts.weight_loading;
@@ -340,7 +382,7 @@ GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
     return metrics;
 }
 
-bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
+bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token,

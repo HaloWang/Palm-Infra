@@ -38,11 +38,7 @@ struct CliCommonOptions {
     bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
 
-    // Sampling
-    float temperature = 0.6f;
-    int top_k = 50;
-    float top_p = 0.9f;
-    int seed = 42;
+    SamplingParams sampling;
 
     // bench output format: "kv" (default, machine-parseable) or "human"
     // (aligned summary blocks). Ignored by chat.
@@ -77,7 +73,7 @@ bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
 std::string decode_piece(const Tokenizer& tokenizer, int token_id);
 GenerationMetrics compute_generation_metrics(size_t prompt_tokens,
                                              const GenerationResult& result);
-bool generate_greedy(LLMEngine& engine, const Tokenizer& tokenizer,
+bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
                      const std::vector<int>& prompt_ids, int max_new_tokens,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token = {},

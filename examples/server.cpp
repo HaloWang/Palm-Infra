@@ -9,10 +9,12 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <functional>
+#include <limits>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -105,10 +107,78 @@ bool parse_args(int argc, char **argv, ServerOptions &o) {
         usage(argv[0]);
         return false;
     }
-    o.runtime.temperature = 0.0f;
-    o.runtime.top_k = 0;
-    o.runtime.top_p = 0.0f;
+    o.runtime.sampling.temperature = 0.0f;
+    o.runtime.sampling.top_k = 0;
+    o.runtime.sampling.top_p = 0.0f;
     return true;
+}
+
+bool read_float_field(const json &req, const char *name, float &out,
+                      std::string &error) {
+    if (!req.contains(name))
+        return true;
+    if (!req[name].is_number()) {
+        error = std::string(name) + " must be a number";
+        return false;
+    }
+    const double value = req[name].get<double>();
+    if (!std::isfinite(value)) {
+        error = std::string(name) + " must be finite";
+        return false;
+    }
+    out = static_cast<float>(value);
+    return true;
+}
+
+bool read_int_field(const json &req, const char *name, int &out,
+                    std::string &error) {
+    if (!req.contains(name))
+        return true;
+    if (!req[name].is_number_integer()) {
+        error = std::string(name) + " must be an integer";
+        return false;
+    }
+    const long long value = req[name].get<long long>();
+    if (value < std::numeric_limits<int>::min() ||
+        value > std::numeric_limits<int>::max()) {
+        error = std::string(name) + " is out of range";
+        return false;
+    }
+    out = static_cast<int>(value);
+    return true;
+}
+
+bool parse_sampling_params(const json &req, const SamplingParams &defaults,
+                           SamplingParams &params, std::string &error) {
+    params = defaults;
+    if (!read_float_field(req, "temperature", params.temperature, error) ||
+        !read_int_field(req, "top_k", params.top_k, error) ||
+        !read_float_field(req, "top_p", params.top_p, error) ||
+        !read_float_field(req, "min_p", params.min_p, error) ||
+        !read_float_field(req, "repeat_penalty", params.repeat_penalty,
+                          error) ||
+        !read_int_field(req, "repeat_last_n", params.repeat_last_n, error) ||
+        !read_float_field(req, "presence_penalty",
+                          params.presence_penalty, error) ||
+        !read_float_field(req, "frequency_penalty",
+                          params.frequency_penalty, error)) {
+        return false;
+    }
+    if (req.contains("seed")) {
+        if (!req["seed"].is_number_integer()) {
+            error = "seed must be a non-negative integer";
+            return false;
+        }
+        const long long seed = req["seed"].get<long long>();
+        if (seed < 0 ||
+            static_cast<unsigned long long>(seed) >
+                std::numeric_limits<unsigned int>::max()) {
+            error = "seed is out of range";
+            return false;
+        }
+        params.seed = static_cast<unsigned int>(seed);
+    }
+    return validate_sampling_params(params, &error);
 }
 
 bool send_all(int fd, const std::string &s) {
@@ -224,7 +294,8 @@ size_t common_prefix(const std::vector<int> &a, const std::vector<int> &b) {
 class Server {
   public:
     Server(LLMEngine &e, const Tokenizer &t, std::string model)
-        : engine(e), tokenizer(t), model_id(std::move(model)) {}
+        : engine(e), tokenizer(t), model_id(std::move(model)),
+          sampling_defaults(e.sampling_params()) {}
 
     void handle(int fd, const std::string &method, const std::string &path,
                 const std::string &body) {
@@ -247,12 +318,11 @@ class Server {
             send_error(fd, 400, ex.what(), "invalid_request_error");
             return;
         }
-        if (req.contains("temperature") &&
-            (!req["temperature"].is_number() ||
-             req["temperature"].get<double>() != 0.0)) {
-            send_error(fd, 400,
-                       "this server currently supports temperature=0 only",
-                       "invalid_request_error");
+        SamplingParams sampling;
+        std::string sampling_error;
+        if (!parse_sampling_params(req, sampling_defaults, sampling,
+                                   sampling_error)) {
+            send_error(fd, 400, sampling_error, "invalid_request_error");
             return;
         }
         std::vector<ChatMessage> messages;
@@ -301,6 +371,10 @@ class Server {
             return;
         }
         max_tokens = std::min(max_tokens, available);
+        if (!engine.set_sampling_params(sampling, &sampling_error)) {
+            send_error(fd, 400, sampling_error, "invalid_request_error");
+            return;
+        }
         bool stream = req.value("stream", false);
         GenerationResult result;
         std::string error;
@@ -318,8 +392,9 @@ class Server {
                                                       {{"content", piece}}, nullptr));
             };
         }
-        bool ok = generate_greedy(engine, tokenizer, delta, max_tokens,
-                                  tokenizer.eos_id(), result, error, on_token, false);
+        bool ok = generate_tokens(engine, tokenizer, delta, max_tokens,
+                                  tokenizer.eos_id(), result, error, on_token,
+                                  false);
         if (!ok) {
             engine.reset();
             cached_tokens.clear();
@@ -365,6 +440,7 @@ class Server {
     LLMEngine &engine;
     const Tokenizer &tokenizer;
     std::string model_id;
+    SamplingParams sampling_defaults;
     std::vector<int> cached_tokens;
 };
 

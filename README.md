@@ -241,6 +241,18 @@ One-shot deterministic smoke test:
     --temperature 0
 ```
 
+Sampled generation:
+
+```bash
+./build_i8mm/mollm_chat \
+    --package qwen35_4b_w4g128.mollm \
+    --temperature 0.8 --top-p 0.95 --top-k 40 --min-p 0.05 \
+    --repeat-penalty 1.05 --repeat-last-n 128 --seed 42
+```
+
+OpenAI-style `--presence-penalty` and `--frequency-penalty` are also
+available. Run `mollm_chat --help` for ranges and defaults.
+
 MoE chat:
 
 ```bash
@@ -274,9 +286,10 @@ Standard mollm benchmark:
 
 The initial server implements `GET /v1/models` and OpenAI-compatible
 `POST /v1/chat/completions`, including SSE streaming. It also retains a
-single exact token-prefix KV cache between serialized requests. Generation is
-currently deterministic (`temperature=0`). See [SERVER.md](SERVER.md)
-for API examples and limitations.
+single exact token-prefix KV cache between serialized requests. Sampling
+parameters can be set per request; the default remains deterministic
+(`temperature=0`). See [SERVER.md](SERVER.md) for fields, examples, and
+limitations.
 
 ## Project Layout
 

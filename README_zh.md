@@ -183,6 +183,18 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
     --temperature 0
 ```
 
+采样生成：
+
+```bash
+./build_i8mm/mollm_chat \
+    --package qwen35_4b_w4g128.mollm \
+    --temperature 0.8 --top-p 0.95 --top-k 40 --min-p 0.05 \
+    --repeat-penalty 1.05 --repeat-last-n 128 --seed 42
+```
+
+同时支持 OpenAI 风格的 `--presence-penalty` 与
+`--frequency-penalty`。参数范围和默认值可通过 `mollm_chat --help` 查看。
+
 默认情况下，`mollm_chat` 以 resident 模式加载包内权重。若需 mmap A/B 测试，传入 `--mmap`；默认 mmap 页面 warmup 已启用，可搭配 `--no-load-warmup` 关闭。
 
 ## 基准测试
@@ -204,7 +216,7 @@ W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。
     --host 127.0.0.1 --port 8080 --threads 4
 ```
 
-初始 server 提供 `GET /v1/models` 和 OpenAI 兼容的 `POST /v1/chat/completions`（含 SSE streaming）。它在串行请求间保留一个精确 token-prefix KV cache。生成当前为确定性模式（`temperature=0`）。详见 [SERVER.md](SERVER.md) 的 API 示例与限制。
+初始 server 提供 `GET /v1/models` 和 OpenAI 兼容的 `POST /v1/chat/completions`（含 SSE streaming）。它在串行请求间保留一个精确 token-prefix KV cache。每个请求均可指定采样参数；默认仍为确定性的 `temperature=0`。详见 [SERVER.md](SERVER.md) 的字段、示例与限制。
 
 ## 项目结构
 

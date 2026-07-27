@@ -293,7 +293,7 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
     GenerationResult result;
     std::string error;
     TokenStreamPrinter stream;
-    bool ok = generate_greedy(
+    bool ok = generate_tokens(
         engine, tokenizer, prompt_ids, max_new_tokens, tokenizer.eos_id(), result,
         error,
         [&](int, const std::string& piece) {
@@ -340,7 +340,7 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     TokenStreamPrinter stream;
     // reset_context=false: multi-turn, keep the KV cache and prefill only the
     // prompt suffix that was not already consumed by previous turns.
-    bool ok = generate_greedy(
+    bool ok = generate_tokens(
         engine, tokenizer, prompt_delta, max_new_tokens, tokenizer.eos_id(), result,
         error,
         [&](int, const std::string& piece) {

@@ -84,7 +84,7 @@ int main(int argc, char** argv) {
     fp16_cfg.n_ctx = 512;
     fp16_cfg.rope_dim = 64;
     fp16_cfg.rope_theta = 1600000.f;
-    fp16_cfg.temperature = 0.0f;
+    fp16_cfg.sampling.temperature = 0.0f;
     bool fp16_ok = fp16.load(fp16_cfg);
     CHECK(fp16_ok, "FP16 baseline engine load");
 
@@ -94,7 +94,7 @@ int main(int argc, char** argv) {
     quant_cfg.n_ctx = 512;
     quant_cfg.rope_dim = 64;
     quant_cfg.rope_theta = 1600000.f;
-    quant_cfg.temperature = 0.0f;
+    quant_cfg.sampling.temperature = 0.0f;
     bool quant_ok = quant.load(quant_cfg);
     CHECK(quant_ok, "quantized engine load");
 

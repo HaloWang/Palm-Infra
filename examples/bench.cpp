@@ -416,7 +416,7 @@ int main(int argc, char** argv) {
     for (int i = 0; i < opts.warmup; i++) {
         GenerationResult warmup_result;
         std::string warmup_error;
-        if (!generate_greedy(engine, tokenizer, prompt_ids, opts.max_new_tokens,
+        if (!generate_tokens(engine, tokenizer, prompt_ids, opts.max_new_tokens,
                              benchmark_eos_id, warmup_result, warmup_error)) {
             std::fprintf(stderr, "bench warmup failed: %s\n", warmup_error.c_str());
             return 1;
@@ -434,7 +434,7 @@ int main(int argc, char** argv) {
 
     GenerationResult result;
     auto total_start = std::chrono::steady_clock::now();
-    if (!generate_greedy(engine, tokenizer, prompt_ids, opts.max_new_tokens,
+    if (!generate_tokens(engine, tokenizer, prompt_ids, opts.max_new_tokens,
                          benchmark_eos_id, result, error)) {
         std::fprintf(stderr, "bench: %s\n", error.c_str());
         return 1;

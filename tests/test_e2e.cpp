@@ -151,7 +151,7 @@ int main(int argc, char** argv) {
     cfg2.n_ctx = 512;
     cfg2.rope_dim = 64;
     cfg2.rope_theta = 1600000.f;
-    cfg2.temperature = 0.0f;  // greedy for deterministic output
+    cfg2.sampling.temperature = 0.0f;  // greedy for deterministic output
 
     ok = eng2.load(cfg2);
     CHECK(ok, "engine load qwen35 package (for prefill+decode)");

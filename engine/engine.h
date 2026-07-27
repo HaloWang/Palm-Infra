@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "graph/execute.h"
 #include "engine/backend.h"
+#include "engine/sampler.h"
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
 #include "kernels/moe_ssd.h"
@@ -111,11 +112,7 @@ struct EngineConfig {
     // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
     std::string trace_path;
 
-    // Sampling params
-    float temperature = 0.6f;         // 0 = greedy (argmax)
-    int top_k = 50;                   // 0 = disabled
-    float top_p = 0.9f;              // 0 = disabled
-    unsigned int seed = 42;          // random seed for sampling
+    SamplingParams sampling;
 
     // Output-only: set by load() when package contains a tokenizer.
     // Callers (e.g. CLI) read this to load the Tokenizer after engine.load().
@@ -161,6 +158,13 @@ public:
     void reset();
 
     const EngineConfig& config() const { return cfg_; }
+    const SamplingParams& sampling_params() const { return sampler_.params(); }
+    bool set_sampling_params(const SamplingParams& params,
+                             std::string* error = nullptr) {
+        if (!sampler_.configure(params, error, true)) return false;
+        cfg_.sampling = params;
+        return true;
+    }
     int past_len() const { return past_len_; }
     // Package-level metadata fields (model_name, architecture, quantization,
     // num_layers, hidden_size, num_heads, n_ctx, vocab_size, prefill_seq_len).
@@ -223,6 +227,7 @@ private:
     void prepare_metal_prefill_weights();
 
     EngineConfig cfg_;
+    Sampler sampler_;
     Graph graph_prefill_;
     Graph graph_decode_;
     ExecContext exec_ctx_prefill_;

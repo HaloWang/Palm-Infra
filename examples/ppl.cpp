@@ -228,7 +228,7 @@ int main(int argc, char** argv) {
     cfg.package_path = opts.package_path;
     cfg.n_ctx = opts.n_ctx;
     cfg.num_threads = opts.threads;
-    cfg.temperature = 0.0f;
+    cfg.sampling.temperature = 0.0f;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;

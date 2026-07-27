@@ -209,6 +209,7 @@ void LLMEngine::reset() {
     invalidate_workspace_key(exec_ctx_decode_);
     clear_graph_borrowed_views(graph_prefill_);
     past_len_ = 0;
+    sampler_.reset();
     // KV cache: only clear metadata header (current_seq_len = 0).
     // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
     // per layer, and GDN reads stale state without causal mask protection).
@@ -370,8 +371,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
         // decode N+1.
         mollm_trace::ScopedEvent trace_sampler("inference", "sampler", {},
                                                "rail_response");
-        token = sample_token(scores, vocab_size, cfg_.temperature, cfg_.top_k,
-                             cfg_.top_p, &cfg_.seed);
+        token = sampler_.sample(scores, vocab_size);
     }
 
     release_pool_tensor(graph_prefill_.runtime.pool, C);
@@ -580,6 +580,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    sampler_.accept(token_ids);
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
@@ -877,6 +878,7 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
 
 int LLMEngine::decode(int token_id) {
     mollm_trace::ScopedEvent trace_decode("inference", "decode");
+    sampler_.accept(token_id);
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
