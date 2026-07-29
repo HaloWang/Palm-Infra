@@ -26,6 +26,12 @@ class ThreadPool;
 
 namespace mollm::cpu {
 
+enum class X86Isa : uint8_t {
+    SCALAR = 0,
+    AVX2 = 1,
+    AVX512 = 2,
+};
+
 #if MOLLM_CPU_ARM_NEON
 using fp16_t = __fp16;
 #else
@@ -44,9 +50,12 @@ struct Capabilities {
     bool x86_avx2 = false;
     bool x86_fma = false;
     bool x86_f16c = false;
+    bool x86_avx512 = false;
+    X86Isa x86_isa = X86Isa::SCALAR;
 };
 
 const Capabilities& capabilities();
+const char* isa_name();
 
 // Hint while polling a CPU worker.  The ARM and scalar implementations live
 // in separately selected translation units so no foreign assembly reaches a
@@ -60,8 +69,9 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
                         int ldc, ThreadPool* thread_pool);
 
 // Architecture-provider dense kernels. Returning false asks the caller to use
-// the portable scalar implementation. The x86 provider dispatches these to a
-// separately compiled AVX2/FMA/F16C translation unit after runtime probing.
+// the portable scalar implementation. The x86 provider binds these to
+// separately compiled AVX2 or AVX-512 translation units after one runtime
+// probe.
 bool matmul_dense_fp32_range(const float* A, const float* B, float* C, int N,
                              int K, int lda, int K_weight, int ldc,
                              int m_begin, int m_end);
