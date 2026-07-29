@@ -6,14 +6,26 @@ on:
 
 jobs:
   build-and-test:
+    name: macOS ARM64 (${{ matrix.name }})
     strategy:
+      fail-fast: false
       matrix:
-        os: [macos-latest]
-    runs-on: ${{ matrix.os }}
+        include:
+          - name: i8mm-auto
+            arm_i8mm: AUTO
+          - name: no-i8mm
+            arm_i8mm: OFF
+    runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Verify ARM64 runner
+        run: test "$(uname -m)" = arm64
       - name: Configure
-        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DMOLLM_BUILD_TESTS=ON
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=Release
+          -DMOLLM_BUILD_TESTS=ON
+          -DMOLLM_ARM_I8MM=${{ matrix.arm_i8mm }}
       - name: Build
         run: cmake --build build -j 2
       - name: Test

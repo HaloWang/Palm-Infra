@@ -1014,6 +1014,39 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
 #else
     bool can_use_q4_i8mm = false;
 #endif
+    // Direct BG32 packages do not retain the original row-major INT4 bytes
+    // or a separate scale array.  Without i8mm, run the existing DOTPROD
+    // GEMV kernel once per input row instead of falling through to the
+    // generic GEMM path with null B/scales pointers.
+    if (M > 1 && B.is_q4_g32_packed && can_use_q4_bg32 &&
+        !can_use_q4_i8mm) {
+        timer.set_shape("q4dot_gemm_bg32_rowwise", M, N, K, group_size,
+                        groups_per_row, true, false, n_threads);
+        auto run_rows = [&](int m_begin, int m_end) {
+            static thread_local Q4GemvScratch scratch;
+            for (int m = m_begin; m < m_end; ++m) {
+                quantize_a_q8_blocks_even_odd(
+                    a_ptr + static_cast<size_t>(m) * lda, K, scratch.qA_even,
+                    scratch.qA_odd, scratch.a_scales);
+                matmul_int4_q8dot_neon_gemv_g32_range(
+                    scratch.qA_even.data(), scratch.qA_odd.data(),
+                    scratch.a_scales.data(), b_q4_g32,
+                    c_ptr + static_cast<size_t>(m) * ldc, K, 0, N);
+            }
+        };
+        if (use_parallel) {
+            thread_pool->parallel_for(
+                0, M, 1, [&](int, int m_begin, int m_end) {
+                    run_rows(m_begin, m_end);
+                });
+        } else {
+            run_rows(0, M);
+        }
+        if (act != Activation::NONE && act_n_len != 0)
+            matmul_apply_activation(c_ptr, M, N, ldc, 0, M, act,
+                                    act_n_begin, act_n_len);
+        return;
+    }
     if (M == 1 && can_use_q4_dot) {
         bool use_q4_gemv_bg128 = can_use_q4_bg128;
         bool use_q4_gemv_bg32 = can_use_q4_bg32;
