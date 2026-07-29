@@ -504,7 +504,9 @@ int main(int argc, char** argv) {
         cfg.dsv4_grouped ? run_dsv4_grouped_bench(cfg) : run_bench(cfg);
 
     if (!cfg.dsv4_grouped) {
-        std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
+        std::printf("M=%d K=%d N=%d threads=%d isa=%s prec=%s\n",
+                    cfg.M, cfg.K, cfg.N, cfg.num_threads,
+                    mollm::cpu::isa_name(),
                     cfg.use_mxfp4 ? "MXFP4" :
                     cfg.use_int4 ? "INT4" :
                     cfg.use_int8 ? "INT8" :

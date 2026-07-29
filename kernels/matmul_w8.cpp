@@ -1364,7 +1364,9 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 
-    timer.set_shape(mollm::cpu::capabilities().x86_avx2 && !b_interleaved
+    timer.set_shape(mollm::cpu::capabilities().x86_avx512 && !b_interleaved
+                        ? "int8_avx512"
+                    : mollm::cpu::capabilities().x86_avx2 && !b_interleaved
                         ? "int8_avx2"
                         : "int8_scalar",
                     M, N, K, group_size, groups_per_row,

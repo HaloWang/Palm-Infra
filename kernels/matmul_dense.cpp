@@ -1200,9 +1200,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     // Decide sharding dimension adaptively, similar to ggml:
     //   If N >> M, shard by N (e.g. lm_head: M=1, N=vocab_size).
     //   Otherwise shard by M (the common case).
-    bool shard_by_n =
-        (HAS_NEON || mollm::cpu::capabilities().x86_avx2) &&
-        (N > M * 8 && M == 1);
+    bool shard_by_n = N > M * 8 && M == 1;
 
     // Decide chunk size adaptively.
     // For GEMV-like shapes, use a larger chunk to reduce per-chunk overhead.

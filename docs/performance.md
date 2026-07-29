@@ -4,25 +4,34 @@ This page collects the CPU and Metal benchmark results used by the README.
 
 ## CPU
 
-### Linux x86_64 AVX2
+### Linux x86_64 runtime ISA dispatch
 
-The x86 provider is runtime-dispatched and can be disabled with
-`MOLLM_X86_DISABLE_AVX2=1` for correctness checks and baseline measurements.
+The x86 provider selects separately compiled scalar, AVX2, or AVX-512 kernels
+after runtime CPUID probing. `MOLLM_X86_ISA=scalar|avx2|avx512|auto` caps the
+selected tier; `MOLLM_X86_DISABLE_AVX2=1` remains a compatible scalar override.
+This keeps AVX instructions out of the baseline object code and allows all
+three paths to be tested from one binary.
+
 The table below uses an AMD Ryzen 9 9950X, eight threads, `M=1`, `K=2048`,
-`N=6144`, five warmups, 20 measured iterations, and average throughput.
+`N=6144`, five warmups, 30 measured iterations, and average throughput.
 
-| Weight format | Scalar | AVX2/FMA/F16C | Speedup |
+| Weight format | Scalar | AVX2 | AVX-512 |
 |---|---:|---:|---:|
-| FP32 | 5.9 GFLOP/s | **44.9 GFLOP/s** | 7.6x |
-| FP16 | 0.6 GFLOP/s | **408.1 GFLOP/s** | 680.2x |
-| W8G32 | 14.5 GFLOP/s | **270.4 GFLOP/s** | 18.6x |
-| W4G32 | 14.5 GFLOP/s | **226.6 GFLOP/s** | 15.6x |
-| W4G128 | 15.5 GFLOP/s | **304.5 GFLOP/s** | 19.6x |
+| FP32 | 34.5 GFLOP/s | **43.5 GFLOP/s** | 41.5 GFLOP/s |
+| FP16 | 4.3 GFLOP/s | **374.3 GFLOP/s** | 337.7 GFLOP/s |
+| W8G32 | 14.4 GFLOP/s | 265.7 GFLOP/s | **338.8 GFLOP/s** |
+| W4G32 | 13.7 GFLOP/s | 227.7 GFLOP/s | **265.6 GFLOP/s** |
+| W4G128 | 14.4 GFLOP/s | 272.7 GFLOP/s | **436.0 GFLOP/s** |
 
-A real Qwen3.5-0.8B W4G32 greedy run produced identical text with AVX2 and
-the forced scalar fallback. On the same host, the measured prefill/decode
-rates were 117.7/75.6 tok/s with AVX2 and 13.1/9.1 tok/s with scalar code.
-These are development measurements rather than a cross-runtime comparison.
+Quantized M>1 kernels reuse each unpacked weight vector across four activation
+rows. At `M=32` and 16 threads this reaches 585.0/823.3 GFLOP/s for AVX2
+W4G32/W4G128 and 704.4/1091.8 GFLOP/s for AVX-512.
+
+A Qwen3.5-0.8B W4G32 `pp256 + tg64` run at 16 threads reaches
+195.52/82.26 tok/s with AVX2 and 203.28/88.19 tok/s with AVX-512. A separate
+greedy generation check produced byte-identical text across scalar, AVX2, and
+AVX-512. These are development measurements rather than a cross-runtime
+comparison.
 
 ### Apple Silicon
 

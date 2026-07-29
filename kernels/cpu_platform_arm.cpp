@@ -10,6 +10,10 @@ const Capabilities& capabilities() {
     return value;
 }
 
+const char* isa_name() {
+    return "arm-neon";
+}
+
 void relax() {
     __asm__ __volatile__("yield" ::: "memory");
 }

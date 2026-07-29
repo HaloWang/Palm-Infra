@@ -22,10 +22,13 @@ then runs that package directly.
 
 The current focus is fast local inference on Apple Silicon and other modern ARM
 CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
-or int4 kernels optimized for ARM dot-product instructions. Linux x86_64 has an
-experimental runtime-dispatched AVX2/FMA/F16C provider for FP32, FP16, W8, and
-packed W4G32/W4G128 matmul. Set `MOLLM_X86_DISABLE_AVX2=1` to exercise the
-portable scalar fallback.
+or int4 kernels optimized for ARM dot-product instructions. Linux x86_64 has
+separately compiled scalar, AVX2/FMA/F16C, and AVX-512 providers for FP32,
+FP16, W8, and packed W4G32/W4G128 matmul. Runtime CPUID dispatch selects the
+widest supported tier without exposing newer instructions to older CPUs.
+Set `MOLLM_X86_ISA=scalar|avx2|avx512|auto` to cap the selected tier for
+testing or machine-specific tuning. The legacy
+`MOLLM_X86_DISABLE_AVX2=1` scalar override remains supported.
 
 ## Now it runs a 122B model on a 48GB Mac (Or even 16GB)
 

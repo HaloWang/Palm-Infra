@@ -3,34 +3,89 @@
 #include "kernels/matmul_internal.h"
 #include "kernels/threading.h"
 #include "kernels/x86_avx2.h"
+#include "kernels/x86_avx512.h"
 
 #include <algorithm>
 #include <cstdlib>
+#include <cstring>
 #include <immintrin.h>
 
 namespace mollm::cpu {
 
-const Capabilities& capabilities() {
-    static const Capabilities value = [] {
-        Capabilities caps;
+namespace {
+
+using DenseFp32Fn = void (*)(const float*, const float*, float*, int, int, int,
+                             int, int, int, int);
+using DenseFp16Fn = void (*)(const float*, const fp16_t*, float*, int, int, int,
+                             int, int, int, int);
+using Int4Fn = void (*)(const Tensor&, const Tensor&, Tensor&, int, int, int,
+                        int, int, int);
+using Int8Fn = void (*)(const float*, const int8_t*, const float*, float*, int,
+                        int, int, int, int, int, int, int, int, int, int);
+
+struct X86Dispatch {
+    Capabilities caps;
+    const char* name = "x86-scalar";
+    DenseFp32Fn fp32 = nullptr;
+    DenseFp16Fn fp16 = nullptr;
+    Int4Fn int4 = nullptr;
+    Int8Fn int8 = nullptr;
+};
+
+X86Dispatch detect_dispatch() {
+    X86Dispatch dispatch;
 #if defined(__GNUC__) || defined(__clang__)
-        if (!std::getenv("MOLLM_X86_DISABLE_AVX2")) {
-            __builtin_cpu_init();
-            caps.x86_avx2 = __builtin_cpu_supports("avx2");
-            caps.x86_fma = __builtin_cpu_supports("fma");
-            caps.x86_f16c = __builtin_cpu_supports("f16c");
-        }
+    __builtin_cpu_init();
+    const bool has_avx2 = __builtin_cpu_supports("avx2");
+    const bool has_fma = __builtin_cpu_supports("fma");
+    const bool has_f16c = __builtin_cpu_supports("f16c");
+    const bool has_avx512 = __builtin_cpu_supports("avx512f");
+
+    const char* requested = std::getenv("MOLLM_X86_ISA");
+    const bool force_scalar =
+        std::getenv("MOLLM_X86_DISABLE_AVX2") != nullptr ||
+        (requested && std::strcmp(requested, "scalar") == 0);
+    const bool cap_at_avx2 =
+        requested && std::strcmp(requested, "avx2") == 0;
+    const bool allow_avx512 =
+        !cap_at_avx2 &&
+        (!requested || std::strcmp(requested, "auto") == 0 ||
+         std::strcmp(requested, "avx512") == 0);
+
+    if (!force_scalar && allow_avx512 && has_avx512 && has_fma) {
+        dispatch.caps.x86_avx2 = has_avx2;
+        dispatch.caps.x86_fma = true;
+        dispatch.caps.x86_f16c = has_f16c;
+        dispatch.caps.x86_avx512 = true;
+        dispatch.caps.x86_isa = X86Isa::AVX512;
+        dispatch.name = "x86-avx512";
+        dispatch.fp32 = x86::matmul_fp32_avx512_range;
+        if (has_f16c)
+            dispatch.fp16 = x86::matmul_fp16_avx512_range;
+        dispatch.int4 = x86::matmul_int4_bg_avx512_range;
+        dispatch.int8 = x86::matmul_int8_avx512_range;
+        return dispatch;
+    }
+    if (!force_scalar && has_avx2 && has_fma) {
+        dispatch.caps.x86_avx2 = true;
+        dispatch.caps.x86_fma = true;
+        dispatch.caps.x86_f16c = has_f16c;
+        dispatch.caps.x86_isa = X86Isa::AVX2;
+        dispatch.name = "x86-avx2";
+        dispatch.fp32 = x86::matmul_fp32_avx2_range;
+        if (has_f16c)
+            dispatch.fp16 = x86::matmul_fp16_avx2_range;
+        dispatch.int4 = x86::matmul_int4_bg_avx2_range;
+        dispatch.int8 = x86::matmul_int8_avx2_range;
+    }
 #endif
-        return caps;
-    }();
+    return dispatch;
+}
+
+const X86Dispatch& dispatch() {
+    static const X86Dispatch value = detect_dispatch();
     return value;
 }
-
-void relax() {
-    _mm_pause();
-}
-
-namespace {
 
 int8_t unpack_int4_signed(uint8_t byte, bool high_nibble) {
     int value = high_nibble ? ((byte >> 4) & 0x0F) : (byte & 0x0F);
@@ -38,6 +93,18 @@ int8_t unpack_int4_signed(uint8_t byte, bool high_nibble) {
 }
 
 }  // namespace
+
+const Capabilities& capabilities() {
+    return dispatch().caps;
+}
+
+const char* isa_name() {
+    return dispatch().name;
+}
+
+void relax() {
+    _mm_pause();
+}
 
 bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
                         int ldc, ThreadPool* thread_pool) {
@@ -54,13 +121,13 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
     if ((!is_q4dot && !is_bg32 && !is_bg128) || groups <= 0)
         return false;
 
-    const bool use_avx2 =
-        capabilities().x86_avx2 && capabilities().x86_fma &&
-        (is_bg32 || is_bg128) && (K % static_cast<int>(B.group_size) == 0);
+    const auto int4_kernel = dispatch().int4;
+    const bool use_simd =
+        int4_kernel && (is_bg32 || is_bg128) &&
+        (K % static_cast<int>(B.group_size) == 0);
     auto run_range = [&](int m_begin, int m_end, int n_begin, int n_end) {
-        if (use_avx2) {
-            x86::matmul_int4_bg_avx2_range(
-                A, B, C, lda, ldc, m_begin, m_end, n_begin, n_end);
+        if (use_simd) {
+            int4_kernel(A, B, C, lda, ldc, m_begin, m_end, n_begin, n_end);
             return;
         }
         for (int m = m_begin; m < m_end; ++m) {
@@ -136,22 +203,20 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
 bool matmul_dense_fp32_range(const float* A, const float* B, float* C, int N,
                              int K, int lda, int K_weight, int ldc,
                              int m_begin, int m_end) {
-    const auto& caps = capabilities();
-    if (!caps.x86_avx2 || !caps.x86_fma)
+    const auto kernel = dispatch().fp32;
+    if (!kernel)
         return false;
-    x86::matmul_fp32_avx2_range(A, B, C, N, K, lda, K_weight, ldc, m_begin,
-                                m_end);
+    kernel(A, B, C, N, K, lda, K_weight, ldc, m_begin, m_end);
     return true;
 }
 
 bool matmul_dense_fp16_range(const float* A, const fp16_t* B, float* C, int N,
                              int K, int lda, int K_weight, int ldc,
                              int m_begin, int m_end, bool interleaved) {
-    const auto& caps = capabilities();
-    if (interleaved || !caps.x86_avx2 || !caps.x86_fma || !caps.x86_f16c)
+    const auto kernel = dispatch().fp16;
+    if (interleaved || !kernel)
         return false;
-    x86::matmul_fp16_avx2_range(A, B, C, N, K, lda, K_weight, ldc, m_begin,
-                                m_end);
+    kernel(A, B, C, N, K, lda, K_weight, ldc, m_begin, m_end);
     return true;
 }
 
@@ -160,12 +225,11 @@ bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
                        int groups_per_row, int lda, int K_weight, int ldc,
                        int m_begin, int m_end, int n_begin, int n_end,
                        bool interleaved) {
-    const auto& caps = capabilities();
-    if (interleaved || !caps.x86_avx2 || !caps.x86_fma)
+    const auto kernel = dispatch().int8;
+    if (interleaved || !kernel)
         return false;
-    x86::matmul_int8_avx2_range(
-        A, B, scales, C, N, K, group_size, groups_per_row, lda, K_weight, ldc,
-        m_begin, m_end, n_begin, n_end);
+    kernel(A, B, scales, C, N, K, group_size, groups_per_row, lda, K_weight,
+           ldc, m_begin, m_end, n_begin, n_end);
     return true;
 }
 

@@ -12,6 +12,10 @@ const Capabilities& capabilities() {
     return value;
 }
 
+const char* isa_name() {
+    return "scalar";
+}
+
 void relax() {
     // Correctness-first backend: yielding avoids embedding an architecture
     // instruction in common worker-pool code.  An x86 microkernel provider
