@@ -5,6 +5,8 @@
 #include <cstdint>
 #include <vector>
 
+#ifndef MOLLM_W8_I8MM_ONLY
+
 static void matmul_int8_scalar_range(const float* A, const int8_t* B,
                                      const float* scales, int group_size,
                                      int groups_per_row, float* C, int M, int N,
@@ -83,7 +85,10 @@ static void matmul_int8_q8dot_scalar_range(
     }
 }
 
+#endif  // MOLLM_W8_I8MM_ONLY
+
 #if HAS_NEON
+#ifndef MOLLM_W8_I8MM_ONLY
 static void matmul_int8_neon_gemv_range(const float* A, const int8_t* B_packed,
                                         const float* scales, int group_size,
                                         int groups_per_row, float* C, int K,
@@ -399,7 +404,10 @@ static void matmul_int8_q8dot_neon_4x8_range(
     }
 }
 
+#endif  // MOLLM_W8_I8MM_ONLY
+
 #if defined(__ARM_FEATURE_DOTPROD)
+#ifndef MOLLM_W8_I8MM_ONLY
 static void matmul_int8_q8dot_neon_gemv_repacked_range(
     const int8_t* qA, const float* a_scales, const int8_t* B_repack,
     const float* scales, int group_size, int groups_per_row, float* C, int K,
@@ -578,8 +586,10 @@ static void matmul_int8_q8dot_neon_4x8_repacked_range(
     }
 }
 
+#endif  // MOLLM_W8_I8MM_ONLY
+
 #if defined(__ARM_FEATURE_MATMUL_INT8)
-static void matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
+void matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
     const int8_t* qA, const float* a_scales, const int8_t* B_repack,
     const float* scales, int group_size, int groups_per_row, float* C, int M,
     int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
@@ -827,7 +837,7 @@ static inline void w8_i8mm_8x4_dot_rows(const int8_t* qa_block, int K_padded,
     rows[7] = vcombine_s32(vget_high_s32(acc67_01), vget_high_s32(acc67_23));
 }
 
-static void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
+void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
     const int8_t* qA, const float* a_scales, const int8_t* B_repack,
     const float* scales, int group_size, int groups_per_row, float* C, int M,
     int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
@@ -950,6 +960,8 @@ static void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
 #endif
 #endif
 #endif
+
+#ifndef MOLLM_W8_I8MM_ONLY
 
 bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
                                    const std::vector<Tensor>& weights,
@@ -1179,8 +1191,10 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
     if (use_q8_dot_gemm) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-        bool use_q8_dot_gemm_i8mm = use_q8_dot_gemm_repack;
+#if MOLLM_ARM_I8MM_KERNELS
+        bool use_q8_dot_gemm_i8mm =
+            mollm::cpu::capabilities().arm_i8mm &&
+            use_q8_dot_gemm_repack;
         bool use_q8_dot_gemm_i8mm_8x8 = use_q8_dot_gemm_i8mm;
 #else
         bool use_q8_dot_gemm_i8mm = false;
@@ -1218,7 +1232,7 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
 #if defined(__ARM_FEATURE_DOTPROD)
         auto run_repacked_q8_gemm = [&](int m_begin, int m_end, int n_begin,
                                         int n_end) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if MOLLM_ARM_I8MM_KERNELS
             if (use_q8_dot_gemm_i8mm_8x8) {
                 matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
                     qA_data, a_scales_data, b_q8_repack, scales, group_size,
@@ -1398,3 +1412,5 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
     }
     return;
 }
+
+#endif  // MOLLM_W8_I8MM_ONLY

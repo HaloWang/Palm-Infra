@@ -141,7 +141,7 @@ python3 models/converter.py /path/to/Qwen3.5-4B qwen35_4b_w4g128.mollm w4g128
 
 依赖：
 
-- macOS/Apple Silicon 或 ARM Linux
+- macOS/Apple Silicon、ARM Linux 或 Linux x86_64
 - CMake 与 Ninja 或 Make
 - Python 3
 - 转换所需的 Python 包，主要是 `numpy` 与 `safetensors`
@@ -153,7 +153,7 @@ cmake -G Ninja -B build_i8mm -DCMAKE_BUILD_TYPE=Release
 cmake --build build_i8mm -j
 ```
 
-若编译器和 CPU 支持 ARM i8mm，构建系统会自动启用更快的 int8 GEMM 路径。普通 `build/` 目录也可以使用；将示例中的 `build_i8mm` 替换为对应目录即可。
+在 ARM64 上，支持 i8mm 的编译器会把优化 kernel 作为独立 object 嵌入；运行时通过 HWCAP/sysctl 仅在兼容 CPU 上选用，库的其余部分仍保持 NEON/DOTPROD baseline。`MOLLM_ARM_I8MM=OFF` 会完全移除 i8mm object，`MOLLM_ARM_ISA=neon` 可在测试时强制走 fallback。普通 `build/` 目录也可以使用；将示例中的 `build_i8mm` 替换为对应目录即可。
 
 ## 转换模型
 

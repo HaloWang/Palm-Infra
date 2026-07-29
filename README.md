@@ -191,7 +191,7 @@ Interactive chat commands:
 
 Requirements:
 
-- macOS/Apple Silicon or ARM Linux
+- macOS/Apple Silicon, ARM Linux, or Linux x86_64
 - CMake + Ninja or Make
 - Python 3
 - Python packages needed by conversion, especially `numpy` and `safetensors`
@@ -203,9 +203,13 @@ cmake -G Ninja -B build_i8mm -DCMAKE_BUILD_TYPE=Release
 cmake --build build_i8mm -j
 ```
 
-If your compiler/CPU supports ARM i8mm, the build system enables the faster int8
-GEMM path automatically. A plain `build/` directory also works; replace
-`build_i8mm` in the examples with your build directory.
+On ARM64, a compiler with i8mm support embeds the optimized kernels as separate
+objects. Runtime HWCAP/sysctl probing selects them only on a compatible CPU;
+the rest of the library remains on the NEON/DOTPROD baseline.
+`MOLLM_ARM_I8MM=OFF` omits the i8mm objects, while
+`MOLLM_ARM_ISA=neon` forces the runtime fallback for testing. A plain `build/`
+directory also works; replace `build_i8mm` in the examples with your build
+directory.
 
 ## Convert Models
 

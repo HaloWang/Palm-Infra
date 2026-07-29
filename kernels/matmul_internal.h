@@ -145,7 +145,7 @@ void quantize_a_q8_blocks_a4(const float* A, int M, int K, int lda,
                              std::vector<Q8A4Block>& qA4);
 void quantize_a_q8_blocks_i8mm_a8(const float* A, int M, int K, int lda,
                                   std::vector<Q8A8I8MMBlock>& qA8);
-#if HAS_NEON && defined(__ARM_FEATURE_MATMUL_INT8)
+#if HAS_NEON && MOLLM_ARM_I8MM_KERNELS
 void matmul_int4_i8mm_g128(const Q8A8I8MMBlock* qA8,
                            const Q4B8G128Block* B_g128, float* C, int M,
                            int N, int K, int ldc, int m_begin, int m_end,
@@ -154,6 +154,16 @@ void matmul_int4_i8mm_g32(const Q8A8I8MMBlock* qA8,
                           const Q4B8G32Block* B_g32, float* C, int M, int N,
                           int K, int ldc, int m_begin, int m_end, int n_begin,
                           int n_end);
+void matmul_int8_q8dot_neon_4x8_repacked_i8mm_range(
+    const int8_t* qA, const float* a_scales, const int8_t* B_repack,
+    const float* scales, int group_size, int groups_per_row, float* C, int M,
+    int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
+    int n_end);
+void matmul_int8_q8dot_neon_8x8_repacked_i8mm_range(
+    const int8_t* qA, const float* a_scales, const int8_t* B_repack,
+    const float* scales, int group_size, int groups_per_row, float* C, int M,
+    int N, int K, int K_padded, int ldc, int m_begin, int m_end, int n_begin,
+    int n_end);
 #endif
 void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,
