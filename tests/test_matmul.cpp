@@ -1600,7 +1600,10 @@ int main() {
     }
 
     // Large FP16 matmul with the original row-major weight retained beside
-    // the interleaved CPU pack. On Apple this exercises Accelerate SGEMM.
+    // the interleaved CPU pack.  This is an exactness test for the sidecar
+    // path, so do not exercise the separately-tested FP16 accumulation mode.
+    // On Apple it exercises Accelerate SGEMM; on ARM it exercises the FP32
+    // accumulation NEON path.
     {
         int M=96,K=64,N=64;
         std::vector<float> a(M*K),w32(N*K),out(M*N),ref(M*N);
@@ -1614,7 +1617,10 @@ int main() {
         Tensor C=Tensor::create(Precision::FP32,MemoryType::EXTERNAL,N,M,1,1,out.data());
         B.is_interleaved=true; B.rowmajor_data=w16.data();
         ThreadPool pool(4);
+        const bool previous_force_fp32_acc = g_mollm_force_fp32_acc;
+        g_mollm_force_fp32_acc = true;
         kernel_matmul_fp32(A,B,C,&pool);
+        g_mollm_force_fp32_acc = previous_force_fp32_acc;
         ref_matmul(a.data(),w32.data(),ref.data(),M,N,K);
         CHECK(check_approx(out.data(),ref.data(),M*N,2e-4f),
               "FP16 large GEMM row-major sidecar");

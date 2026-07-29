@@ -128,6 +128,17 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     message(STATUS "Target: ARM64 (NEON enabled)")
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=1)
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
+    # FP16/FML vector arithmetic and DOTPROD are used by the regular NEON
+    # kernels regardless of whether i8mm is enabled. Linux GCC defaults to
+    # armv8-a, where those intrinsics are unavailable; keep this baseline
+    # separate from the i8mm tuning target so MOLLM_ARM_I8MM=OFF remains a
+    # valid build.
+    set(MOLLM_ARM_BASELINE_FLAGS "-march=armv8.2-a+dotprod+fp16+fp16fml")
+    if(APPLE)
+        # Apple arm64 targets already provide FP16 vector arithmetic, and
+        # Apple Clang does not need (or consistently accept) a GNU -march.
+        set(MOLLM_ARM_BASELINE_FLAGS "")
+    endif()
     if(MOLLM_ARM_NATIVE)
         message(STATUS "ARM64 native target enabled (-mcpu=native)")
         target_compile_options(mollm_lib PRIVATE -mcpu=native)
@@ -167,10 +178,16 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
                 "MOLLM_ARM_I8MM=ON requested, but compiler/target does not support "
                 "${MOLLM_ARM_I8MM_FLAGS} with __ARM_FEATURE_MATMUL_INT8")
         else()
-            message(STATUS "ARM64 i8mm target not available; using DOTPROD/NEON kernels")
+            message(STATUS "ARM64 i8mm target not available; using FP16 NEON kernels")
+            if(MOLLM_ARM_BASELINE_FLAGS)
+                target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_BASELINE_FLAGS})
+            endif()
         endif()
     else()
         message(STATUS "ARM64 i8mm target disabled by MOLLM_ARM_I8MM=OFF")
+        if(MOLLM_ARM_BASELINE_FLAGS)
+            target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_BASELINE_FLAGS})
+        endif()
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")
