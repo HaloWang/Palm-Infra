@@ -29,27 +29,58 @@ or int4 kernels optimized for ARM dot-product instructions.
 `mollm` can run Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping
 dense weights in RAM and fetching only routed MoE experts from SSD. In the
 current 256-token cache sweep, a bounded, shared 16 GiB expert cache and
-cross-layer prefetching provide 16.22 t/s interactive decode.
+cross-layer prefetching provide 16.53 t/s interactive decode.
 
 The cache is configurable rather than tied to a resident copy of the model. In
 the following real-prompt sweep, the 1 GiB expert-cache configuration runs with
 only 5.90 GiB peak RSS; larger caches trade memory for fewer SSD reads and
 higher throughput.
 
-| Expert RAM cache | Decode | Peak RSS | Cache hit rate | SSD reads |
+| Expert RAM cache | Decode | Peak RSS | Cache hit rate | Avg. SSD reads / generated token |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
-| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
-| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
+| **1 GiB** | 12.38 t/s | **5.90 GiB** | 47.9% | 1.72 GB/token |
+| **10 GiB** | 16.19 t/s | 14.64 GiB | 83.5% | 0.75 GB/token |
+| **16 GiB** | **16.53 t/s** | 20.60 GiB | **88.6%** | **0.51 GB/token** |
 
 This sweep uses a 16-token real prompt, 256 generated tokens, greedy decoding,
 `warmup=0`, and three independent process runs per cache size. The rows were
-rerun on 2026-07-26. The 10 GiB cache is within 0.5% of the 16 GiB decode
+rerun on 2026-07-29. The 10 GiB cache is within 2.1% of the 16 GiB decode
 throughput while using about 6 GiB less peak RSS; 1 GiB demonstrates the
-low-memory operating point.
+low-memory operating point. SSD reads are logical routed-expert bytes loaded
+by demand or prefetch, divided by generated tokens; prompt prefill is included
+in the amortized value, while dense-weight and CPU-sidecar loading is excluded.
 
 See [Running 122B MoE models with SSD offload](docs/ssd-offload.md) for cache
 policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
+
+## Experimental DeepSeek-V4-Flash support
+
+`mollm` can convert the native DeepSeek-V4-Flash checkpoint without first
+expanding it to FP16. Quantized dense and shared-expert weights retain their
+native FP8 E4M3 data, while routed experts retain OCP MXFP4: packed E2M1 values
+with one E8M0 scale per 32 values. The 157 GB package uses the same bounded,
+asynchronous SSD expert offload path as other large MoE models.
+
+Current CPU-only results on an Apple M5 Pro:
+
+| Standard throughput | Expert RAM cache | Result |
+|---|---:|---:|
+| `pp256 + tg64` | 16 GiB | **9.35 pp / 4.74 tg** |
+
+This standard sample uses four CPU threads and `warmup=3`. It is one completed
+process run rather than the usual five-process median, so it is provisional.
+
+| Expert RAM cache | Decode | Peak RSS | Avg. SSD reads / generated token |
+|---:|---:|---:|---:|
+| **1 GiB** | 4.37 t/s | **19.09 GiB** | 3.73 GB/token |
+| **10 GiB** | **4.73 t/s** | **24.32 GiB** | 1.89 GB/token |
+| **16 GiB** | 4.67 t/s | 26.91 GiB | **1.55 GB/token** |
+
+This experimental sweep uses a 19-token real Chinese prompt, 64 generated
+tokens, greedy decoding, six CPU threads, `warmup=0`, and three independent
+processes per cache size. These real-prompt numbers are reported separately
+from the standard `pp256 + tg64` performance chart. SSD reads use the same
+amortized logical-expert-byte definition as the 122B table above.
 
 ## What Works
 
@@ -62,6 +93,7 @@ policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 | RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
+| DeepSeek-V4-Flash | Experimental CPU inference with native FP8/MXFP4 and SSD expert offload |
 
 The most tested runtime path today is `w4g128`: it has the lowest memory use and
 the fastest decode speed in mollm. All config-based converters also accept
@@ -203,6 +235,19 @@ python3 models/converter.py \
     w4g128
 ```
 
+Experimental DeepSeek-V4-Flash conversion preserves its checkpoint-native FP8
+and MXFP4 weights:
+
+```bash
+python3 models/deepseek_v4.py \
+    /path/to/DeepSeek-V4-Flash \
+    deepseek_v4_flash_native.mollm
+
+./build_i8mm/mollm_chat \
+    --package deepseek_v4_flash_native.mollm \
+    --ssd-cache-mb 10240 --ssd-io-workers 8 --threads 6
+```
+
 Supported `config.json` model types:
 
 | `model_type` | Supported models |
@@ -213,6 +258,7 @@ Supported `config.json` model types:
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
 | RWKV7 `.pth` | Use `models/rwkv7.py` directly. |
+| `deepseek_v4` | Use the experimental `models/deepseek_v4.py` converter directly. |
 
 Quantization choices:
 
@@ -227,6 +273,9 @@ Quantization choices:
 
 Notes:
 
+- DeepSeek-V4-Flash uses checkpoint-native FP8 E4M3 block-128 quantized
+  dense/shared-expert weights and MXFP4 E2M1/E8M0 group-32 routed experts
+  instead of the conversion modes above.
 - W4 conversion requires the `mollm-quantize` helper built from C++.
 - FP16 and W8 conversion do not require that helper.
 - The prefill graph is built with an internal 256-token chunk size, but CPU
@@ -345,8 +394,10 @@ mollm/
 - More model families beyond the current Qwen, Youtu, and Qwen-MoE coverage.
 - Broader vision support beyond the current Qwen3.5 single-image path,
   including multi-image/video input, serving, and Metal execution.
-- SSD offload for larger models and MoE experts that do not fit comfortably in
-  memory.
+- Speculative decoding for DeepSeek-V4, starting with native MTP and exploring
+  [DSpark](https://arxiv.org/abs/2607.05147)-style confidence-scheduled
+  semi-autoregressive drafting.
+- Keep optimizing SSD offload.
 
 ## License
 

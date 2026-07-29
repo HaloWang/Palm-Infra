@@ -59,13 +59,23 @@ W4G32 package reaches `7.020762` PPL on the complete
 |---|---:|---:|---|
 | Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
 | Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
-| Qwen3.5-122B-A10B (SSD offload) | **51.06** / **16.22** † | OOM | runs on a 48GB Mac |
+| Qwen3.5-122B-A10B (SSD offload) | **51.06** / **16.53** † | OOM | runs on a 48GB Mac |
 
 † Prefill was refreshed on 2026-07-27 and is the five-process
 `pp256 + tg64`, `warmup=3` median with a 16 GiB expert RAM cache. Decode is the
 current three-process median on a real ChatML prompt with 16 prompt tokens,
 256 generated tokens, `warmup=0`, and the same cache size. See [SSD
 offload](ssd-offload.md) for the cache sweep and I/O protocol.
+
+## Native FP8 + MXFP4
+
+| Model | mollm pp/tg | llama.cpp pp/tg | Result |
+|---|---:|---:|---|
+| DeepSeek-V4-Flash (SSD offload) | **9.35** / **4.74** ‡ | 0 / 0 | llama.cpp OOM |
+
+‡ Provisional single-process result using four CPU threads, `pp256 + tg64`,
+`warmup=3`, and a 16 GiB expert RAM cache. This is not yet the usual
+five-process median.
 
 Packages are resident by default. `--mmap` remains available for CPU A/B
 testing; mmap page warmup is reported separately from measured prefill and

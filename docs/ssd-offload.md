@@ -8,10 +8,12 @@ used expert pairs.
 
 ## Cache policy
 
-The default uses one shared cache instead of fixed per-layer quotas. Least-Stale
-eviction protects experts needed by current and future layers. A next-layer
-router prediction submits low-priority reads before the following MoE layer
-needs them.
+The default uses one shared cache instead of fixed per-layer quotas. Eviction
+adapts to cache pressure: when a layer's fair share cannot hold its current
+route, entries from layers already executed in this pass are recycled first;
+when the route fits, Least-Stale ordering instead preserves cross-token hits.
+A next-layer router prediction submits low-priority reads before the following
+MoE layer needs them.
 
 On macOS, the expert cache is pinned by default. Without pinning, the VM
 compressor may compress cold anonymous expert buffers and later decompress them
@@ -22,10 +24,10 @@ decode throughput.
 Historical cache-policy isolation run: real chat prompt, four CPU threads, 16 prompt tokens, 128 generated tokens,
 `warmup=1`, and five independent process runs:
 
-| 16 GiB cache policy | Decode | Expert-cache hit rate | SSD reads |
+| 16 GiB cache policy | Decode | Expert-cache hit rate | Avg. SSD reads / generated token |
 |---|---:|---:|---:|
-| Legacy equal per-layer cache, no prediction | 10.89 t/s | 74.5% | 69.4 GB |
-| **Shared cache + cross-layer prefetch** | **12.70 t/s** | **89.3%** | 75.7 GB |
+| Legacy equal per-layer cache, no prediction | 10.89 t/s | 74.5% | 0.54 GB/token |
+| **Shared cache + cross-layer prefetch** | **12.70 t/s** | **89.3%** | 0.59 GB/token |
 
 The default row locks both dense weights and the expert cache. The prediction
 uses somewhat more SSD bandwidth but hides enough latency to improve
@@ -34,20 +36,24 @@ interactive decode. With a longer 256-token context, the strict `pp256 + tg64`,
 
 ## Cache-size sweep
 
-This sweep was rerun on 2026-07-26 using the prompt “给我讲一个故事”, greedy
+This sweep was rerun on 2026-07-29 using the prompt “给我讲一个故事”, greedy
 decoding, 16 prompt tokens, 256 generated tokens, `warmup=0`, and three
 independent processes per cache size.
 
-| Expert RAM cache | Decode | Peak RSS | Expert-cache hit rate | SSD reads |
+| Expert RAM cache | Decode | Peak RSS | Expert-cache hit rate | Avg. SSD reads / generated token |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
-| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
-| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
+| **1 GiB** | 12.38 t/s | **5.90 GiB** | 47.9% | 1.72 GB/token |
+| **10 GiB** | 16.19 t/s | 14.64 GiB | 83.5% | 0.75 GB/token |
+| **16 GiB** | **16.53 t/s** | 20.60 GiB | **88.6%** | **0.51 GB/token** |
 
-Ten GiB is within 0.5% of the 16 GiB throughput while using about 6 GiB less
+Ten GiB is within 2.1% of the 16 GiB throughput while using about 6 GiB less
 peak RSS. The 1 GiB configuration demonstrates that the 122B package can run
-at about 6 GiB peak RSS, at the cost of a zero cache-hit rate and much more SSD
-I/O.
+at about 6 GiB peak RSS, at the cost of substantially more SSD I/O.
+
+SSD reads are logical routed-expert bytes successfully loaded by demand or
+prefetch, divided by generated tokens. The value amortizes prompt prefill over
+the generated output and excludes dense-weight and CPU-sidecar loading; it is
+not a direct measurement of filesystem or physical-device traffic.
 
 Cache capacity must leave room for dense weights, KV cache, runtime buffers, and
 other applications.

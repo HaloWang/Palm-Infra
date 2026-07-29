@@ -22,25 +22,54 @@ mobile-oriented LLM inference engine.
 `mollm` 可以在 48GB Apple Silicon Mac 上运行 W4 量化的
 Qwen3.5-122B-A10B：稠密权重保留在 RAM 中，仅从 SSD 读取被路由到的 MoE
 expert。在当前 256-token cache sweep 中，通过有界的 16 GiB 共享 expert
-cache 和跨层预取，decode 达到 16.22 t/s。
+cache 和跨层预取，decode 达到 16.53 t/s。
 
 cache 容量可配置，并不要求把模型完整常驻内存。在下面的真实 prompt sweep
 中，1 GiB expert cache 配置的峰值 RSS 仅 5.90 GiB；增大 cache 可以用更多内存
 换取更少的 SSD 读取和更高吞吐。
 
-| Expert RAM cache | Decode | Peak RSS | Cache 命中率 | SSD 读取量 |
+| Expert RAM cache | Decode | Peak RSS | Cache 命中率 | 每个生成 token 的平均 SSD 读取量 |
 |---:|---:|---:|---:|---:|
-| **1 GiB** | 11.35 t/s | **5.91 GiB** | 0.0% | 555.0 GB |
-| **10 GiB** | 16.15 t/s | 14.64 GiB | 83.9% | 191.4 GB |
-| **16 GiB** | **16.22 t/s** | 20.59 GiB | **89.8%** | **118.3 GB** |
+| **1 GiB** | 12.38 t/s | **5.90 GiB** | 47.9% | 1.72 GB/token |
+| **10 GiB** | 16.19 t/s | 14.64 GiB | 83.5% | 0.75 GB/token |
+| **16 GiB** | **16.53 t/s** | 20.60 GiB | **88.6%** | **0.51 GB/token** |
 
 该 sweep 使用 16-token 真实 prompt、生成 256 tokens、greedy decoding、
-`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-26 重新运行。
-10 GiB cache 的 decode 吞吐与 16 GiB 相差不到 0.5%，同时峰值 RSS 少约
-6 GiB；1 GiB 则展示了低内存运行能力。
+`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-29 重新运行。
+10 GiB cache 的 decode 吞吐与 16 GiB 相差约 2.1%，同时峰值 RSS 少约
+6 GiB；1 GiB 则展示了低内存运行能力。SSD 读取量统计 demand 或 prefetch
+实际装入的路由 expert 逻辑字节，并除以生成 token 数；该摊销值包含 prompt
+prefill，但不包含稠密权重和 CPU sidecar 的加载。
 
 cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 [122B MoE SSD offload](docs/ssd-offload.md)。
+
+## 实验性 DeepSeek-V4-Flash 支持
+
+`mollm` 可以直接转换 DeepSeek-V4-Flash 原生 checkpoint，无需先展开成 FP16。
+其中量化的稠密权重和共享 expert 权重保留原生 FP8 E4M3 数据，路由 expert
+则保留 OCP MXFP4 格式，即 packed E2M1 数值和每 32 个数值一个 E8M0 scale。
+生成的约 157 GB 模型包沿用大 MoE 模型的有界异步 SSD expert offload 路径。
+
+Apple M5 Pro 上当前的纯 CPU 实验结果：
+
+| 标准吞吐 | Expert RAM cache | 结果 |
+|---|---:|---:|
+| `pp256 + tg64` | 16 GiB | **9.35 pp / 4.74 tg** |
+
+该标准样本使用 4 个 CPU 线程和 `warmup=3`。目前只完成了一个独立进程，
+并非通常采用的五进程中位数，因此暂作 provisional 数据。
+
+| Expert RAM cache | Decode | Peak RSS | 每个生成 token 的平均 SSD 读取量 |
+|---:|---:|---:|---:|
+| **1 GiB** | 4.37 t/s | **19.09 GiB** | 3.73 GB/token |
+| **10 GiB** | **4.73 t/s** | **24.32 GiB** | 1.89 GB/token |
+| **16 GiB** | 4.67 t/s | 26.91 GiB | **1.55 GB/token** |
+
+该实验使用 19-token 中文真实 prompt、生成 64 tokens、greedy decoding、
+6 个 CPU 线程、`warmup=0`，每档 cache 取三个独立进程的中位数。由于测试
+协议不同，这组真实 prompt 数据不与标准 `pp256 + tg64` 性能图混排。SSD
+读取量采用与上方 122B 表格相同的摊销逻辑 expert 字节定义。
 
 ## 已支持的模型
 
@@ -53,6 +82,7 @@ cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
+| DeepSeek-V4-Flash | 实验性纯 CPU 推理，支持原生 FP8/MXFP4 与 SSD expert offload |
 
 当前测试最充分的运行路径是 `w4g128`：它占用内存最少，且具有 mollm 中最快的
 decode 速度。所有基于 `config.json` 的 converter 也支持 `w4g32` 和
@@ -159,6 +189,18 @@ python3 models/converter.py \
     w4g128
 ```
 
+DeepSeek-V4-Flash 的实验性转换会保留 checkpoint 原生 FP8 和 MXFP4 权重：
+
+```bash
+python3 models/deepseek_v4.py \
+    /path/to/DeepSeek-V4-Flash \
+    deepseek_v4_flash_native.mollm
+
+./build_i8mm/mollm_chat \
+    --package deepseek_v4_flash_native.mollm \
+    --ssd-cache-mb 10240 --ssd-io-workers 8 --threads 6
+```
+
 | `model_type` | 支持的模型 |
 |---|---|
 | `qwen3` | Qwen3 dense text models |
@@ -166,6 +208,7 @@ python3 models/converter.py \
 | `qwen3_5` | Qwen3.5 dense text 与单图视觉模型 |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
+| `deepseek_v4` | 直接使用实验性的 `models/deepseek_v4.py` converter。 |
 
 | 模式 | 适用场景 |
 |---|---|
@@ -175,6 +218,10 @@ python3 models/converter.py \
 | `w4mixg128` | 纯 W4 质量不足，可使用更多内存保留部分 W8 tensor。 |
 | `w4g32` | 使用更小的 32-value group 改善 W4 质量，并接受更多 scale 和潜在吞吐损失。 |
 | `w4mixg32` | 在 W4G32 基础上，沿用该模型 `w4mixg128` 的 W8 tensor promotion policy。 |
+
+DeepSeek-V4-Flash 不使用上述转换量化模式：其中量化的稠密/共享 expert
+权重采用 checkpoint 原生 FP8 E4M3 block-128，路由 expert 采用
+MXFP4 E2M1/E8M0 group-32。
 
 W4 转换需要 C++ 构建的 `mollm-quantize` 工具；FP16 和 W8 不需要。prefill
 图内部以 256 token 为分块大小，但 CPU runtime 使用 dynamic prefill；除非
@@ -268,7 +315,11 @@ mollm/
 - 基于当前单用户 REPL cache，为 serving 工作负载实现完整的 prefix cache。
 - 扩展 accelerator 覆盖范围，同时保持 CPU runtime 作为可移植基线。
 - 增加更多模型系列，并将当前 Qwen3.5 单图路径扩展到多图、视频、serving 与
-  Metal vision encoder；继续优化 SSD offload。
+  Metal vision encoder。
+- 为 DeepSeek-V4 支持投机解码，先实现原生 MTP，并探索
+  [DSpark](https://arxiv.org/abs/2607.05147) 风格的 confidence-scheduled
+  semi-autoregressive drafting。
+- 继续优化 SSD offload。
 
 ## 许可证
 

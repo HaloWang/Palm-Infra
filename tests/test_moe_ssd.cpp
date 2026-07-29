@@ -549,6 +549,73 @@ int main() {
               "retained route produces a next-forward hit");
     }
 
+    // Switch the global victim order according to cache pressure. When one
+    // layer's fair share cannot hold its complete route, recycle a finished
+    // layer before a stale future entry. Once the route fits, preserve the
+    // current left-layer entry and evict stale residency instead.
+    {
+        auto run_pressure_case = [&](size_t capacity, bool expect_left_eviction,
+                                     const char* label) {
+            MoeSsdCache cache;
+            check(cache.open(path, capacity, 2), label);
+            auto gate0 = spec("pressure_gate0", 0);
+            auto down0 = spec("pressure_down0", 6 * sizeof(uint16_t));
+            auto gate1 = spec("pressure_gate1", 0);
+            auto down1 = spec("pressure_down1", 6 * sizeof(uint16_t));
+            auto gate2 = spec("pressure_gate2", 0);
+            auto down2 = spec("pressure_down2", 6 * sizeof(uint16_t));
+            gate1.layer = down1.layer = 1;
+            gate2.layer = down2.layer = 2;
+            check(cache.add_source(gate0) && cache.add_source(down0) &&
+                      cache.add_source(gate1) && cache.add_source(down1) &&
+                      cache.add_source(gate2) && cache.add_source(down2),
+                  "add pressure-adaptive cache sources");
+            check(cache.set_global_capacity_pool(true),
+                  "enable pressure-adaptive global pool");
+            const MoeSsdTensorSource* g0 =
+                cache.find_source("pressure_gate0");
+            const MoeSsdTensorSource* d0 =
+                cache.find_source("pressure_down0");
+            const MoeSsdTensorSource* g1 =
+                cache.find_source("pressure_gate1");
+            const MoeSsdTensorSource* d1 =
+                cache.find_source("pressure_down1");
+            const MoeSsdTensorSource* g2 =
+                cache.find_source("pressure_gate2");
+            const MoeSsdTensorSource* d2 =
+                cache.find_source("pressure_down2");
+            Tensor gu, dw;
+            check(cache.acquire(g0, d0, 0, gu, dw) &&
+                      cache.acquire(g1, d1, 0, gu, dw) &&
+                      cache.acquire(g2, d2, 0, gu, dw),
+                  "populate pressure-adaptive cache");
+            if (capacity >= 48) {
+                check(cache.acquire(g0, d0, 1, gu, dw) &&
+                          cache.acquire(g1, d1, 1, gu, dw) &&
+                          cache.acquire(g2, d2, 1, gu, dw),
+                      "fill roomy pressure-adaptive cache");
+            }
+            cache.begin_forward_pass();
+            check(cache.request_many(g0, d0, {0}) &&
+                      cache.acquire(g0, d0, 0, gu, dw),
+                  "mark current early-layer route");
+            check(cache.request_many(g1, d1, {0, 2}) &&
+                      cache.acquire(g1, d1, 0, gu, dw) &&
+                      cache.acquire(g1, d1, 2, gu, dw),
+                  "admit changed middle-layer route");
+            check(cache.contains(g0, d0, 0) != expect_left_eviction,
+                  expect_left_eviction
+                      ? "tight cache recycles the finished layer"
+                      : "roomy cache preserves the current finished layer");
+            check(cache.contains(g2, d2, 0) == expect_left_eviction,
+                  expect_left_eviction
+                      ? "tight cache preserves stale future residency"
+                      : "roomy cache recycles stale future residency");
+        };
+        run_pressure_case(24, true, "open tight pressure-adaptive cache");
+        run_pressure_case(48, false, "open roomy pressure-adaptive cache");
+    }
+
     // Protect all resident members of a route before allocating its misses.
     // Otherwise the leading miss can evict expert zero before request_many()
     // reaches the trailing hit.

@@ -264,7 +264,9 @@ private:
     std::unique_ptr<Entry> remove_entry_locked(Entry* entry,
                                                bool count_eviction);
     size_t layer_capacity_bytes_locked(int layer) const;
-    bool global_victim_before_locked(const Entry* candidate, const Entry* current) const;
+    bool prefer_left_layer_eviction_locked() const;
+    bool global_victim_before_locked(const Entry* candidate,
+                                     const Entry* current) const;
     static ByteBuffer& component_buffer(Entry& entry, uint8_t component);
     static const ByteBuffer& component_buffer(const Entry& entry, uint8_t component);
     static uint64_t component_offset(const Entry& entry, uint8_t component);
@@ -329,6 +331,10 @@ private:
     // while one MoE layer only needs to inspect its own small route window.
     std::unordered_map<int, std::vector<Entry*>> layer_entries_;
     std::unordered_map<int, size_t> layer_resident_bytes_;
+    // Number of unique experts in the latest demand route for each layer.
+    // The shared cache uses this to distinguish a streaming-sized cache from
+    // one roomy enough to preserve routes across forward passes.
+    std::unordered_map<int, size_t> layer_route_widths_;
     std::unordered_map<int, std::vector<int>> retained_experts_;
     std::unordered_map<int, PredictionRecord> pending_predictions_;
     std::unordered_map<int, LayerCounters> layer_stats_;

@@ -81,6 +81,7 @@ bool MoeSsdCache::clear_resident() {
     entry_locations_.clear();
     layer_entries_.clear();
     layer_resident_bytes_.clear();
+    layer_route_widths_.clear();
     retained_experts_.clear();
     pending_predictions_.clear();
     resident_bytes_ = 0;
@@ -165,6 +166,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         entry_locations_.clear();
         layer_entries_.clear();
         layer_resident_bytes_.clear();
+        layer_route_widths_.clear();
         retained_experts_.clear();
         pending_predictions_.clear();
         layer_stats_.clear();
@@ -532,20 +534,38 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     return raw;
 }
 
+bool MoeSsdCache::prefer_left_layer_eviction_locked() const {
+    if (active_layer_ < 0 || layers_.empty())
+        return false;
+    const auto layout = layer_layouts_.find(active_layer_);
+    const auto route = layer_route_widths_.find(active_layer_);
+    if (layout == layer_layouts_.end() || layout->second.pair_bytes == 0 ||
+        route == layer_route_widths_.end() || route->second == 0) {
+        return false;
+    }
+    const size_t fair_share = capacity_bytes_ / layers_.size();
+    const size_t fair_share_pairs = fair_share / layout->second.pair_bytes;
+    return fair_share_pairs < route->second;
+}
+
 bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
                                               const Entry* current) const {
+    const bool prefer_left = prefer_left_layer_eviction_locked();
     auto rank = [&](const Entry* entry) {
         const bool stale = entry->forward_epoch != forward_epoch_;
         const int layer = entry->gate_up->spec.layer;
         const bool shallow = shallow_favoring_layers_ > 0 && layer < shallow_favoring_layers_;
         const bool left = active_layer_ >= 0 && layer < active_layer_;
-        // Recycle entries from layers already consumed in this forward before
-        // touching last-forward entries belonging to layers still ahead.
-        // Checking `stale` first degenerates into a cyclic LRU scan: early
-        // misses evict future-layer hits before execution can reach them.
         int value = 0;
-        if (left) value = shallow ? 1 : 0;
-        else if (stale) value = shallow ? 3 : 2;
+        // A streaming-sized cache cannot preserve one complete route per
+        // layer, so recycle finished layers before displacing entries which
+        // may still be used later in this pass. Once every layer's fair share
+        // can hold the current route, least-stale ordering instead preserves
+        // the stronger cross-token locality.
+        if ((prefer_left && left) || (!prefer_left && stale))
+            value = shallow ? 1 : 0;
+        else if ((prefer_left && stale) || (!prefer_left && left))
+            value = shallow ? 3 : 2;
         else value = shallow ? 5 : 4;
         return value + (entry->retained ? 6 : 0);
     };
@@ -756,6 +776,11 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                 continue;
             }
             missing_experts.push_back({expert, prediction_confidence});
+        }
+        if (!speculative) {
+            layer_route_widths_[gate_up->spec.layer] =
+                static_cast<size_t>(
+                    std::count(seen.begin(), seen.end(), uint8_t{1}));
         }
         for (const MissingExpert& missing : missing_experts) {
             Entry* entry = reserve_entry_locked(
