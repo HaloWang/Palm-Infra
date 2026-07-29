@@ -18,6 +18,11 @@ int main() {
         std::fprintf(stderr, "inconsistent AVX-512 dispatch state\n");
         return 1;
     }
+    if (caps.arm_i8mm &&
+        (!caps.arm_neon || std::strcmp(name, "arm-neon-i8mm") != 0)) {
+        std::fprintf(stderr, "inconsistent ARM i8mm dispatch state\n");
+        return 1;
+    }
     if (caps.x86_isa == mollm::cpu::X86Isa::AVX2 &&
         (!caps.x86_avx2 || std::strcmp(name, "x86-avx2") != 0)) {
         std::fprintf(stderr, "inconsistent AVX2 dispatch state\n");
@@ -38,6 +43,13 @@ int main() {
     if (requested && std::strcmp(requested, "avx2") == 0 &&
         caps.x86_avx512) {
         std::fprintf(stderr, "AVX2 cap incorrectly selected AVX-512\n");
+        return 1;
+    }
+    const char* arm_requested = std::getenv("MOLLM_ARM_ISA");
+    if ((std::getenv("MOLLM_ARM_DISABLE_I8MM") ||
+         (arm_requested && std::strcmp(arm_requested, "neon") == 0)) &&
+        caps.arm_i8mm) {
+        std::fprintf(stderr, "ARM NEON cap incorrectly selected i8mm\n");
         return 1;
     }
 

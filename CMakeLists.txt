@@ -6,7 +6,6 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
 include(CheckCXXSourceCompiles)
-include(CheckCXXSourceRuns)
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
@@ -58,7 +57,6 @@ set(SOURCES
     kernels/matmul_quant.cpp
     kernels/matmul_sparse.cpp
     kernels/matmul_w4.cpp
-    kernels/matmul_w4_i8mm.cpp
     kernels/matmul_w8.cpp
     kernels/matmul_mxfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
@@ -146,21 +144,21 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     message(STATUS "Target: ARM64 (NEON enabled)")
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=1)
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
-    # FP16/FML vector arithmetic and DOTPROD are used by the regular NEON
-    # kernels regardless of whether i8mm is enabled. Linux GCC defaults to
-    # armv8-a, where those intrinsics are unavailable; keep this baseline
-    # separate from the i8mm tuning target so MOLLM_ARM_I8MM=OFF remains a
-    # valid build.
+    # Baseline NEON/DOTPROD code and optional i8mm code are compiled into
+    # separate objects.  The baseline therefore remains runnable on ARMv8.2
+    # CPUs even when the build also contains i8mm kernels.
     set(MOLLM_ARM_BASELINE_FLAGS "-march=armv8.2-a+dotprod+fp16+fp16fml")
     if(APPLE)
-        # Apple arm64 targets already provide FP16 vector arithmetic, and
-        # Apple Clang does not need (or consistently accept) a GNU -march.
         set(MOLLM_ARM_BASELINE_FLAGS "")
     endif()
     if(MOLLM_ARM_NATIVE)
         message(STATUS "ARM64 native target enabled (-mcpu=native)")
         target_compile_options(mollm_lib PRIVATE -mcpu=native)
-    elseif(NOT MOLLM_ARM_I8MM_MODE STREQUAL "OFF")
+    elseif(MOLLM_ARM_BASELINE_FLAGS)
+        target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_BASELINE_FLAGS})
+    endif()
+
+    if(NOT MOLLM_ARM_I8MM_MODE STREQUAL "OFF")
         set(MOLLM_ARM_I8MM_FLAGS "-march=armv8.6-a+i8mm+fp16+fp16fml")
         set(_mollm_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
         set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${MOLLM_ARM_I8MM_FLAGS}")
@@ -178,34 +176,40 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
             }
         ")
         check_cxx_source_compiles("${_mollm_i8mm_probe_source}" MOLLM_ARM_I8MM_COMPILES)
-        if(MOLLM_ARM_I8MM_COMPILES AND NOT CMAKE_CROSSCOMPILING)
-            check_cxx_source_runs("${_mollm_i8mm_probe_source}" MOLLM_ARM_I8MM_RUNS)
-        elseif(MOLLM_ARM_I8MM_COMPILES AND CMAKE_CROSSCOMPILING)
-            set(MOLLM_ARM_I8MM_RUNS TRUE)
-            message(STATUS "ARM64 i8mm runtime probe skipped while cross-compiling")
-        else()
-            set(MOLLM_ARM_I8MM_RUNS FALSE)
-        endif()
         set(CMAKE_REQUIRED_FLAGS "${_mollm_saved_required_flags}")
 
-        if(MOLLM_ARM_I8MM_COMPILES AND MOLLM_ARM_I8MM_RUNS)
-            message(STATUS "ARM64 i8mm target enabled (${MOLLM_ARM_I8MM_FLAGS})")
-            target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_I8MM_FLAGS})
+        if(MOLLM_ARM_I8MM_COMPILES)
+            add_library(mollm_arm_i8mm OBJECT
+                kernels/matmul_w4_i8mm.cpp
+                kernels/matmul_w8.cpp)
+            target_include_directories(mollm_arm_i8mm PRIVATE
+                ${CMAKE_CURRENT_SOURCE_DIR}
+                ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann)
+            target_compile_definitions(mollm_arm_i8mm PRIVATE
+                MOLLM_CPU_ARM_NEON=1
+                MOLLM_ARM_I8MM_KERNELS=1
+                MOLLM_W8_I8MM_ONLY=1
+                __ARM_NEON=1)
+            target_compile_options(mollm_arm_i8mm PRIVATE
+                ${MOLLM_ARM_I8MM_FLAGS})
+            target_sources(mollm_lib PRIVATE
+                $<TARGET_OBJECTS:mollm_arm_i8mm>)
+            target_compile_definitions(mollm_lib PRIVATE
+                MOLLM_ARM_I8MM_KERNELS=1)
+            message(STATUS
+                "ARM64 i8mm kernels embedded for runtime dispatch "
+                "(${MOLLM_ARM_I8MM_FLAGS})")
         elseif(MOLLM_ARM_I8MM_MODE STREQUAL "ON")
             message(FATAL_ERROR
-                "MOLLM_ARM_I8MM=ON requested, but compiler/target does not support "
-                "${MOLLM_ARM_I8MM_FLAGS} with __ARM_FEATURE_MATMUL_INT8")
+                "MOLLM_ARM_I8MM=ON requested, but the compiler does not support "
+                "${MOLLM_ARM_I8MM_FLAGS}")
         else()
-            message(STATUS "ARM64 i8mm target not available; using FP16 NEON kernels")
-            if(MOLLM_ARM_BASELINE_FLAGS)
-                target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_BASELINE_FLAGS})
-            endif()
+            message(STATUS
+                "ARM64 i8mm kernels unavailable; using the NEON baseline")
         endif()
     else()
-        message(STATUS "ARM64 i8mm target disabled by MOLLM_ARM_I8MM=OFF")
-        if(MOLLM_ARM_BASELINE_FLAGS)
-            target_compile_options(mollm_lib PRIVATE ${MOLLM_ARM_BASELINE_FLAGS})
-        endif()
+        message(STATUS
+            "ARM64 i8mm kernels disabled by MOLLM_ARM_I8MM=OFF")
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")

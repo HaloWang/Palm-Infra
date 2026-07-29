@@ -20,6 +20,10 @@ class ThreadPool;
 #endif
 #endif
 
+#ifndef MOLLM_ARM_I8MM_KERNELS
+#define MOLLM_ARM_I8MM_KERNELS 0
+#endif
+
 #if MOLLM_CPU_ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -44,6 +48,7 @@ static_assert(sizeof(fp16_t) == 2, "mollm FP16 storage must be binary16");
 
 struct Capabilities {
     bool arm_neon = false;
+    bool arm_i8mm = false;
     bool fp16_vector_math = false;
     bool fp16_kv_cache = false;
     bool fp16_interleaved_weights = false;

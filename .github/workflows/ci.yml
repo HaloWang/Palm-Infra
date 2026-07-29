@@ -30,6 +30,11 @@ jobs:
         run: cmake --build build -j 2
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Test NEON runtime fallback
+        if: matrix.arm_i8mm == 'AUTO'
+        env:
+          MOLLM_ARM_ISA: neon
+        run: ctest --test-dir build --output-on-failure
 
   x86-build-and-test:
     name: Linux x86_64 (runtime ISA dispatch)
@@ -96,4 +101,9 @@ jobs:
       - name: Build
         run: cmake --build build -j 2
       - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Test NEON runtime fallback
+        if: matrix.arm_i8mm == 'AUTO'
+        env:
+          MOLLM_ARM_ISA: neon
         run: ctest --test-dir build --output-on-failure
