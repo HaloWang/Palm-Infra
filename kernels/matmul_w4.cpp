@@ -980,8 +980,12 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 
-    if (mollm::cpu::matmul_int4_packed(A, B, C, lda, ldc)) {
-        timer.set_shape("int4_packed_scalar", M, N, K, group_size,
+    if (mollm::cpu::matmul_int4_packed(
+            A, B, C, lda, ldc, thread_pool)) {
+        timer.set_shape(mollm::cpu::capabilities().x86_avx2
+                            ? "int4_packed_avx2"
+                            : "int4_packed_scalar",
+                        M, N, K, group_size,
                         groups_per_row, true, false, n_threads);
         if (act != Activation::NONE && act_n_len != 0)
             matmul_apply_activation(c_ptr, M, N, ldc, 0, M, act,

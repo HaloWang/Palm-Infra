@@ -13,9 +13,9 @@ mobile-oriented LLM inference engine.
 |_| |_| |_|\___/|_|_|_| |_| |_|
 ```
 
-`mollm` 是面向 ARM CPU 的轻量 C++ LLM 推理引擎，并提供实验性的 Apple Metal 支持。它将已支持的 Hugging Face 模型目录转换成单个 `.mollm` 文件，其中包含计算图、权重、tokenizer 与对话模板，并可直接运行。
+`mollm` 是面向 ARM 和 x86 CPU 的轻量 C++ LLM 推理引擎，并提供实验性的 Apple Metal 支持。它将已支持的 Hugging Face 模型目录转换成单个 `.mollm` 文件，其中包含计算图、权重、tokenizer 与对话模板，并可直接运行。
 
-项目当前聚焦 Apple Silicon 和其他现代 ARM 处理器上的高性能本地推理：FP16 使用 NEON FP16FML kernel；CPU 量化模型使用针对 ARM dot-product 指令优化的 weight-only int8/int4 kernel。
+项目当前聚焦 Apple Silicon 和其他现代 ARM 处理器上的高性能本地推理：FP16 使用 NEON FP16FML kernel；CPU 量化模型使用针对 ARM dot-product 指令优化的 weight-only int8/int4 kernel。Linux x86_64 现在也提供实验性的运行时分派 AVX2/FMA/F16C provider，覆盖 FP32、FP16、W8 以及 packed W4G32/W4G128 matmul。设置 `MOLLM_X86_DISABLE_AVX2=1` 可验证 portable scalar fallback。
 
 ## 现在，48GB Mac 也能运行 122B 模型
 

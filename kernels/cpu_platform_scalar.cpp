@@ -29,7 +29,7 @@ int8_t unpack_int4_signed(uint8_t byte, bool high_nibble) {
 }  // namespace
 
 bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
-                        int ldc) {
+                        int ldc, ThreadPool*) {
     const int M = static_cast<int>(A.shape[1]);
     const int K = static_cast<int>(A.shape[0]);
     const int N = static_cast<int>(B.shape[0]);
@@ -85,6 +85,21 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
         }
     }
     return true;
+}
+
+bool matmul_dense_fp32_range(const float*, const float*, float*, int, int, int,
+                             int, int, int, int) {
+    return false;
+}
+
+bool matmul_dense_fp16_range(const float*, const fp16_t*, float*, int, int, int,
+                             int, int, int, int, bool) {
+    return false;
+}
+
+bool matmul_int8_range(const float*, const int8_t*, const float*, float*, int,
+                       int, int, int, int, int, int, int, int, int, int, bool) {
+    return false;
 }
 
 }  // namespace mollm::cpu

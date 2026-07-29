@@ -272,6 +272,9 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     bool is_int8 = cfg.use_int8;
     bool is_int4 = cfg.use_int4;
     bool is_mxfp4 = cfg.use_mxfp4;
+    const bool use_interleaved_dense =
+        g_matmul_config.use_interleave_pack &&
+        mollm::cpu::capabilities().fp16_interleaved_weights;
 
     float* a_data = new float[M * K];
     float* c_data = new float[M * N];
@@ -339,7 +342,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
                 b_int8_data[n * K + k] = (int8_t)((std::rand() % 255) - 127);
             }
         }
-        if (g_matmul_config.use_interleave_pack) {
+        if (use_interleaved_dense) {
             b_int8_packed_data = pack_b_interleaved_int8_full(b_int8_data, N, K, K);
             b_int8_q8dot_data = pack_b_q8dot_int8_full(b_int8_data, N, K, K);
             b_raw = b_int8_packed_data;
@@ -386,7 +389,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         delete[] tmp;
 
         // Pre-pack B for interleaved path (mirrors engine load-time packing)
-        if (g_matmul_config.use_interleave_pack) {
+        if (use_interleaved_dense) {
             b_packed_data = pack_b_interleaved_full(b_fp16_data, N, K, K);
             b_raw = b_packed_data;
         } else {
@@ -405,7 +408,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
                               is_fp16 ? Precision::FP16 : Precision::FP32,
                               MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
     if (is_fp16)
-        B.is_interleaved = g_matmul_config.use_interleave_pack;
+        B.is_interleaved = use_interleaved_dense;
     if (is_mxfp4) {
         B.e8m0_scales = b_mxfp4_scales;
         B.group_size = 32;
@@ -419,13 +422,16 @@ static BenchResult run_bench(const BenchConfig& cfg) {
         B.groups_per_row = (uint32_t)groups_per_row;
         B.num_groups = (uint32_t)(N * groups_per_row);
         if (is_int8) {
-            B.is_interleaved = g_matmul_config.use_interleave_pack;
+            B.is_interleaved = use_interleaved_dense;
             B.q8_repack_data = b_int8_q8dot_data;
             if (cfg.sparse_a) B.sparse_data = b_int8_packed_data;
         } else {
             B.q4_repack_data = b_int4_q4dot_data;
             B.q4_g32_data = b_int4_q4g32_data;
             B.q4_g128_data = b_int4_q4g128_data;
+            B.is_q4_repacked = b_int4_q4dot_data != nullptr;
+            B.is_q4_g32_packed = b_int4_q4g32_data != nullptr;
+            B.is_q4_g128_packed = b_int4_q4g128_data != nullptr;
             B.sparse_data = b_int4_sparse_data;
         }
     }
