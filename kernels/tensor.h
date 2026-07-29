@@ -5,15 +5,7 @@
 #include <cstdint>
 #include <cstring>
 
-// ---------------------------------------------------------------------------
-// Platform detection for SIMD
-// ---------------------------------------------------------------------------
-#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
-#include <arm_neon.h>
-#define HAS_NEON 1
-#else
-#define HAS_NEON 0
-#endif
+#include "kernels/cpu_platform.h"
 
 // ---------------------------------------------------------------------------
 // mollm — Tensor definition

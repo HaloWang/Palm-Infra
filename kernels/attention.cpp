@@ -1014,6 +1014,7 @@ void kernel_sdpa(const OpParams& params,
                 if (cache_is_fp16) {
                     __fp16* dst_k = (__fp16*)(kd + (past_seqlen + s) * head_dim * cache_es);
                     int d = 0;
+#if HAS_NEON
                     for (; d + 7 < head_dim; d += 8) {
                         float32x4_t s0 = vld1q_f32(src_k + d);
                         float32x4_t s1 = vld1q_f32(src_k + d + 4);
@@ -1023,6 +1024,7 @@ void kernel_sdpa(const OpParams& params,
                     for (; d + 3 < head_dim; d += 4) {
                         vst1_f16(dst_k + d, vcvt_f16_f32(vld1q_f32(src_k + d)));
                     }
+#endif
                     for (; d < head_dim; d++) dst_k[d] = (__fp16)src_k[d];
                 } else {
                     std::memcpy(kd + (past_seqlen + s) * head_dim * cache_es,
@@ -1037,6 +1039,7 @@ void kernel_sdpa(const OpParams& params,
                 if (cache_is_fp16) {
                     __fp16* dst_v = (__fp16*)(vd + (past_seqlen + s) * v_head_dim * cache_es);
                     int d = 0;
+#if HAS_NEON
                     for (; d + 7 < v_head_dim; d += 8) {
                         float32x4_t s0 = vld1q_f32(src_v + d);
                         float32x4_t s1 = vld1q_f32(src_v + d + 4);
@@ -1046,6 +1049,7 @@ void kernel_sdpa(const OpParams& params,
                     for (; d + 3 < v_head_dim; d += 4) {
                         vst1_f16(dst_v + d, vcvt_f16_f32(vld1q_f32(src_v + d)));
                     }
+#endif
                     for (; d < v_head_dim; d++) dst_v[d] = (__fp16)src_v[d];
                 } else {
                     std::memcpy(vd + (past_seqlen + s) * v_head_dim * cache_es,
@@ -1174,8 +1178,8 @@ void kernel_sdpa(const OpParams& params,
     for (int h = 0; h < num_heads; h++) {
         int kv_h = h / heads_per_group;
         const float* Q_head = (const float*)Q.channel<unsigned char>(h);
-        const float* K_head = get_k_ptr(kv_h);
-        const float* V_head = get_v_ptr(kv_h);
+        const float* K_head = static_cast<const float*>(get_k_ptr(kv_h));
+        const float* V_head = static_cast<const float*>(get_v_ptr(kv_h));
         float* O_head = (float*)out.channel<unsigned char>(h);
         naive_sdpa_head(Q_head, K_head, V_head, O_head,
                         src_seqlen, dst_seqlen, head_dim, v_head_dim, scale, mask_ptr);

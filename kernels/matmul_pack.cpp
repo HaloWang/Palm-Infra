@@ -57,6 +57,7 @@ void maybe_pack_fp16_weight(Tensor& weight, const std::string& key,
                             const void* rowmajor_data,
                             PackedWeightMap& packed_weights) {
     if (weight.prec != Precision::FP16 ||
+        !mollm::cpu::capabilities().fp16_interleaved_weights ||
         !g_matmul_config.use_interleave_pack || !is_2d_linear_weight(weight)) {
         return;
     }

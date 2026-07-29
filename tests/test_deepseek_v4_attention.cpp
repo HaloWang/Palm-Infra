@@ -355,9 +355,10 @@ int main() {
                   input, exact_weight, reference, groups),
               "exact grouped FP8 reference executes");
         PackedWeightMap packed;
-        CHECK(prepare_fp8_bf16_fp16_weight(
-                  weight, "grouped_fp8_fixture", weight_data.data(), packed),
-              "grouped FP8 exact-value sidecar is prepared");
+        const bool prepared = prepare_fp8_bf16_fp16_weight(
+            weight, "grouped_fp8_fixture", weight_data.data(), packed);
+        CHECK(prepared == mollm::cpu::capabilities().fp16_interleaved_weights,
+              "grouped FP8 sidecar follows CPU provider capability");
         CHECK(kernel_dsv4_grouped_linear(
                   input, weight, optimized, groups),
               "optimized grouped FP8 projection executes");

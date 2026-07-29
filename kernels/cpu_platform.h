@@ -1,0 +1,71 @@
+#pragma once
+
+// CPU architecture boundary.
+//
+// Graph and engine code use this header for storage-level FP16 and for the
+// few execution-policy decisions that genuinely vary by CPU family.  ARM
+// intrinsics stay behind this boundary; generic kernels must not infer their
+// target from compiler predefined macros.
+
+#include <cstdint>
+
+struct Tensor;
+
+#ifndef MOLLM_CPU_ARM_NEON
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
+#define MOLLM_CPU_ARM_NEON 1
+#else
+#define MOLLM_CPU_ARM_NEON 0
+#endif
+#endif
+
+#if MOLLM_CPU_ARM_NEON
+#include <arm_neon.h>
+#endif
+
+namespace mollm::cpu {
+
+#if MOLLM_CPU_ARM_NEON
+using fp16_t = __fp16;
+#else
+// GCC and Clang support IEEE binary16 storage on x86 Linux.  It is used only
+// for model bytes and scalar conversion; it does not imply native FP16 SIMD.
+using fp16_t = _Float16;
+#endif
+
+static_assert(sizeof(fp16_t) == 2, "mollm FP16 storage must be binary16");
+
+struct Capabilities {
+    bool arm_neon = false;
+    bool fp16_vector_math = false;
+    bool fp16_kv_cache = false;
+    bool fp16_interleaved_weights = false;
+};
+
+const Capabilities& capabilities();
+
+// Hint while polling a CPU worker.  The ARM and scalar implementations live
+// in separately selected translation units so no foreign assembly reaches a
+// target compiler.
+void relax();
+
+// Handle a package-native packed INT4 matrix when the selected CPU provider
+// has a portable decoder.  Returning false leaves the normal matmul dispatch
+// to select its architecture-specific kernel.
+bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
+                        int ldc);
+
+}  // namespace mollm::cpu
+
+#if !MOLLM_CPU_ARM_NEON
+// Legacy CPU kernels still spell their storage element as `__fp16`.  Keep the
+// compatibility name at this one architecture boundary while those kernels
+// are moved behind providers; no generic caller needs a compiler extension.
+using __fp16 = mollm::cpu::fp16_t;
+#endif
+
+// Transitional compatibility for existing NEON kernels.  New generic code
+// should use mollm::cpu::Capabilities instead of testing this macro.
+#ifndef HAS_NEON
+#define HAS_NEON MOLLM_CPU_ARM_NEON
+#endif

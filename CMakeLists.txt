@@ -28,6 +28,12 @@ if(NOT MOLLM_ARM_I8MM_MODE MATCHES "^(AUTO|ON|OFF)$")
     message(FATAL_ERROR "MOLLM_ARM_I8MM must be AUTO, ON, or OFF (got '${MOLLM_ARM_I8MM}')")
 endif()
 
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
+    set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_arm.cpp)
+else()
+    set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
+endif()
+
 # ---------------------------------------------------------------------------
 # library sources
 # ---------------------------------------------------------------------------
@@ -50,6 +56,7 @@ set(SOURCES
     kernels/matmul_w4_i8mm.cpp
     kernels/matmul_w8.cpp
     kernels/matmul_mxfp4.cpp
+    ${MOLLM_CPU_PLATFORM_SOURCE}
     kernels/elementwise.cpp
     kernels/layout.cpp
     kernels/norm.cpp
@@ -97,6 +104,7 @@ set(PUBLIC_GRAPH_HEADERS
 )
 
 set(PUBLIC_KERNEL_HEADERS
+    kernels/cpu_platform.h
     kernels/moe_ssd.h
     kernels/tensor.h
     kernels/threading.h
@@ -118,6 +126,7 @@ target_link_libraries(mollm_lib PUBLIC Threads::Threads)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     message(STATUS "Target: ARM64 (NEON enabled)")
+    target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=1)
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
     if(MOLLM_ARM_NATIVE)
         message(STATUS "ARM64 native target enabled (-mcpu=native)")
@@ -165,11 +174,14 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     endif()
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     message(STATUS "Target: ARM32")
+    target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=1)
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     message(STATUS "Target: x86_64 (scalar fallback)")
+    target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=0)
 else()
     message(STATUS "Target: ${CMAKE_SYSTEM_PROCESSOR} (scalar fallback)")
+    target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=0)
 endif()
 
 # Apple-specific: link Accelerate for optional BLAS (future use)
@@ -353,6 +365,24 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_e2e           tests/test_e2e.cpp)
     add_mollm_test(test_quantized_e2e tests/test_quantized_e2e.cpp)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
+    find_package(Python3 COMPONENTS Interpreter QUIET)
+    if(Python3_Interpreter_FOUND)
+        add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)
+        target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)
+        add_dependencies(test_tiny_cpu_inference mollm-quantize)
+        add_test(
+            NAME test_tiny_qwen3_cpu_inference
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/run_tiny_qwen3_cpu_e2e.py
+                    ${CMAKE_CURRENT_SOURCE_DIR}/models/converter.py
+                    $<TARGET_FILE:mollm-quantize>
+                    $<TARGET_FILE:test_tiny_cpu_inference>)
+        set_tests_properties(test_tiny_qwen3_cpu_inference
+                             PROPERTIES SKIP_RETURN_CODE 77
+                                        LABELS "cpu;e2e")
+    else()
+        message(STATUS "Python3 not found; tiny CPU inference E2E test disabled")
+    endif()
     add_test(
         NAME test_package_install
         COMMAND ${CMAKE_COMMAND}

@@ -5,6 +5,7 @@
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/trace.h"
+#include "kernels/cpu_platform.h"
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
 
@@ -584,6 +585,16 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (input.kind == PersistentInputKind::AUX_STATE) {
             auxiliary_states_[input.layer] = &tensor;
             continue;
+        }
+        // Cache precision is a CPU-provider policy, not a graph-format or
+        // loader architecture check.  The scalar provider keeps K/V in FP32;
+        // the ARM provider retains the serialized FP16 cache path unchanged.
+        if (exec_ctx_prefill_.backend == &cpu_backend_ &&
+            !mollm::cpu::capabilities().fp16_kv_cache &&
+            (input.kind == PersistentInputKind::KV_KEY ||
+             input.kind == PersistentInputKind::KV_VALUE)) {
+            tensor.prec = Precision::FP32;
+            tensor.compute_strides();
         }
         if (input.layer >= (int)caches_.size())
             caches_.resize(input.layer + 1);

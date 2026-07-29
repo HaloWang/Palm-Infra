@@ -64,6 +64,7 @@ static inline bool is_contiguous_layout(const Tensor& t) {
 // Apply a unary op (sigmoid/silu/etc) reading from `src` (may be strided view),
 // writing to `dst` (assumed contiguous, freshly allocated).
 // `kernel_4(dst, src)` processes 4 contiguous FP32 elements via NEON.
+#if HAS_NEON
 template <typename Kernel4>
 static inline void unary_stride_aware(float* dst, const Tensor& src,
                                       Kernel4 kernel_4) {
@@ -176,6 +177,7 @@ static inline void binary_stride_aware(float* dst, const Tensor& a,
         }
     }
 }
+#endif  // HAS_NEON
 
 // Elementwise operations commonly apply a per-channel parameter [D, 1] to a
 // sequence tensor [D, S].  The fast helper above deliberately assumes equal

@@ -1,4 +1,5 @@
 #include "engine/weight_metadata.h"
+#include "kernels/cpu_platform.h"
 
 #include "kernels/matmul.h"
 
@@ -201,7 +202,11 @@ bool configure_weight_metadata(Tensor& tensor,
                      label, static_cast<long long>(cols), header.group_size);
         return false;
     }
+    // Packed INT4 is a serialized layout, not an ARM-only model format.  The
+    // scalar provider decodes it directly, while the ARM provider retains its
+    // historical requirement for the DOTPROD kernel.
     if ((int4_q4dot_layout || int4_bg32_layout || int4_bg128_layout) &&
+        mollm::cpu::capabilities().arm_neon &&
         !matmul_int4_q4dot_kernel_available()) {
         std::fprintf(stderr,
                      "Engine: INT4 packed weight %s requires an ARM DOTPROD "

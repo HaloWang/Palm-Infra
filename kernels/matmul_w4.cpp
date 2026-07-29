@@ -967,16 +967,25 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
     int n_threads = thread_pool ? thread_pool->num_threads() : 1;
     const bool has_embedded_bg128_scales =
         B.is_q4_g128_packed && b_q4_g128 && group_size == 128 &&
-        K % 128 == 0 && matmul_int4_q4dot_kernel_available();
+        K % 128 == 0;
     const bool has_embedded_bg32_scales =
         B.is_q4_g32_packed && b_q4_g32 && group_size == 32 &&
-        K % 32 == 0 && matmul_int4_q4dot_kernel_available();
+        K % 32 == 0;
     if ((!scales && !has_embedded_bg32_scales &&
          !has_embedded_bg128_scales) ||
         group_size <= 0 ||
         groups_per_row <= 0) {
         timer.set_shape("int4_invalid_scales", M, N, K, group_size,
                         groups_per_row, false, false, n_threads);
+        return;
+    }
+
+    if (mollm::cpu::matmul_int4_packed(A, B, C, lda, ldc)) {
+        timer.set_shape("int4_packed_scalar", M, N, K, group_size,
+                        groups_per_row, true, false, n_threads);
+        if (act != Activation::NONE && act_n_len != 0)
+            matmul_apply_activation(c_ptr, M, N, ldc, 0, M, act,
+                                    act_n_begin, act_n_len);
         return;
     }
 

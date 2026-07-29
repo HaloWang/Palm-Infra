@@ -854,7 +854,8 @@ static void matmul_fp32_range(const float* A, const float* B, float* C, int M,
 // FP16 variant: B is __fp16*, A and C are float*.
 static void matmul_fp16_range(const float* A, const __fp16* B, float* C, int M,
                               int N, int K, int lda, int K_weight, int ldc,
-                              int m_begin, int m_end) {
+                              int m_begin, int m_end,
+                              bool interleaved = false) {
 #if HAS_NEON
     matmul_fp16_neon_8x8_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin,
                                m_end);
@@ -865,7 +866,11 @@ static void matmul_fp16_range(const float* A, const __fp16* B, float* C, int M,
         for (int n = 0; n < N; n++) {
             float sum = 0.f;
             for (int k = 0; k < K; k++) {
-                sum += A[k + m * lda] * (float)B[n * K_weight + k];
+                const size_t weight_index = interleaved
+                    ? static_cast<size_t>(n & ~7) * K +
+                          static_cast<size_t>(k) * 8 + (n & 7)
+                    : static_cast<size_t>(n) * K_weight + k;
+                sum += A[k + m * lda] * (float)B[weight_index];
             }
             c_row[n] = sum;
         }
@@ -982,7 +987,13 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 #endif
-    bool use_interleave = is_fp16 && HAS_NEON && !is_repacked &&
+    // The following packed execution block is the ARM provider's hot path.
+    // Keep its symbols out of scalar translation units; layout selection is
+    // still made through the centralized CPU capability contract.
+#if HAS_NEON
+    bool use_interleave = is_fp16 &&
+                          mollm::cpu::capabilities().fp16_interleaved_weights &&
+                          !is_repacked &&
                           B.is_interleaved &&
                           g_matmul_config.use_interleave_pack;
     bool use_lane_fma = use_interleave && (M >= 8);
@@ -1171,6 +1182,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
         }
         return;
     }
+#endif  // HAS_NEON
 
     // ---- Standard path (FP32 or non-packed FP16) ----
 
@@ -1180,7 +1192,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     // Decide sharding dimension adaptively, similar to ggml:
     //   If N >> M, shard by N (e.g. lm_head: M=1, N=vocab_size).
     //   Otherwise shard by M (the common case).
-    bool shard_by_n = (N > M * 8 && M == 1);
+    bool shard_by_n = HAS_NEON && (N > M * 8 && M == 1);
 
     // Decide chunk size adaptively.
     // For GEMV-like shapes, use a larger chunk to reduce per-chunk overhead.
@@ -1201,7 +1213,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     if (!use_parallel) {
         if (is_fp16) {
             matmul_fp16_range(a_ptr, b_fp16, c_ptr, M, N, K, lda, K_weight, ldc,
-                              0, M);
+                              0, M, B.is_interleaved);
         } else {
             matmul_fp32_range(a_ptr, b_fp32, c_ptr, M, N, K, lda, K_weight, ldc,
                               0, M);
@@ -1219,7 +1231,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
                 0, N, chunk_size, [&](int, int n_begin, int n_end) {
                     matmul_fp16_range(a_ptr, b_fp16 + n_begin * K_weight,
                                       c_ptr + n_begin, M, n_end - n_begin, K,
-                                      lda, K_weight, ldc, 0, M);
+                                      lda, K_weight, ldc, 0, M, false);
                     const auto local = local_activation_range(
                         act_n_begin, act_n_len, n_begin, n_end);
                     if (act != Activation::NONE && local.length != 0) {
@@ -1247,7 +1259,8 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
             thread_pool->parallel_for(
                 0, M, chunk_size, [&](int, int m_begin, int m_end) {
                     matmul_fp16_range(a_ptr, b_fp16, c_ptr, M, N, K, lda,
-                                      K_weight, ldc, m_begin, m_end);
+                                      K_weight, ldc, m_begin, m_end,
+                                      B.is_interleaved);
                 });
         } else {
             thread_pool->parallel_for(
