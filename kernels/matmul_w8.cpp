@@ -957,9 +957,18 @@ bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
     }
     const int K = (int)inputs[0].shape[0];
     const int N = (int)weights[0].shape[0];
-    const int group_size = (int)weights[0].group_size;
-    const int groups_per_row = (int)weights[0].groups_per_row;
+    const Precision weight_precision = weights[0].prec;
+    const bool fp8_weights = weight_precision == Precision::FP8_E4M3;
+    if (weight_precision != Precision::INT8 && !fp8_weights)
+        return false;
+    const int group_size =
+        fp8_weights ? MATMUL_Q8_BLOCK : (int)weights[0].group_size;
+    const int groups_per_row =
+        fp8_weights ? K / MATMUL_Q8_BLOCK
+                    : (int)weights[0].groups_per_row;
     if (K <= 0 || N <= 0 || group_size <= 0 || groups_per_row <= 0)
+        return false;
+    if (fp8_weights && K % MATMUL_Q8_BLOCK != 0)
         return false;
     const int K_padded =
         ((K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK) * MATMUL_Q8_BLOCK;
@@ -985,11 +994,13 @@ bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
         const Tensor& weight = weights[i];
         Tensor& output = outputs[i];
         if (input.prec != Precision::FP32 || input.shape[0] != K ||
-            input.shape[1] != 1 || weight.prec != Precision::INT8 ||
+            input.shape[1] != 1 || weight.prec != weight_precision ||
             weight.shape[0] != N || weight.shape[1] != K ||
-            (int)weight.group_size != group_size ||
-            (int)weight.groups_per_row != groups_per_row ||
-            !weight.q8_repack_data || !weight.scales ||
+            (!fp8_weights &&
+             ((int)weight.group_size != group_size ||
+              (int)weight.groups_per_row != groups_per_row)) ||
+            !weight.q8_repack_data ||
+            (fp8_weights ? !weight.fp8_q8_scales : !weight.scales) ||
             output.prec != Precision::FP32 || output.shape[0] != N ||
             output.shape[1] != 1) {
             return false;
@@ -1004,19 +1015,31 @@ bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
         }
         scratch.input_indices[i] = input_index;
         if (input_index == i) {
-            quantize_a_q8_blocks(
-                input.ptr<float>(), 1, K, (int)(input.stride[1] / sizeof(float)),
-                K_padded, scratch.q_inputs[i], scratch.a_scales[i]);
+            if (fp8_weights) {
+                quantize_a_fp8_q8_blocks(
+                    input.ptr<float>(), 1, K,
+                    (int)(input.stride[1] / sizeof(float)), K_padded,
+                    scratch.q_inputs[i], scratch.a_scales[i]);
+            } else {
+                quantize_a_q8_blocks(
+                    input.ptr<float>(), 1, K,
+                    (int)(input.stride[1] / sizeof(float)), K_padded,
+                    scratch.q_inputs[i], scratch.a_scales[i]);
+            }
         }
         scratch.packed_weights[i] =
             reinterpret_cast<const int8_t*>(weight.q8_repack_data);
-        scratch.weight_scales[i] = weight.scales;
+        scratch.weight_scales[i] =
+            fp8_weights ? weight.fp8_q8_scales : weight.scales;
         scratch.outputs[i] = output.ptr<float>();
     }
 
     MatmulTimer timer;
-    timer.set_shape("q8dot_gemv_repack_batch", (int)batch, N, K, group_size,
-                    groups_per_row, true, false, thread_pool->num_threads());
+    timer.set_shape(
+        fp8_weights ? "fp8_q8dot_gemv_repack_batch"
+                    : "q8dot_gemv_repack_batch",
+        (int)batch, N, K, group_size, groups_per_row, true, false,
+        thread_pool->num_threads());
     int n_chunk = std::max(N / (thread_pool->num_threads() * 8), 64);
     n_chunk = ((n_chunk + 7) / 8) * 8;
     // `scratch` is thread-local to the dispatching thread. Capture its address
@@ -1047,7 +1070,8 @@ bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
 
 void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool, Activation act,
-                          int act_n_begin, int act_n_len, MatmulTimer& timer) {
+                          int act_n_begin, int act_n_len, MatmulTimer& timer,
+                          bool fp8_activation) {
     const int M = (int)A.shape[1];
     const int K = (int)A.shape[0];
     const int N = (int)B.shape[0];
@@ -1099,9 +1123,15 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         std::vector<float> a_scales;
         int K_padded =
             ((K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK) * MATMUL_Q8_BLOCK;
-        quantize_a_q8_blocks(a_ptr, M, K, lda,
-                             use_q8_dot_gemv_repack ? K_padded : K, qA,
-                             a_scales);
+        if (fp8_activation) {
+            quantize_a_fp8_q8_blocks(
+                a_ptr, M, K, lda,
+                use_q8_dot_gemv_repack ? K_padded : K, qA, a_scales);
+        } else {
+            quantize_a_q8_blocks(
+                a_ptr, M, K, lda,
+                use_q8_dot_gemv_repack ? K_padded : K, qA, a_scales);
+        }
         const int8_t* qA_data = qA.data();
         const float* a_scales_data = a_scales.data();
         if (!use_parallel) {
@@ -1163,9 +1193,15 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         std::vector<float> a_scales;
         int K_padded =
             ((K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK) * MATMUL_Q8_BLOCK;
-        quantize_a_q8_blocks(a_ptr, M, K, lda,
-                             use_q8_dot_gemm_repack ? K_padded : K, qA,
-                             a_scales);
+        if (fp8_activation) {
+            quantize_a_fp8_q8_blocks(
+                a_ptr, M, K, lda,
+                use_q8_dot_gemm_repack ? K_padded : K, qA, a_scales);
+        } else {
+            quantize_a_q8_blocks(
+                a_ptr, M, K, lda,
+                use_q8_dot_gemm_repack ? K_padded : K, qA, a_scales);
+        }
         const int8_t* qA_data = qA.data();
         const float* a_scales_data = a_scales.data();
         auto run_legacy_q8_gemm = [&](int m_begin, int m_end) {

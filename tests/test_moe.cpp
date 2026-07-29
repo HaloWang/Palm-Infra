@@ -187,7 +187,8 @@ int main() {
     std::vector<const Tensor*> inputs = {
         &hidden_t, &router_t, &gu_t, &down_t, &sg_t, &su_t, &sd_t, &seg_t,
     };
-    kernel_qwen3_moe(inputs, out_t, nullptr, H, E, KTOP, I, SI);
+    CHECK(kernel_qwen3_moe(inputs, out_t, nullptr, H, E, KTOP, I, SI),
+          "kernel_qwen3_moe reports successful execution");
     ref_moe(hidden, router, experts_gate_up, experts_down,
             shared_gate, shared_up, shared_down, shared_expert_gate,
             ref, H, M, E, KTOP, I, SI);
@@ -320,6 +321,68 @@ int main() {
     Tensor& graph_out = g.runtime.tensors[8];
     std::vector<float> graph_vals(graph_out.ptr<float>(), graph_out.ptr<float>() + H * M);
     CHECK(close_enough(graph_vals, ref, 1e-5f), "OpType::MOE graph dispatch matches reference");
+
+    // DeepSeek-V4 variant: hash-selected routes, sqrt-softplus weights,
+    // ungated shared expert, and clipped SwiGLU inputs.
+    {
+        float hidden_data[] = {20.0f};
+        float router_data[] = {0.0f, 0.0f};
+        float expert_gate_up_data[] = {
+            20.0f, 20.0f, // expert 0 gate/up
+            0.0f, 0.0f,   // expert 1 gate/up
+        };
+        float expert_down_data[] = {1.0f, 0.0f};
+        float shared_gate_data[] = {20.0f};
+        float shared_up_data[] = {20.0f};
+        float shared_down_data[] = {1.0f};
+        int32_t token_data[] = {0};
+        int32_t hash_data[] = {0};
+        float output_data[] = {0.0f};
+        Tensor hidden = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            hidden_data);
+        Tensor router = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
+            router_data);
+        Tensor expert_gate_up = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1,
+            expert_gate_up_data);
+        Tensor expert_down = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
+            expert_down_data);
+        Tensor shared_gate = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            shared_gate_data);
+        Tensor shared_up = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            shared_up_data);
+        Tensor shared_down = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            shared_down_data);
+        Tensor token_ids = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            token_data);
+        Tensor hash_table = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            hash_data);
+        Tensor output = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1,
+            output_data);
+        std::vector<const Tensor*> deepseek_inputs = {
+            &hidden, &router, &expert_gate_up, &expert_down,
+            &shared_gate, &shared_up, &shared_down,
+            &token_ids, &hash_table,
+        };
+        CHECK(kernel_qwen3_moe(
+                  deepseek_inputs, output, nullptr,
+                  1, 2, 1, 1, 1, 2, true, true, 1, 1, 1.0f,
+                  false, -1, 7, 8, 10.0f),
+              "DeepSeek hash MoE reports successful execution");
+        const float clipped =
+            10.0f / (1.0f + std::exp(-10.0f)) * 10.0f;
+        CHECK(std::abs(output_data[0] - 2.0f * clipped) < 1e-3f,
+              "DeepSeek hash MoE applies ungated shared expert and SwiGLU limit");
+    }
 
     return failures == 0 ? 0 : 1;
 }

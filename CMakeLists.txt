@@ -49,6 +49,7 @@ set(SOURCES
     kernels/matmul_w4.cpp
     kernels/matmul_w4_i8mm.cpp
     kernels/matmul_w8.cpp
+    kernels/matmul_mxfp4.cpp
     kernels/elementwise.cpp
     kernels/layout.cpp
     kernels/norm.cpp
@@ -58,6 +59,8 @@ set(SOURCES
     kernels/gdn.cpp
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
+    kernels/deepseek_v4_attention.cpp
+    kernels/hyper_connection.cpp
     kernels/moe.cpp
     kernels/moe_routing.cpp
     kernels/moe_ssd.cpp
@@ -333,6 +336,8 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_moe_routing  tests/test_moe_routing.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
+    add_mollm_test(test_hyper_connection tests/test_hyper_connection.cpp)
+    add_mollm_test(test_deepseek_v4_attention tests/test_deepseek_v4_attention.cpp)
     add_mollm_test(test_trace         tests/test_trace.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
     add_mollm_test(bench_sdpa         tests/bench_sdpa.cpp)

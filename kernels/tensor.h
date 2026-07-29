@@ -24,6 +24,13 @@ enum class Precision : uint8_t {
     FP16 = 1,
     INT8 = 2,
     INT4 = 3,
+    // DeepSeek-V4 dense matrices: E4M3 values with an explicitly described
+    // block-scale layout in the weight metadata.
+    FP8_E4M3 = 4,
+    // OCP MXFP4: packed E2M1 values, one E8M0 scale per 32 K elements.
+    MXFP4 = 5,
+    // Integer graph metadata such as token-to-expert routing tables.
+    INT32 = 6,
 };
 
 enum class MemoryType : uint8_t {
@@ -64,6 +71,18 @@ struct Tensor {
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
     const float* scales = nullptr; // quant scales for INT8/INT4 weights; borrowed from weight file
+    // Raw E8M0 block scales for FP8_E4M3 and MXFP4. E8M0 is a power-of-two
+    // scale encoding, so preserving it avoids expanding the 284B checkpoint.
+    const uint8_t* e8m0_scales = nullptr;
+    // Optional load-time Q8-dot sidecar for native FP8 weights. It keeps the
+    // package bytes in FP8 while avoiding per-token FP8 decode on CPUs without
+    // native FP8 arithmetic.
+    const float* fp8_q8_scales = nullptr;
+    // DeepSeek-V4 wo_a is defined as FP8 dequantized to BF16 before its
+    // grouped einsum. BF16 values are exactly representable in FP16, so this
+    // optional interleaved FP16 layout preserves those values while enabling
+    // the existing NEON dense kernel.
+    const void* fp8_bf16_fp16_data = nullptr;
     uint32_t    group_size = 0;    // K-dim quant group size; K means per-channel
     uint32_t    num_groups = 0;    // total groups = N * groups_per_row
     uint32_t    groups_per_row = 0;
@@ -72,6 +91,7 @@ struct Tensor {
     bool        is_q4_repacked = false; // INT4 data itself is [N/8, K/32, 8, 16B]
     bool        is_q4_g32_packed = false; // INT4 data itself is [N/8, K/32] G32 blocks
     bool        is_q4_g128_packed = false; // INT4 data itself is [N/8, K/128] G128 blocks
+    bool        is_fp8_block128 = false; // scales are [ceil(N/128),ceil(K/128)]
     const void* q8_repack_data = nullptr; // optional [N/8, K/32, 8, 32] INT8 dot layout
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
     const void* q4_g32_data = nullptr; // optional [N/8, K/32] G32 packed INT4+scales
@@ -122,6 +142,9 @@ struct Tensor {
         case Precision::FP16: return 2;
         case Precision::INT8: return 1;
         case Precision::INT4: return 1; // packed storage byte; logical element is a nibble
+        case Precision::FP8_E4M3: return 1;
+        case Precision::MXFP4: return 1; // packed storage byte; logical element is a nibble
+        case Precision::INT32: return 4;
         }
         return 0;
     }
@@ -314,6 +337,9 @@ inline size_t precision_size(Precision p) {
     case Precision::FP16: return 2;
     case Precision::INT8: return 1;
     case Precision::INT4: return 1; // packed storage byte
+    case Precision::FP8_E4M3: return 1;
+    case Precision::MXFP4: return 1; // packed storage byte
+    case Precision::INT32: return 4;
     }
     return 0;
 }

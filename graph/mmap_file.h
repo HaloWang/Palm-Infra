@@ -19,6 +19,7 @@
 //                             float scales[8] + q4dot q[4][8][16B]
 //                      bit 2: INT4 data is BG32 layout [N/8,K/32] blocks:
 //                             float scales[8] + q4dot q[8][16B]
+//                      bit 3: FP8 E4M3 scales are E8M0 over 128x128 blocks
 //   8       4      ndim    — number of dimensions (1-4)
 //   12      4      precision — Precision enum value
 //   16      8      shape[0]
@@ -44,6 +45,7 @@ public:
     static constexpr uint32_t FLAG_INT4_Q4DOT = 1u << 0;
     static constexpr uint32_t FLAG_INT4_BG128 = 1u << 1;
     static constexpr uint32_t FLAG_INT4_BG32 = 1u << 2;
+    static constexpr uint32_t FLAG_FP8_BLOCK128 = 1u << 3;
 
     struct Header {
         uint32_t magic;

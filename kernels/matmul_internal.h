@@ -132,6 +132,15 @@ inline void matmul_apply_activation_gemv(float* C, int N, Activation act,
 void quantize_a_q8_blocks(const float* A, int M, int K, int lda, int K_padded,
                           std::vector<int8_t>& qA,
                           std::vector<float>& a_scales);
+// DeepSeek-V4 quantized linears first round activations to E4M3 with one
+// power-of-two E8M0 scale per 128 K elements. These helpers preserve that
+// model-visible quantization before mapping the coefficients to Q8 for ARM
+// SDOT/i8mm execution.
+void quantize_a_fp8_q8_blocks(const float* A, int M, int K, int lda,
+                              int K_padded, std::vector<int8_t>& qA,
+                              std::vector<float>& a_scales);
+void quantize_a_fp8_dequant(const float* A, int M, int K, int lda,
+                            std::vector<float>& output);
 void quantize_a_q8_blocks_a4(const float* A, int M, int K, int lda,
                              std::vector<Q8A4Block>& qA4);
 void quantize_a_q8_blocks_i8mm_a8(const float* A, int M, int K, int lda,
@@ -150,6 +159,11 @@ void quantize_a_q8_blocks_even_odd(const float* A, int K,
                                    std::vector<int8_t>& qA_even,
                                    std::vector<int8_t>& qA_odd,
                                    std::vector<float>& a_scales);
+void quantize_a_fp8_q8_even_odd(const float* A, int K,
+                               std::vector<int8_t>& qA_even,
+                               std::vector<int8_t>& qA_odd,
+                               std::vector<float>& a_scales,
+                               std::vector<float>* fp8_dequant = nullptr);
 // BG128 decode variant: one activation scale covers four 32-value dot blocks.
 void quantize_a_q8_g128_even_odd(const float* A, int K,
                                  std::vector<int8_t>& qA_even,
@@ -161,8 +175,16 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
                           int act_n_begin, int act_n_len, MatmulTimer& timer);
 void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool, Activation act,
-                          int act_n_begin, int act_n_len, MatmulTimer& timer);
+                          int act_n_begin, int act_n_len, MatmulTimer& timer,
+                          bool fp8_activation = false);
 void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
                            ThreadPool* thread_pool, Activation act,
                            int act_n_begin, int act_n_len, MatmulTimer& timer,
                            bool force_fp32_acc = false);
+void matmul_dispatch_mxfp4(const Tensor& A, const Tensor& B, Tensor& C,
+                           ThreadPool* thread_pool, Activation act,
+                           int act_n_begin, int act_n_len, MatmulTimer& timer);
+void matmul_dispatch_fp8_e4m3(const Tensor& A, const Tensor& B, Tensor& C,
+                              ThreadPool* thread_pool, Activation act,
+                              int act_n_begin, int act_n_len,
+                              MatmulTimer& timer);

@@ -1,4 +1,6 @@
 #include "kernels/moe.h"
+
+#include "kernels/bf16.h"
 #include "kernels/matmul.h"
 #include "kernels/moe_routing.h"
 #include "kernels/moe_ssd.h"
@@ -90,7 +92,10 @@ static inline float load_weight_at(const Tensor& t, int64_t row, int col, int K)
     const float* scales = t.scales;
     const bool has_embedded_bg128_scales =
         t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data;
-    if (!scales && !has_embedded_bg128_scales) return 0.0f;
+    if (!scales && !has_embedded_bg128_scales &&
+        !(t.prec == Precision::MXFP4 && t.e8m0_scales)) {
+        return 0.0f;
+    }
 
     if (t.prec == Precision::INT8) {
         const int8_t* q = static_cast<const int8_t*>(t.data);
@@ -128,6 +133,19 @@ static inline float load_weight_at(const Tensor& t, int64_t row, int col, int K)
         return (float)unpack_int4_signed(byte, (col & 1) != 0) * scale;
     }
 
+    if (t.prec == Precision::MXFP4 && t.e8m0_scales &&
+        t.group_size == 32) {
+        const uint8_t* q = static_cast<const uint8_t*>(t.data);
+        const int row_stride = (K + 1) / 2;
+        const uint8_t byte =
+            q[static_cast<size_t>(row) * row_stride +
+              static_cast<size_t>(col >> 1)];
+        const uint8_t nibble = (col & 1) ? byte >> 4 : byte & 0x0f;
+        return decode_mxfp4_e2m1(nibble) *
+               decode_e8m0(
+                   t.e8m0_scales[row * groups_per_row + group]);
+    }
+
     return 0.0f;
 }
 
@@ -146,13 +164,21 @@ static void apply_swiglu(const float* gate,
                          int width,
                          int gate_stride,
                          int up_stride,
-                         int output_stride) {
+                         int output_stride,
+                         float limit = 0.0f) {
     for (int row = 0; row < rows; ++row) {
         const float* gate_row = gate + static_cast<size_t>(row) * gate_stride;
         const float* up_row = up + static_cast<size_t>(row) * up_stride;
         float* output_row = output + static_cast<size_t>(row) * output_stride;
-        for (int col = 0; col < width; ++col)
-            output_row[col] = silu_scalar(gate_row[col]) * up_row[col];
+        for (int col = 0; col < width; ++col) {
+            float gate_value = gate_row[col];
+            float up_value = up_row[col];
+            if (limit > 0.0f) {
+                gate_value = std::min(gate_value, limit);
+                up_value = std::clamp(up_value, -limit, limit);
+            }
+            output_row[col] = silu_scalar(gate_value) * up_value;
+        }
     }
 }
 
@@ -186,6 +212,7 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     view.stride[3] = view.stride[2];
 
     view.scales = nullptr;
+    view.e8m0_scales = nullptr;
     view.num_groups = 0;
     view.is_interleaved = false;
     view.is_q4_repacked = false;
@@ -205,6 +232,24 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     int groups_per_row = src.groups_per_row > 0
         ? (int)src.groups_per_row
         : (src.group_size > 0 ? (K + (int)src.group_size - 1) / (int)src.group_size : 0);
+    if (src.prec == Precision::MXFP4) {
+        if (!src.e8m0_scales || src.group_size != 32 ||
+            groups_per_row <= 0 || (K % 32) != 0) {
+            return false;
+        }
+        view.data = static_cast<char*>(src.data) +
+                    static_cast<size_t>(row0) * (K / 2);
+        view.e8m0_scales =
+            src.e8m0_scales +
+            static_cast<size_t>(row0) * groups_per_row;
+        view.group_size = 32;
+        view.groups_per_row = static_cast<uint32_t>(groups_per_row);
+        view.num_groups =
+            static_cast<uint32_t>(
+                static_cast<size_t>(rows) * groups_per_row);
+        return true;
+    }
+
     const bool embeds_scales =
         (src.is_q4_g32_packed && src.q4_g32_data) ||
         (src.is_q4_g128_packed && src.q4_g128_data);
@@ -295,8 +340,10 @@ static bool validate_inputs(const std::vector<const Tensor*>& inputs,
                             int top_k,
                             int intermediate_size,
                             int shared_intermediate_size,
-                            bool has_shared_expert) {
-    size_t required_inputs = has_shared_expert ? 8 : 4;
+                            bool has_shared_expert,
+                            bool shared_expert_has_gate) {
+    size_t required_inputs =
+        has_shared_expert ? (shared_expert_has_gate ? 8 : 7) : 4;
     if (inputs.size() < required_inputs) {
         std::fprintf(stderr, "MOE: expected at least %zu inputs, got %zu\n",
                      required_inputs, inputs.size());
@@ -337,7 +384,8 @@ static bool routed_ffn_scalar_fallback(const Tensor& experts_gate_up,
                                        int expert_id,
                                        float route_w,
                                        int hidden_size,
-                                       int intermediate_size) {
+                                       int intermediate_size,
+                                       float swiglu_limit) {
     std::vector<float> gate_up(2 * intermediate_size);
     std::vector<float> inter(intermediate_size);
     int64_t gu_base = (int64_t)expert_id * (int64_t)(2 * intermediate_size) * hidden_size;
@@ -349,7 +397,7 @@ static bool routed_ffn_scalar_fallback(const Tensor& experts_gate_up,
     apply_swiglu(gate_up.data(), gate_up.data() + intermediate_size,
                  inter.data(), 1, intermediate_size,
                  2 * intermediate_size, 2 * intermediate_size,
-                 intermediate_size);
+                 intermediate_size, swiglu_limit);
     for (int d = 0; d < hidden_size; d++) {
         float sum = 0.0f;
         int64_t row = (int64_t)expert_id * hidden_size + d;
@@ -412,7 +460,7 @@ extern "C" void mollm_print_moe_profile(const char* title) {
     }
 }
 
-void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
+bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       Tensor& output,
                       ThreadPool* thread_pool,
                       int hidden_size,
@@ -425,17 +473,24 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       bool has_shared_expert,
                       int n_group,
                       int topk_group,
-                      float routed_scaling_factor) {
+                      float routed_scaling_factor,
+                      bool shared_expert_has_gate,
+                      int router_bias_input,
+                      int token_ids_input,
+                      int hash_table_input,
+                      float swiglu_limit) {
     if (!validate_inputs(inputs, output, hidden_size, num_experts, top_k,
                          intermediate_size, shared_intermediate_size,
-                         has_shared_expert)) {
-        return;
+                         has_shared_expert, shared_expert_has_gate)) {
+        return false;
     }
 
     const Tensor& hidden = *inputs[0];
     const Tensor& router = *inputs[1];
     const Tensor& experts_gate_up = *inputs[2];
     const Tensor& experts_down = *inputs[3];
+    const bool use_bf16_activations =
+        experts_gate_up.prec == Precision::MXFP4;
     const auto* gate_up_source = static_cast<const MoeSsdTensorSource*>(
         experts_gate_up.moe_ssd_source);
     const auto* down_source = static_cast<const MoeSsdTensorSource*>(
@@ -444,7 +499,7 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (use_ssd && (!gate_up_source || !down_source ||
                     gate_up_source->cache != down_source->cache)) {
         std::fprintf(stderr, "MOE: incomplete SSD expert source pair\n");
-        return;
+        return false;
     }
     std::string trace_layer_args;
     if (mollm_trace::enabled()) {
@@ -453,11 +508,16 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             : "{}";
     }
     mollm_trace::ScopedEvent trace_moe("compute", "moe", trace_layer_args);
-    const Tensor* router_bias = inputs.size() > 8 ? inputs[8] : nullptr;
+    const Tensor* router_bias =
+        router_bias_input >= 0 &&
+                static_cast<size_t>(router_bias_input) < inputs.size()
+            ? inputs[router_bias_input]
+            : nullptr;
     const Tensor* shared_gate = has_shared_expert ? inputs[4] : nullptr;
     const Tensor* shared_up = has_shared_expert ? inputs[5] : nullptr;
     const Tensor* shared_down = has_shared_expert ? inputs[6] : nullptr;
-    const Tensor* shared_expert_gate = has_shared_expert ? inputs[7] : nullptr;
+    const Tensor* shared_expert_gate =
+        has_shared_expert && shared_expert_has_gate ? inputs[7] : nullptr;
 
     assert(hidden.prec == Precision::FP32);
     const int seq_len = (int)hidden.shape[1];
@@ -499,11 +559,27 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     if (profile) stage_start = moe_profile_now();
     {
         mollm_trace::ScopedEvent trace_topk("compute", "moe.topk", trace_layer_args);
-        if (!mollm::detail::select_moe_routes(
+        bool selected = false;
+        if (token_ids_input >= 0 && hash_table_input >= 0 &&
+            static_cast<size_t>(token_ids_input) < inputs.size() &&
+            static_cast<size_t>(hash_table_input) < inputs.size() &&
+            inputs[token_ids_input] && inputs[hash_table_input] &&
+            inputs[token_ids_input]->prec == Precision::INT32 &&
+            inputs[hash_table_input]->prec == Precision::INT32) {
+            selected = mollm::detail::select_moe_hash_routes(
+                router_logits.data(), seq_len,
+                inputs[token_ids_input]->ptr<int32_t>(),
+                inputs[hash_table_input]->ptr<int32_t>(),
+                static_cast<int>(inputs[hash_table_input]->shape[1]),
+                routing, top_idx, top_w);
+        } else {
+            selected = mollm::detail::select_moe_routes(
                 router_logits.data(), seq_len, bias_data, routing,
-                top_idx, top_w)) {
+                top_idx, top_w);
+        }
+        if (!selected) {
             std::fprintf(stderr, "MOE: failed to select routed experts\n");
-            return;
+            return false;
         }
     }
     if (profile) moe_profile_add(MoeProfileStage::TopK, stage_start);
@@ -523,6 +599,12 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         std::sort(selected_experts.begin(), selected_experts.end());
         selected_experts.erase(std::unique(selected_experts.begin(), selected_experts.end()),
                                selected_experts.end());
+        if (seq_len == 1 && !top_idx.empty()) {
+            std::vector<int> ranked_experts(
+                top_idx.begin(), top_idx.begin() + top_k);
+            gate_up_source->cache->retain_for_next_forward(
+                gate_up_source, down_source, ranked_experts);
+        }
         // Queue all cache misses before shared-expert work. The I/O workers
         // can now fill them while this CPU thread executes the independent
         // shared MLP below; acquire() only waits for a particular expert when
@@ -530,21 +612,26 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         if (!gate_up_source->cache->request_many(gate_up_source, down_source,
                                                   selected_experts)) {
             std::fprintf(stderr, "MOE: failed to queue SSD expert reads\n");
-            return;
+            return false;
         }
         stream_ssd_window = gate_up_source->cache->resident_count(
             gate_up_source, down_source, selected_experts) < selected_experts.size();
     }
 
-    // Shared expert: shared_down(silu(shared_gate(x)) * shared_up(x))
-    // multiplied by sigmoid(shared_expert_gate(x)).
+    // Compute the shared expert while routed-expert reads are in flight, but
+    // defer its accumulation.  The reference accumulates routed experts first
+    // and adds the shared expert last; preserving that FP32 summation order
+    // avoids a small but systematic logits drift without sacrificing overlap.
+    std::vector<float> shared_contribution;
+    std::vector<float> shared_scales;
     if (has_shared_expert) {
         mollm_trace::ScopedEvent trace_shared("compute", "moe.shared", trace_layer_args);
         std::vector<float> shared_gate_out((size_t)seq_len * (size_t)shared_intermediate_size);
         std::vector<float> shared_up_out((size_t)seq_len * (size_t)shared_intermediate_size);
         std::vector<float> shared_inter((size_t)seq_len * (size_t)shared_intermediate_size);
-        std::vector<float> shared_down_out((size_t)seq_len * (size_t)hidden_size);
-        std::vector<float> shared_scale((size_t)seq_len);
+        shared_contribution.resize(
+            (size_t)seq_len * (size_t)hidden_size);
+        shared_scales.resize((size_t)seq_len);
 
         Tensor shared_gate_b = make_weight_view_2d(*shared_gate, shared_intermediate_size, hidden_size);
         Tensor shared_up_b = make_weight_view_2d(*shared_up, shared_intermediate_size, hidden_size);
@@ -559,8 +646,13 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 shared_gate_b, shared_up_b};
             std::vector<Tensor> shared_outputs = {
                 shared_gate_t, shared_up_t};
-            batched_gate_up = kernel_matmul_int4_gemv_batch(
-                shared_inputs, shared_weights, shared_outputs, thread_pool);
+            batched_gate_up =
+                kernel_matmul_int4_gemv_batch(
+                    shared_inputs, shared_weights, shared_outputs,
+                    thread_pool) ||
+                kernel_matmul_int8_gemv_batch(
+                    shared_inputs, shared_weights, shared_outputs,
+                    thread_pool);
         }
         if (!batched_gate_up) {
             kernel_matmul_fp32(
@@ -568,28 +660,54 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             kernel_matmul_fp32(
                 hidden, shared_up_b, shared_up_t, thread_pool);
         }
+        if (use_bf16_activations) {
+            mollm_round_to_bf16(
+                shared_gate_out.data(), shared_gate_out.size());
+            mollm_round_to_bf16(
+                shared_up_out.data(), shared_up_out.size());
+        }
         apply_swiglu(shared_gate_out.data(), shared_up_out.data(),
                      shared_inter.data(), seq_len, shared_intermediate_size,
                      shared_intermediate_size, shared_intermediate_size,
-                     shared_intermediate_size);
+                     shared_intermediate_size, swiglu_limit);
+        if (use_bf16_activations)
+            mollm_round_to_bf16(
+                shared_inter.data(), shared_inter.size());
         if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
 
         Tensor shared_inter_t = make_fp32_tensor(shared_inter.data(), shared_intermediate_size, seq_len);
         Tensor shared_down_b = make_weight_view_2d(*shared_down, hidden_size, shared_intermediate_size);
-        Tensor shared_down_t = make_fp32_tensor(shared_down_out.data(), hidden_size, seq_len);
+        Tensor shared_down_t = make_fp32_tensor(
+            shared_contribution.data(), hidden_size, seq_len);
         std::vector<float> shared_gate_scale_out((size_t)seq_len);
-        Tensor shared_scale_b = make_weight_view_2d(*shared_expert_gate, 1, hidden_size);
+        Tensor shared_scale_b;
+        if (shared_expert_has_gate) {
+            shared_scale_b =
+                make_weight_view_2d(*shared_expert_gate, 1, hidden_size);
+        }
         Tensor shared_scale_t = make_fp32_tensor(shared_gate_scale_out.data(), 1, seq_len);
 
         if (profile) stage_start = moe_profile_now();
         kernel_matmul_fp32(shared_inter_t, shared_down_b, shared_down_t, thread_pool);
-        kernel_matmul_fp32(hidden, shared_scale_b, shared_scale_t, thread_pool);
+        if (shared_expert_has_gate) {
+            kernel_matmul_fp32(
+                hidden, shared_scale_b, shared_scale_t, thread_pool);
+        } else {
+            std::fill(shared_gate_scale_out.begin(),
+                      shared_gate_scale_out.end(), 1.0f);
+        }
+        if (use_bf16_activations) {
+            mollm_round_to_bf16(
+                shared_contribution.data(), shared_contribution.size());
+            mollm_round_to_bf16(
+                shared_gate_scale_out.data(),
+                shared_gate_scale_out.size());
+        }
         for (int t = 0; t < seq_len; t++) {
-            shared_scale[t] = sigmoid_scalar(shared_gate_scale_out[t]);
-            const float* src = shared_down_out.data() + (size_t)t * hidden_size;
-            float* dst = out_data + (int64_t)t * ldo;
-            float scale = shared_scale[t];
-            for (int d = 0; d < hidden_size; d++) dst[d] += scale * src[d];
+            shared_scales[t] =
+                shared_expert_has_gate
+                    ? sigmoid_scalar(shared_gate_scale_out[t])
+                    : 1.0f;
         }
         if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
     }
@@ -652,7 +770,7 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                     gate_up_weights[i], down_weights[i])) {
                 std::fprintf(stderr, "MOE: failed to page in expert %d\n",
                              batched_experts[i]);
-                return;
+                return false;
             }
             batched_slots[batched_experts[i]] = (int)i;
         }
@@ -685,6 +803,8 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             mollm_trace::ScopedEvent trace_batch(
                 "compute", "moe.routed_gate_up_batch", batch_trace_args);
             if (!kernel_matmul_int4_gemv_batch(
+                    gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
+                !kernel_matmul_mxfp4_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -695,11 +815,29 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             for (size_t i = 0; i < batch; ++i) {
                 float* gate_up = batch_gate_up_out.data() +
                     i * (size_t)(2 * intermediate_size);
+                if (use_bf16_activations) {
+                    mollm_round_to_bf16(
+                        gate_up,
+                        static_cast<size_t>(2 * intermediate_size));
+                }
                 apply_swiglu(
                     gate_up, gate_up + intermediate_size,
                     batch_inter.data() + i * (size_t)intermediate_size,
                     1, intermediate_size, 2 * intermediate_size,
-                    2 * intermediate_size, intermediate_size);
+                    2 * intermediate_size, intermediate_size,
+                    swiglu_limit);
+                if (use_bf16_activations) {
+                    const int route = offsets[batched_experts[i]];
+                    const float route_weight = route_weights[route];
+                    float* intermediate =
+                        batch_inter.data() +
+                        i * (size_t)intermediate_size;
+                    for (int dim = 0; dim < intermediate_size; ++dim)
+                        intermediate[dim] *= route_weight;
+                    mollm_round_to_bf16(
+                        intermediate,
+                        static_cast<size_t>(intermediate_size));
+                }
             }
         }
         if (profile)
@@ -722,6 +860,8 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             mollm_trace::ScopedEvent trace_batch(
                 "compute", "moe.routed_down_batch", batch_trace_args);
             if (!kernel_matmul_int4_gemv_batch(
+                    down_inputs, down_weights, down_outputs, thread_pool) &&
+                !kernel_matmul_mxfp4_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -732,6 +872,9 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         }
         if (profile)
             moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
+        if (use_bf16_activations)
+            mollm_round_to_bf16(
+                batch_down_out.data(), batch_down_out.size());
     }
 
     auto advance_stream_window = [&](int expert) {
@@ -768,13 +911,14 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         if (batched_slot >= 0) {
             if (profile) stage_start = moe_profile_now();
             const int route = offsets[e];
-            const float weight = route_weights[route];
             const float* src = batch_down_out.data() +
                 (size_t)batched_slot * hidden_size;
             float* dst =
                 out_data + (int64_t)route_tokens[route] * ldo;
+            const float output_scale =
+                use_bf16_activations ? 1.0f : route_weights[route];
             for (int d = 0; d < hidden_size; ++d)
-                dst[d] += weight * src[d];
+                dst[d] += output_scale * src[d];
             if (profile)
                 moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
 
@@ -802,7 +946,7 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (!gate_up_source->cache->acquire(gate_up_source, down_source, e,
                                                 gate_up_b, down_b)) {
                 std::fprintf(stderr, "MOE: failed to page in expert %d\n", e);
-                return;
+                return false;
             }
             has_gate_up_view = true;
             has_down_view = true;
@@ -816,13 +960,20 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         }
 
         if (!has_gate_up_view || !has_down_view) {
+            if (use_bf16_activations) {
+                std::fprintf(
+                    stderr,
+                    "MOE: MXFP4 expert does not support the scalar fallback\n");
+                return false;
+            }
             for (int i = 0; i < count; i++) {
                 int t = route_tokens[begin + i];
                 routed_ffn_scalar_fallback(experts_gate_up, experts_down,
                                            x_data + (int64_t)t * ldx,
                                            out_data + (int64_t)t * ldo,
                                            e, route_weights[begin + i],
-                                           hidden_size, intermediate_size);
+                                           hidden_size, intermediate_size,
+                                           swiglu_limit);
             }
             continue;
         }
@@ -837,26 +988,57 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             Tensor gate_up_t = make_fp32_tensor(gate_up_out.data(), 2 * intermediate_size, count);
             if (profile) stage_start = moe_profile_now();
             kernel_matmul_fp32(expert_x_t, gate_up_b, gate_up_t, thread_pool);
+            if (use_bf16_activations) {
+                mollm_round_to_bf16(
+                    gate_up_out.data(),
+                    static_cast<size_t>(count) *
+                        static_cast<size_t>(2 * intermediate_size));
+            }
             apply_swiglu(gate_up_out.data(),
                          gate_up_out.data() + intermediate_size,
                          routed_inter.data(), count, intermediate_size,
                          2 * intermediate_size, 2 * intermediate_size,
-                         intermediate_size);
+                         intermediate_size, swiglu_limit);
+            if (use_bf16_activations) {
+                for (int i = 0; i < count; ++i) {
+                    float* intermediate =
+                        routed_inter.data() +
+                        static_cast<size_t>(i) * intermediate_size;
+                    const float route_weight =
+                        route_weights[begin + i];
+                    for (int dim = 0; dim < intermediate_size; ++dim)
+                        intermediate[dim] *= route_weight;
+                }
+                mollm_round_to_bf16(
+                    routed_inter.data(),
+                    static_cast<size_t>(count) *
+                        static_cast<size_t>(intermediate_size));
+            }
             if (profile) moe_profile_add(MoeProfileStage::RoutedGateUp, stage_start);
 
             Tensor inter_t = make_fp32_tensor(routed_inter.data(), intermediate_size, count);
             Tensor down_t = make_fp32_tensor(down_out.data(), hidden_size, count);
             if (profile) stage_start = moe_profile_now();
             kernel_matmul_fp32(inter_t, down_b, down_t, thread_pool);
+            if (use_bf16_activations) {
+                mollm_round_to_bf16(
+                    down_out.data(),
+                    static_cast<size_t>(count) *
+                        static_cast<size_t>(hidden_size));
+            }
             if (profile) moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
 
             if (profile) stage_start = moe_profile_now();
             for (int i = 0; i < count; i++) {
                 int t = route_tokens[begin + i];
-                float weight = route_weights[begin + i];
                 const float* src = down_out.data() + (size_t)i * hidden_size;
                 float* dst = out_data + (int64_t)t * ldo;
-                for (int d = 0; d < hidden_size; d++) dst[d] += weight * src[d];
+                const float output_scale =
+                    use_bf16_activations
+                        ? 1.0f
+                        : route_weights[begin + i];
+                for (int d = 0; d < hidden_size; d++)
+                    dst[d] += output_scale * src[d];
             }
             if (profile) moe_profile_add(MoeProfileStage::RoutedScatter, stage_start);
         }
@@ -865,4 +1047,16 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         // so its replacement read overlaps the next ready expert.
         advance_stream_window(e);
     }
+
+    if (has_shared_expert) {
+        for (int t = 0; t < seq_len; ++t) {
+            const float* src =
+                shared_contribution.data() + (size_t)t * hidden_size;
+            float* dst = out_data + (int64_t)t * ldo;
+            const float scale = shared_scales[t];
+            for (int d = 0; d < hidden_size; ++d)
+                dst[d] += scale * src[d];
+        }
+    }
+    return true;
 }

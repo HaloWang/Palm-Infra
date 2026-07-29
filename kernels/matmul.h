@@ -21,6 +21,35 @@ struct MatmulConfig {
 extern MatmulConfig g_matmul_config;
 extern bool g_mollm_force_fp32_acc; // debug: force FP32 accumulation
 
+// Low-precision floating-point helpers. MXFP4 uses the OCP-defined E2M1
+// element encoding and E8M0 block scale; FP8 dense weights use E4M3FN.
+float decode_e8m0(uint8_t value);
+float decode_fp8_e4m3fn(uint8_t value);
+uint8_t encode_fp8_e4m3fn(float value);
+float decode_mxfp4_e2m1(uint8_t nibble);
+
+// Build the load-time Q8-dot sidecar used to execute native FP8 weights on
+// ARM CPUs without retaining a dequantized FP16/FP32 copy.
+size_t pack_fp8_e4m3_q8dot_bytes(int N, int K);
+bool pack_fp8_e4m3_q8dot(const uint8_t* source,
+                         const uint8_t* e8m0_scales,
+                         int N, int K,
+                         int8_t* packed,
+                         float* q8_scales);
+
+// Exact F32-activation reference path used by validation and as the portable
+// fallback for MXFP4 GEMM. Production M=1 dispatch uses the Q8/SDOT path.
+void kernel_matmul_mxfp4_reference(const Tensor& A, const Tensor& B, Tensor& C,
+                                   ThreadPool* thread_pool = nullptr);
+
+// Multiply ordinary floating-point activations by a native block-scaled FP8
+// weight without quantizing the activation. DeepSeek-V4's grouped wo_a
+// projection is defined this way: the official runtime dequantizes that
+// checkpoint tensor to BF16 and executes a regular einsum.
+bool kernel_matmul_fp8_weight_f32_activation(
+    const Tensor& A, const Tensor& B, Tensor& C,
+    ThreadPool* thread_pool = nullptr);
+
 // Engine-lifetime buffers that own load-time matmul repacks. The key is the
 // package/file weight path plus a layout suffix where one source weight needs
 // multiple layouts.
@@ -37,7 +66,14 @@ bool matmul_int4_q4dot_kernel_available();
 void prepare_matmul_weight(Tensor& weight, const std::string& key,
                            const void* weight_data,
                            PackedWeightMap& packed_weights,
-                           bool pack_fp16 = true);
+                           bool pack_fp16 = true,
+                           bool pack_fp8 = true);
+
+// Build the exact-value interleaved FP16 layout for a block-scaled FP8 tensor
+// whose reference semantics first round dequantized weights to BF16.
+bool prepare_fp8_bf16_fp16_weight(
+    Tensor& weight, const std::string& key, const void* weight_data,
+    PackedWeightMap& packed_weights);
 
 extern "C" {
 int mollm_matmul_shape_profile_enabled();
@@ -80,10 +116,17 @@ bool kernel_matmul_int4_gemv_batch(const std::vector<Tensor>& inputs,
                                    const std::vector<Tensor>& weights,
                                    std::vector<Tensor>& outputs,
                                    ThreadPool* thread_pool);
+// Execute several Q8-dot GEMVs backed by either native INT8 weights or the
+// load-time Q8 sidecar of FP8_E4M3 weights. Identical input pointers share one
+// activation quantization.
 bool kernel_matmul_int8_gemv_batch(const std::vector<Tensor>& inputs,
                                    const std::vector<Tensor>& weights,
                                    std::vector<Tensor>& outputs,
                                    ThreadPool* thread_pool);
+bool kernel_matmul_mxfp4_gemv_batch(const std::vector<Tensor>& inputs,
+                                    const std::vector<Tensor>& weights,
+                                    std::vector<Tensor>& outputs,
+                                    ThreadPool* thread_pool);
 
 // Execute independent, same-shaped [A, weight] pairs into consecutive slices
 // of one output tensor. Decode can share a single worker-pool dispatch.

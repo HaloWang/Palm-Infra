@@ -593,6 +593,45 @@ int main() {
     CHECK(pool4.active_bytes() == reshape_active, "non-contiguous reshape repeated execute does not grow active pool bytes");
     CHECK(pool4.acquire_count() == reshape_acquires, "static workspace reuses materialized reshape buffer without reacquire");
 
+    // Checked model-specific kernels must abort the graph on malformed input
+    // instead of leaving a zero-filled tensor that looks like valid output.
+    {
+        Graph bad;
+        GraphNode input;
+        input.id = 0;
+        input.op_type = OpType::INPUT;
+        input.out_shape[0] = 4;
+        input.out_shape[1] = 1;
+        input.out_prec = Precision::FP32;
+        bad.nodes.push_back(input);
+
+        GraphNode sparse;
+        sparse.id = 1;
+        sparse.op_type = OpType::DSV4_SPARSE_ATTN;
+        sparse.inputs = {0};  // Deliberately missing the other five inputs.
+        sparse.out_shape[0] = 4;
+        sparse.out_shape[1] = 1;
+        sparse.out_prec = Precision::FP32;
+        bad.nodes.push_back(sparse);
+        bad.graph_inputs = {0};
+        bad.graph_outputs = {1};
+        bad.runtime.tensors.resize(2);
+        float bad_input[4] = {};
+        bad.runtime.tensors[0] = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            4, 1, 1, 1, bad_input);
+
+        BufferPool bad_pool;
+        ExecContext bad_ctx;
+        bad_ctx.graph = &bad;
+        bad_ctx.pool = &bad_pool;
+        bad_ctx.backend = &cpu_backend;
+        prepare_execution(bad_ctx);
+        execute_graph(bad_ctx);
+        CHECK(bad_ctx.execution_failed,
+              "malformed DeepSeek operator aborts graph execution");
+    }
+
     delete[] input_data;
     delete[] d2;
     delete[] d3;

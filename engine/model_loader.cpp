@@ -23,6 +23,7 @@ MetalBackend* as_metal(const std::unique_ptr<Backend>& backend) {
 #include <cstring>
 #include <limits>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include <sys/mman.h>
@@ -39,6 +40,7 @@ enum class PersistentInputKind {
     STATE,
     ATT_SHIFT,
     FFN_SHIFT,
+    AUX_STATE,
 };
 
 struct PersistentInput {
@@ -79,6 +81,8 @@ PersistentInput parse_persistent_input(const std::string& name) {
         input.kind = PersistentInputKind::ATT_SHIFT;
     } else if (parse_indexed_input_name(name, "rwkv_ffn_shift", input.layer)) {
         input.kind = PersistentInputKind::FFN_SHIFT;
+    } else if (parse_indexed_input_name(name, "aux_state", input.layer)) {
+        input.kind = PersistentInputKind::AUX_STATE;
     }
     return input;
 }
@@ -118,6 +122,7 @@ void LLMEngine::clear_model_state() {
     metal_backend_.reset();
 
     caches_.clear();
+    auxiliary_states_.clear();
     embed_weight_ = nullptr;
     lm_head_weight_ = nullptr;
     vision_pos_embed_ = nullptr;
@@ -135,7 +140,7 @@ void LLMEngine::clear_model_state() {
     shared_weights_.clear();
     packed_weights_.clear();
     package_weight_map_.clear();
-    moe_ssd_expert_ranges_.clear();
+    mmap_weight_exclusion_ranges_.clear();
 
     if (package_mmap_) {
         munmap(package_mmap_, package_mmap_size_);
@@ -177,7 +182,8 @@ size_t LLMEngine::warmup_package_weights() {
     const size_t len = package_weights_size_;
 
     const auto expert_ranges =
-        mollm::detail::normalize_byte_ranges(moe_ssd_expert_ranges_, len);
+        mollm::detail::normalize_byte_ranges(
+            mmap_weight_exclusion_ranges_, len);
 
 #if defined(MADV_WILLNEED)
     // Preserve the eager readahead behaviour for ordinary mmap packages. In
@@ -225,7 +231,8 @@ size_t LLMEngine::lock_dense_package_weights() {
         system_page > 0 ? static_cast<size_t>(system_page) : 4096;
 
     const auto expert_ranges =
-        mollm::detail::normalize_byte_ranges(moe_ssd_expert_ranges_, len);
+        mollm::detail::normalize_byte_ranges(
+            mmap_weight_exclusion_ranges_, len);
 
     auto lock_range = [&](uint64_t begin, uint64_t end) -> bool {
         if (begin >= end)
@@ -254,6 +261,45 @@ size_t LLMEngine::lock_dense_package_weights() {
     }
     if (complete)
         complete = lock_range(cursor, len);
+    size_t locked_sidecar_bytes = 0;
+    size_t fp8_q8_sidecar_bytes = 0;
+    size_t fp8_bf16_sidecar_bytes = 0;
+    size_t other_sidecar_bytes = 0;
+    if (complete) {
+        // Matmul sidecars are the actual CPU working set for repacked
+        // FP8/W8/W4/FP16 weights. Locking only their now-unused mmap sources
+        // lets macOS compress or page these heap buffers under a large expert
+        // cache, which makes the same GEMV several times slower in a full
+        // layer rotation than in isolation.
+        for (auto& [key, buffer] : packed_weights_) {
+            (void)key;
+            if (buffer.empty())
+                continue;
+            if (mlock(buffer.data(), buffer.size()) != 0) {
+                complete = false;
+                break;
+            }
+            locked_dense_ranges_.push_back(
+                {buffer.data(), buffer.size()});
+            locked_sidecar_bytes += buffer.size();
+            constexpr char q8_suffix[] = "#fp8_q8dot";
+            constexpr char bf16_suffix[] = "#fp8_bf16_fp16";
+            const bool is_fp8_q8 =
+                key.size() >= sizeof(q8_suffix) - 1 &&
+                key.compare(key.size() - (sizeof(q8_suffix) - 1),
+                            sizeof(q8_suffix) - 1, q8_suffix) == 0;
+            const bool is_fp8_bf16 =
+                key.size() >= sizeof(bf16_suffix) - 1 &&
+                key.compare(key.size() - (sizeof(bf16_suffix) - 1),
+                            sizeof(bf16_suffix) - 1, bf16_suffix) == 0;
+            if (is_fp8_q8)
+                fp8_q8_sidecar_bytes += buffer.size();
+            else if (is_fp8_bf16)
+                fp8_bf16_sidecar_bytes += buffer.size();
+            else
+                other_sidecar_bytes += buffer.size();
+        }
+    }
     if (!complete) {
         const int err = errno;
         for (const auto& range : locked_dense_ranges_)
@@ -263,9 +309,14 @@ size_t LLMEngine::lock_dense_package_weights() {
                      std::strerror(err));
         return 0;
     }
-    std::fprintf(stderr, "Engine: locked %.1f MB of dense mmap weights\n",
-                 warmed / 1e6);
-    return warmed;
+    std::fprintf(
+        stderr,
+        "Engine: locked %.1f MB of dense mmap weights and %.1f MB of CPU "
+        "sidecars (FP8-Q8 %.1f MB, FP8-BF16 %.1f MB, other %.1f MB)\n",
+        warmed / 1e6, locked_sidecar_bytes / 1e6,
+        fp8_q8_sidecar_bytes / 1e6, fp8_bf16_sidecar_bytes / 1e6,
+        other_sidecar_bytes / 1e6);
+    return warmed + locked_sidecar_bytes;
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +336,17 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         graph_dir = graph_dir.substr(0, slash + 1);
     else
         graph_dir = "./";
+
+    // DSV4_GROUPED_LINEAR consumes the checkpoint's native FP8 bytes
+    // directly. Its specialized kernel deliberately emulates the reference
+    // BF16 materialization and does not use the generic Q8-dot sidecar.
+    std::unordered_set<uint32_t> native_fp8_weight_nodes;
+    for (const auto& node : g.nodes) {
+        if (node.op_type == OpType::DSV4_GROUPED_LINEAR &&
+            node.inputs.size() >= 2) {
+            native_fp8_weight_nodes.insert(node.inputs[1]);
+        }
+    }
 
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty())
@@ -316,6 +378,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.is_q4_g32_packed = false;
             t.is_q4_g128_packed = false;
             t.q8_repack_data = nullptr;
+            t.fp8_bf16_fp16_data = nullptr;
             t.q4_repack_data = nullptr;
             t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
@@ -409,7 +472,26 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     wref.find("vision_pos_embed.weights") !=
                         std::string::npos;
                 prepare_matmul_weight(
-                    t, wref, data, packed_weights_, !lookup_table);
+                    t, wref, data, packed_weights_, !lookup_table,
+                    native_fp8_weight_nodes.count(node.id) == 0);
+                if (native_fp8_weight_nodes.count(node.id) != 0)
+                    prepare_fp8_bf16_fp16_weight(
+                        t, wref, data, packed_weights_);
+                // Once a CPU sidecar owns every value needed by the selected
+                // FP8 kernel, the original package pages are no longer used at
+                // inference time. Exclude the whole weight blob (header, data,
+                // and E8M0 scales) from dense warmup/mlock. Gate this on the
+                // sidecar pointer rather than the architecture or weight name
+                // so unsupported platforms retain the raw fallback.
+                const bool complete_cpu_sidecar =
+                    (t.prec == Precision::FP8_E4M3 &&
+                     (t.q8_repack_data || t.fp8_bf16_fp16_data)) ||
+                    (t.prec == Precision::FP16 && t.is_interleaved &&
+                     t.data != data);
+                if (complete_cpu_sidecar) {
+                    mmap_weight_exclusion_ranges_.push_back(
+                        {pit->second.first, pit->second.second});
+                }
                 finalize_metal_weight();
                 continue;
             }
@@ -449,7 +531,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;
         prepare_matmul_weight(
-            t, wpath, t.data, packed_weights_, !lookup_table);
+            t, wpath, t.data, packed_weights_, !lookup_table,
+            native_fp8_weight_nodes.count(node.id) == 0);
+        if (native_fp8_weight_nodes.count(node.id) != 0)
+            prepare_fp8_bf16_fp16_weight(
+                t, wpath, t.data, packed_weights_);
         finalize_metal_weight();
     }
 
@@ -493,10 +579,14 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         if (input.kind == PersistentInputKind::NONE)
             continue;
 
-        if (input.layer >= (int)caches_.size())
-            caches_.resize(input.layer + 1);
         Tensor& tensor = g.runtime.tensors[node.id];
         initialize_input_tensor(tensor, node);
+        if (input.kind == PersistentInputKind::AUX_STATE) {
+            auxiliary_states_[input.layer] = &tensor;
+            continue;
+        }
+        if (input.layer >= (int)caches_.size())
+            caches_.resize(input.layer + 1);
         CachePair& cache = caches_[input.layer];
 
         switch (input.kind) {
@@ -531,6 +621,8 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         case PersistentInputKind::FFN_SHIFT:
             cache.rwkv_ffn_shift = &tensor;
             break;
+        case PersistentInputKind::AUX_STATE:
+            break; // handled before indexing caches_
         case PersistentInputKind::NONE:
             break;
         }
@@ -643,6 +735,15 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
                 shift->mem_type = MemoryType::POOLED;
             }
     }
+    for (const auto& entry : auxiliary_states_) {
+        Tensor* state = entry.second;
+        if (!state || state->data)
+            continue;
+        const size_t bytes = state->nbytes();
+        void* buffer = alloc_cache_buf(state, bytes);
+        std::memset(buffer, 0, bytes);
+        state->mem_type = MemoryType::POOLED;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -700,9 +801,12 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_decode_.trace_label = "decode";
     exec_ctx_vision_.trace_label = "vision";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
+    exec_ctx_prefill_.moe_hash_cross_layer_prefetch = false;
     exec_ctx_decode_.moe_cross_layer_prefetch =
         !cfg_.metal_ssd_full && cfg_.moe_ssd_global_cache &&
         cfg_.moe_ssd_cross_layer_prefetch;
+    exec_ctx_decode_.moe_hash_cross_layer_prefetch =
+        exec_ctx_decode_.moe_cross_layer_prefetch;
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
@@ -726,17 +830,6 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 cfg_.moe_ssd_cache_bytes != 0 && !cfg_.metal_ssd_full
                 ? static_cast<Backend*>(&cpu_backend_)
                 : metal_backend_.get();
-            // The Metal backend wraps the weight region via
-            // newBufferWithBytesNoCopy. mmap'd file-backed pages are NOT
-            // reliably GPU-accessible that way (the GPU reads zeros), so force
-            // RESIDENT weights when Metal is active.
-            if (cfg_.weight_loading == WeightLoadingMode::MMAP &&
-                cfg_.moe_ssd_cache_bytes == 0) {
-                fprintf(stderr,
-                        "Engine: Metal backend requires resident weights; "
-                        "ignoring --mmap\n");
-                cfg_.weight_loading = WeightLoadingMode::RESIDENT;
-            }
         }
 #else
         fprintf(stderr,
@@ -768,9 +861,57 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         }
     }
 
-    if (cfg_.lock_dense_weights && moe_ssd_cache_) {
-        lock_dense_package_weights();
+    const auto architecture_it = package_metadata_.find("architecture");
+    const std::string architecture =
+        architecture_it != package_metadata_.end()
+            ? architecture_it->second
+            : std::string();
+    if (architecture == "deepseek-v4") {
+        const auto context_it = package_metadata_.find("n_ctx");
+        if (context_it == package_metadata_.end()) {
+            fprintf(stderr,
+                    "Engine: DeepSeek-V4 package is missing n_ctx metadata\n");
+            return false;
+        }
+        char* context_end = nullptr;
+        const long package_context =
+            std::strtol(context_it->second.c_str(), &context_end, 10);
+        if (!context_end || *context_end != '\0' || package_context <= 0) {
+            fprintf(stderr,
+                    "Engine: DeepSeek-V4 package has invalid n_ctx metadata\n");
+            return false;
+        }
+        if (cfg_.n_ctx > package_context) {
+            fprintf(
+                stderr,
+                "Engine: requested n_ctx=%d exceeds this DeepSeek-V4 "
+                "package's auxiliary-cache capacity (%ld); reconvert with "
+                "a larger --n-ctx or lower --n-ctx\n",
+                cfg_.n_ctx, package_context);
+            return false;
+        }
+
+        // DeepSeek-V4 currently has CPU-only FP8/MXFP4, hyper-connection and
+        // sparse-attention kernels. Running this graph through Metal would
+        // silently dispatch unsupported operators and corrupt the result.
+        if (cfg_.device == Device::METAL) {
+            if (cfg_.metal_ssd_full) {
+                fprintf(stderr,
+                        "Engine: DeepSeek-V4 does not yet support "
+                        "--metal-ssd-full\n");
+                return false;
+            }
+            fprintf(stderr,
+                    "Engine: DeepSeek-V4 currently uses the CPU backend; "
+                    "ignoring --device metal\n");
+            metal_backend_.reset();
+            cfg_.device = Device::CPU;
+            exec_ctx_prefill_.backend = &cpu_backend_;
+            exec_ctx_decode_.backend = &cpu_backend_;
+            exec_ctx_vision_.backend = &cpu_backend_;
+        }
     }
+
 #ifdef MOLLM_METAL
     // Wrap the whole package weight region as one zero-copy MTLBuffer so each
     // weight tensor can alias it via device_offset (set in setup_weight).
@@ -849,6 +990,13 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {
         return false;
     }
+    // Graph loading builds the CPU sidecars used by FP8 dense weights and
+    // records their source blobs as exclusions. Lock only after both graphs
+    // have been prepared so those now-unused raw package pages are not pulled
+    // into RAM and pinned alongside their sidecars.
+    if (cfg_.lock_dense_weights && moe_ssd_cache_) {
+        lock_dense_package_weights();
+    }
 
     if (!embed_weight_ || !embed_weight_->data) {
         fprintf(stderr,
@@ -869,13 +1017,22 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             continue;
         const std::string& name = node.params.str[0];
         const PersistentInput input = parse_persistent_input(name);
-        if (input.kind == PersistentInputKind::NONE ||
-            input.layer >= (int)caches_.size()) {
+        if (input.kind == PersistentInputKind::NONE) {
             continue;
         }
 
-        const CachePair& cache = caches_[input.layer];
         const Tensor* source = nullptr;
+        if (input.kind == PersistentInputKind::AUX_STATE) {
+            auto state = auxiliary_states_.find(input.layer);
+            source = state != auxiliary_states_.end()
+                ? state->second : nullptr;
+            if (source)
+                graph_decode_.runtime.tensors[node.id] = *source;
+            continue;
+        }
+        if (input.layer >= (int)caches_.size())
+            continue;
+        const CachePair& cache = caches_[input.layer];
         switch (input.kind) {
         case PersistentInputKind::KV_KEY:
             source = cache.k;
@@ -897,6 +1054,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             break;
         case PersistentInputKind::FFN_SHIFT:
             source = cache.rwkv_ffn_shift;
+            break;
+        case PersistentInputKind::AUX_STATE:
             break;
         case PersistentInputKind::NONE:
             break;

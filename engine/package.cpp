@@ -451,7 +451,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         if (layer_index < 0 || num_experts <= 0 ||
                             spec.rows <= 0 || spec.cols <= 0 ||
                             static_cast<uint32_t>(spec.precision) >
-                                static_cast<uint32_t>(Precision::INT4) ||
+                                static_cast<uint32_t>(Precision::MXFP4) ||
                             !checked_multiply(
                                 data_bytes,
                                 static_cast<uint64_t>(num_experts),
@@ -473,10 +473,10 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                     spec.weight_ref.c_str());
                             return false;
                         }
-                        moe_ssd_expert_ranges_.push_back(
+                        mmap_weight_exclusion_ranges_.push_back(
                             {weight_offset + data_offset, all_data});
                         if (all_scales != 0) {
-                            moe_ssd_expert_ranges_.push_back(
+                            mmap_weight_exclusion_ranges_.push_back(
                                 {weight_offset + scales_offset, all_scales});
                         }
                         spec.data_offset =
@@ -554,15 +554,31 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         return true;
     };
 
+    // Parse metadata before choosing mmap versus resident storage. Backend
+    // support is architecture-specific: Metal packages require resident
+    // weights today, while DeepSeek-V4 must fall back to its CPU mmap path.
+    std::string meta_str(static_cast<size_t>(ph.meta_len), '\0');
+    if (!read_exact_at(package_file.get(), ph.meta_off, meta_str.data(),
+                       meta_str.size(), "package metadata") ||
+        !parse_metadata(meta_str)) {
+        return false;
+    }
+    const auto architecture = package_metadata_.find("architecture");
+    const bool deepseek_v4 =
+        architecture != package_metadata_.end() &&
+        architecture->second == "deepseek-v4";
+    if (cfg_.device == Device::METAL && cfg_.moe_ssd_cache_bytes == 0) {
+        if (deepseek_v4) {
+            cfg_.weight_loading = WeightLoadingMode::MMAP;
+        } else if (cfg_.weight_loading == WeightLoadingMode::MMAP) {
+            fprintf(stderr,
+                    "Engine: Metal backend requires resident weights; "
+                    "ignoring --mmap\n");
+            cfg_.weight_loading = WeightLoadingMode::RESIDENT;
+        }
+    }
+
     if (cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
-        std::string meta_str(static_cast<size_t>(ph.meta_len), '\0');
-        if (!read_exact_at(package_file.get(), ph.meta_off, meta_str.data(),
-                           meta_str.size(), "package metadata")) {
-            return false;
-        }
-        if (!parse_metadata(meta_str)) {
-            return false;
-        }
 
         try {
             package_weights_storage_.resize(static_cast<size_t>(ph.w_len));
@@ -618,12 +634,6 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     }
     ScopedMapping mapping(mapped, file_size);
     const uint8_t* base = mapping.bytes();
-
-    std::string meta_str(reinterpret_cast<const char*>(base + ph.meta_off),
-                         static_cast<size_t>(ph.meta_len));
-    if (!parse_metadata(meta_str)) {
-        return false;
-    }
 
     if (!extract_temp_section(-1, base, ph.pf_off, ph.pf_len,
                               "prefill graph", pf_path, temp_files_) ||

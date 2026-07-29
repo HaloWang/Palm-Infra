@@ -26,10 +26,16 @@ struct ExecContext {
     BufferPool*   pool    = nullptr;
     ThreadPool*   thread_pool = nullptr;
     Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
+    bool          execution_failed = false;
     bool          profile_enabled = false;
+    // DeepSeek-V4 activations are BF16 in the published inference graph.
+    // prepare_execution() derives this from DeepSeek-specific graph nodes.
+    bool          emulate_bf16_activations = false;
     // Decode-only experimental SSD prefetch using the current gate input and
     // the next MoE layer's router.
     bool          moe_cross_layer_prefetch = false;
+    // Exact next-layer prefetch for token-id hash-routed MoE layers.
+    bool          moe_hash_cross_layer_prefetch = false;
     // Label used by optional Chrome Trace events (normally prefill/decode).
     const char*   trace_label = "graph";
 

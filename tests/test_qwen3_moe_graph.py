@@ -52,7 +52,8 @@ def main():
         check(node.params_i32[2] == 2, "MOE top_k")
         check(node.params_i32[5] == ROUTER_SCORE_SIGMOID, "MOE sigmoid router")
         check(node.params_i32[7] == 0, "MOE has no shared expert")
-        check(len(node.inputs) == 9, "MOE includes optional router bias")
+        check(len(node.inputs) == 5, "MOE includes optional router bias")
+        check(node.params_i32[11] == 4, "MOE records router bias input")
 
     sdpa_nodes = [n for n in g._nodes if n.op_type == OpType.SDPA]
     check(len(sdpa_nodes) == 3, "all layers use full attention")
@@ -73,7 +74,8 @@ def main():
     for node in moe_nodes:
         check(node.params_i32[5] == ROUTER_SCORE_SOFTMAX,
               "official Qwen3-MoE uses softmax router")
-        check(len(node.inputs) == 8, "official Qwen3-MoE has no router bias")
+        check(len(node.inputs) == 4, "official Qwen3-MoE has no router bias")
+        check(node.params_i32[11] == -1, "MOE records no router bias input")
 
     print("Qwen3-MoE graph tests passed")
 

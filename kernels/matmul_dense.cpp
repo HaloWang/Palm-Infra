@@ -911,7 +911,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
 
     // Quantized weights are dispatched by kernel_matmul_fp32 before reaching
     // this dense implementation.
-    bool is_fp16 = (B.prec == Precision::FP16);
+    bool is_fp16 = B.prec == Precision::FP16;
     const __fp16* b_fp16 =
         is_fp16 ? reinterpret_cast<const __fp16*>(B.data) : nullptr;
     const float* b_fp32 = is_fp16 ? nullptr : B.ptr<float>();
@@ -936,7 +936,8 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     // short prompts; model-level sweeps put the crossover at roughly M=96.
 #if defined(__APPLE__)
     constexpr int accelerate_min_m = 96;
-    if (is_fp16 && B.rowmajor_data && M >= accelerate_min_m && N >= 32 &&
+    if (B.prec == Precision::FP16 && B.rowmajor_data &&
+        M >= accelerate_min_m && N >= 32 &&
         K >= 32) {
         int n_threads = thread_pool ? thread_pool->num_threads() : 1;
         _timer.set_shape("accelerate_sgemm", M, N, K, 0, 0, false, false,
@@ -1035,8 +1036,9 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
 
         // ---- GEMV path: M == 1, dedicated kernel ----
         if (M == 1) {
-            _timer.set_shape(use_fp16_acc ? "fp16_gemv_interleaved_fp16acc"
-                                          : "fp16_gemv_interleaved_fp32acc",
+            _timer.set_shape(use_fp16_acc
+                                 ? "fp16_gemv_interleaved_fp16acc"
+                                 : "fp16_gemv_interleaved_fp32acc",
                              M, N, K, 0, 0, false, false, n_threads);
             if (use_fp16_acc) {
                 if (!use_parallel) {
@@ -1085,10 +1087,12 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
             return;
         }
 
-        _timer.set_shape(use_lane_fma
-                             ? (use_fp16_acc ? "fp16_gemm_interleaved_fp16acc"
-                                             : "fp16_gemm_interleaved_fp32acc")
-                             : "fp16_gemm_interleaved_scalar_a",
+        _timer.set_shape(
+            use_lane_fma
+                ? (use_fp16_acc
+                       ? "fp16_gemm_interleaved_fp16acc"
+                       : "fp16_gemm_interleaved_fp32acc")
+                : "fp16_gemm_interleaved_scalar_a",
                          M, N, K, 0, 0, false, false, n_threads);
 
         std::unique_ptr<__fp16[]> a_packed;

@@ -1,7 +1,9 @@
 #include "kernels/matmul_internal.h"
+#include "kernels/bf16.h"
 
 #include <algorithm>
 #include <cstring>
+#include <limits>
 #include <utility>
 
 namespace {
@@ -122,6 +124,48 @@ void maybe_pack_int8_weight(Tensor& weight, const std::string& key,
         }
         weight.q8_repack_data = it->second.data();
     }
+#else
+    (void)weight;
+    (void)key;
+    (void)rowmajor_data;
+    (void)packed_weights;
+#endif
+}
+
+void maybe_pack_fp8_weight(Tensor& weight, const std::string& key,
+                           const void* rowmajor_data,
+                           PackedWeightMap& packed_weights) {
+#if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
+    if (weight.prec != Precision::FP8_E4M3 ||
+        !g_matmul_config.use_interleave_pack ||
+        !is_2d_linear_weight(weight) || !rowmajor_data ||
+        !weight.e8m0_scales || !weight.is_fp8_block128 ||
+        weight.shape[1] <= 0 || weight.shape[1] % MATMUL_Q8_BLOCK != 0) {
+        return;
+    }
+    const int N = static_cast<int>(weight.shape[0]);
+    const int K = static_cast<int>(weight.shape[1]);
+    const int groups = K / MATMUL_Q8_BLOCK;
+    const size_t data_bytes = pack_fp8_e4m3_q8dot_bytes(N, K);
+    const size_t scale_bytes =
+        static_cast<size_t>(N) * groups * sizeof(float);
+    const std::string pack_key = key + "#fp8_q8dot";
+    auto it = packed_weights.find(pack_key);
+    if (it == packed_weights.end()) {
+        std::vector<uint8_t> buffer(data_bytes + scale_bytes);
+        auto* packed = reinterpret_cast<int8_t*>(buffer.data());
+        auto* scales = reinterpret_cast<float*>(
+            buffer.data() + data_bytes);
+        if (!pack_fp8_e4m3_q8dot(
+                static_cast<const uint8_t*>(rowmajor_data),
+                weight.e8m0_scales, N, K, packed, scales)) {
+            return;
+        }
+        it = packed_weights.emplace(pack_key, std::move(buffer)).first;
+    }
+    weight.q8_repack_data = it->second.data();
+    weight.fp8_q8_scales = reinterpret_cast<const float*>(
+        it->second.data() + data_bytes);
 #else
     (void)weight;
     (void)key;
@@ -264,11 +308,74 @@ bool matmul_int4_q4dot_kernel_available() {
 
 void prepare_matmul_weight(Tensor& weight, const std::string& key,
                            const void* weight_data,
-                           PackedWeightMap& packed_weights, bool pack_fp16) {
+                           PackedWeightMap& packed_weights, bool pack_fp16,
+                           bool pack_fp8) {
     if (pack_fp16)
         maybe_pack_fp16_weight(weight, key, weight_data, packed_weights);
+    if (pack_fp8)
+        maybe_pack_fp8_weight(weight, key, weight_data, packed_weights);
     maybe_pack_int8_weight(weight, key, weight_data, packed_weights);
     maybe_pack_int4_weight(weight, key, weight_data, packed_weights);
+}
+
+bool prepare_fp8_bf16_fp16_weight(
+    Tensor& weight, const std::string& key, const void* weight_data,
+    PackedWeightMap& packed_weights) {
+#if HAS_NEON
+    if (weight.prec != Precision::FP8_E4M3 ||
+        !is_2d_linear_weight(weight) || !weight_data ||
+        !weight.e8m0_scales || !weight.is_fp8_block128 ||
+        weight.shape[0] <= 0 || weight.shape[1] <= 0) {
+        return false;
+    }
+    const int N = static_cast<int>(weight.shape[0]);
+    const int K = static_cast<int>(weight.shape[1]);
+    const int padded_n = ((N + 7) / 8) * 8;
+    const int k_blocks = (K + 127) / 128;
+    const size_t elements = static_cast<size_t>(padded_n) * K;
+    if (elements > std::numeric_limits<size_t>::max() / sizeof(__fp16))
+        return false;
+
+    const std::string pack_key = key + "#fp8_bf16_fp16";
+    auto it = packed_weights.find(pack_key);
+    if (it == packed_weights.end()) {
+        std::vector<uint8_t> buffer(elements * sizeof(__fp16));
+        auto* packed = reinterpret_cast<__fp16*>(buffer.data());
+        const auto* source = static_cast<const uint8_t*>(weight_data);
+        for (int n_tile = 0; n_tile < padded_n; n_tile += 8) {
+            for (int k = 0; k < K; ++k) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int n = n_tile + lane;
+                    float value = 0.0f;
+                    if (n < N) {
+                        value =
+                            decode_fp8_e4m3fn(
+                                source[static_cast<size_t>(n) * K + k]) *
+                            decode_e8m0(
+                                weight.e8m0_scales[
+                                    static_cast<size_t>(n / 128) *
+                                        k_blocks +
+                                    k / 128]);
+                        value = mollm_round_to_bf16(value);
+                    }
+                    packed[
+                        static_cast<size_t>(n_tile) * K +
+                        static_cast<size_t>(k) * 8 + lane] =
+                        static_cast<__fp16>(value);
+                }
+            }
+        }
+        it = packed_weights.emplace(pack_key, std::move(buffer)).first;
+    }
+    weight.fp8_bf16_fp16_data = it->second.data();
+    return true;
+#else
+    (void)weight;
+    (void)key;
+    (void)weight_data;
+    (void)packed_weights;
+    return false;
+#endif
 }
 
 int8_t* pack_b_interleaved_int8_full(const int8_t* B_original, int N, int K,

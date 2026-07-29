@@ -81,6 +81,7 @@ bool MoeSsdCache::clear_resident() {
     entry_locations_.clear();
     layer_entries_.clear();
     layer_resident_bytes_.clear();
+    retained_experts_.clear();
     pending_predictions_.clear();
     resident_bytes_ = 0;
     active_layer_ = -1;
@@ -164,6 +165,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         entry_locations_.clear();
         layer_entries_.clear();
         layer_resident_bytes_.clear();
+        retained_experts_.clear();
         pending_predictions_.clear();
         layer_stats_.clear();
         last_evicted_epoch_.clear();
@@ -199,7 +201,9 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
         return false;
     }
     if (spec.precision != Precision::FP16 && spec.precision != Precision::FP32 &&
-        spec.precision != Precision::INT8 && spec.precision != Precision::INT4) {
+        spec.precision != Precision::INT8 &&
+        spec.precision != Precision::INT4 &&
+        spec.precision != Precision::MXFP4) {
         std::fprintf(stderr, "MoE SSD: unsupported precision for %s\n",
                      spec.weight_ref.c_str());
         return false;
@@ -211,7 +215,9 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
          ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
           spec.group_size == 32 && spec.cols % 32 == 0)) &&
         matmul_int4_q4dot_kernel_available();
-    if ((spec.precision == Precision::INT8 || spec.precision == Precision::INT4) &&
+    if ((spec.precision == Precision::INT8 ||
+         spec.precision == Precision::INT4 ||
+         spec.precision == Precision::MXFP4) &&
         (spec.group_size == 0 || spec.groups_per_row == 0 ||
          (spec.scales_bytes == 0 && !has_embedded_scales))) {
         std::fprintf(stderr, "MoE SSD: quantized expert %s lacks scale metadata\n",
@@ -504,6 +510,11 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->pending_reads = 0;
     entry->fresh_miss = true;
     entry->speculative = speculative;
+    const auto retained = retained_experts_.find(layer);
+    entry->retained =
+        retained != retained_experts_.end() &&
+        std::find(retained->second.begin(), retained->second.end(), expert) !=
+            retained->second.end();
     entry->forward_epoch = forward_epoch_;
     entry->prediction_epoch = speculative ? forward_epoch_ : 0;
     entry->prediction_confidence = speculative ? prediction_confidence : 0.0f;
@@ -528,15 +539,37 @@ bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
         const int layer = entry->gate_up->spec.layer;
         const bool shallow = shallow_favoring_layers_ > 0 && layer < shallow_favoring_layers_;
         const bool left = active_layer_ >= 0 && layer < active_layer_;
-        // Least-Stale first; within a pass, left layers have no remaining use.
-        // A shallow entry is protected as a tie-break within either category.
-        if (stale) return shallow ? 1 : 0;
-        if (left) return shallow ? 3 : 2;
-        return shallow ? 5 : 4;
+        // Recycle entries from layers already consumed in this forward before
+        // touching last-forward entries belonging to layers still ahead.
+        // Checking `stale` first degenerates into a cyclic LRU scan: early
+        // misses evict future-layer hits before execution can reach them.
+        int value = 0;
+        if (left) value = shallow ? 1 : 0;
+        else if (stale) value = shallow ? 3 : 2;
+        else value = shallow ? 5 : 4;
+        return value + (entry->retained ? 6 : 0);
     };
     const int candidate_rank = rank(candidate);
     const int current_rank = rank(current);
     if (candidate_rank != current_rank) return candidate_rank < current_rank;
+    const bool candidate_stale =
+        candidate->forward_epoch != forward_epoch_;
+    const bool current_stale =
+        current->forward_epoch != forward_epoch_;
+    const int candidate_layer = candidate->gate_up->spec.layer;
+    const int current_layer = current->gate_up->spec.layer;
+    const bool candidate_future =
+        candidate_stale && active_layer_ >= 0 &&
+        candidate_layer >= active_layer_;
+    const bool current_future =
+        current_stale && active_layer_ >= 0 &&
+        current_layer >= active_layer_;
+    if (candidate_future && current_future &&
+        candidate_layer != current_layer) {
+        // If future residency must be sacrificed, evict the entry whose next
+        // possible use is farthest away.
+        return candidate_layer > current_layer;
+    }
     const bool candidate_predicted = candidate->prediction_epoch == forward_epoch_;
     const bool current_predicted = current->prediction_epoch == forward_epoch_;
     if (candidate_predicted != current_predicted) return !candidate_predicted;
@@ -545,6 +578,48 @@ bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
         return candidate->prediction_confidence < current->prediction_confidence;
     }
     return candidate->used_at < current->used_at;
+}
+
+bool MoeSsdCache::retain_for_next_forward(
+    const MoeSsdTensorSource* gate_up,
+    const MoeSsdTensorSource* down,
+    const std::vector<int>& experts) {
+    if (!gate_up || !down || !valid_pair(gate_up, down, 0))
+        return false;
+    std::lock_guard<std::mutex> lock(mutex_);
+    if (!global_capacity_pool_)
+        return true;
+    const int layer = gate_up->spec.layer;
+    const auto layout = layer_layouts_.find(layer);
+    if (layout == layer_layouts_.end() || layout->second.pair_bytes == 0)
+        return false;
+    const size_t layer_share =
+        layers_.empty() ? capacity_bytes_ : capacity_bytes_ / layers_.size();
+    const size_t retain_limit =
+        std::max<size_t>(1, layer_share / layout->second.pair_bytes);
+    std::vector<int>& retained = retained_experts_[layer];
+    retained.clear();
+    retained.reserve(std::min(retain_limit, experts.size()));
+    for (int expert : experts) {
+        if (expert < 0 || expert >= gate_up->spec.num_experts ||
+            std::find(retained.begin(), retained.end(), expert) !=
+                retained.end()) {
+            continue;
+        }
+        retained.push_back(expert);
+        if (retained.size() == retain_limit)
+            break;
+    }
+    const auto entries = layer_entries_.find(layer);
+    if (entries != layer_entries_.end()) {
+        for (Entry* entry : entries->second) {
+            entry->retained =
+                entry->gate_up == gate_up && entry->down == down &&
+                std::find(retained.begin(), retained.end(), entry->expert) !=
+                    retained.end();
+        }
+    }
+    return true;
 }
 
 Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
@@ -564,6 +639,11 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.is_q4_g128_packed = (s.flags & MappedFile::FLAG_INT4_BG128) != 0;
         if (t.is_q4_g32_packed) t.q4_g32_data = t.data;
         if (t.is_q4_g128_packed) t.q4_g128_data = t.data;
+    } else if (s.precision == Precision::MXFP4) {
+        t.e8m0_scales = scales;
+        t.group_size = s.group_size;
+        t.groups_per_row = s.groups_per_row;
+        t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
     }
     return t;
 }
@@ -595,6 +675,11 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
     }
     const uint64_t trace_start = mollm_trace::now_ns();
     std::vector<uint8_t> seen((size_t)gate_up->spec.num_experts, 0);
+    struct MissingExpert {
+        int expert = -1;
+        float prediction_confidence = 0.0f;
+    };
+    std::vector<MissingExpert> missing_experts;
     std::vector<Entry*> queued_entries;
     {
         std::lock_guard<std::mutex> lock(mutex_);
@@ -641,6 +726,13 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
         const size_t count = std::min(experts.size(), request_count);
         if (speculative)
             layer_stats_[gate_up->spec.layer].prefetch_selected += count;
+        missing_experts.reserve(count);
+        queued_entries.reserve(count);
+
+        // Protect every resident member of this route before reserving any
+        // misses. Reserving while walking the route can otherwise evict a
+        // cached expert that appears later in the same top-k list, turning a
+        // guaranteed hit into an avoidable read.
         for (size_t index = 0; index < count; ++index) {
             const int expert = experts[index];
             const float prediction_confidence =
@@ -663,8 +755,12 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                 }
                 continue;
             }
-            entry = reserve_entry_locked(gate_up, down, expert, speculative,
-                                         prediction_confidence);
+            missing_experts.push_back({expert, prediction_confidence});
+        }
+        for (const MissingExpert& missing : missing_experts) {
+            Entry* entry = reserve_entry_locked(
+                gate_up, down, missing.expert, speculative,
+                missing.prediction_confidence);
             // Do not reserve beyond the per-layer byte budget. acquire() will
             // submit this expert later after an in-flight slot becomes ready.
             if (!entry) {

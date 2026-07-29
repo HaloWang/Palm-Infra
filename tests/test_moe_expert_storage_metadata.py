@@ -12,7 +12,14 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "models"))
 
-from transpile import GraphBuilder, Precision, _write_weight_file, save_package
+from transpile import (
+    GraphBuilder,
+    Precision,
+    StreamedWeight,
+    WeightByteRange,
+    _write_weight_file,
+    save_package,
+)
 
 
 def read_package_metadata(path: str) -> dict:
@@ -47,14 +54,22 @@ def main():
         # Logical down: E=2, rows_per_expert=3, K=4.
         down_q4 = np.arange(6 * 2, dtype=np.uint8)
         down_scales = np.arange(6 * 2, dtype=np.float32)
-        _write_weight_file(
-            str(weights_dir / down_name),
-            down_q4,
-            scales=down_scales,
-            group_size=2,
-            num_groups=down_scales.size,
+        down_source = Path(tmp) / "down-source.bin"
+        down_source.write_bytes(
+            down_q4.tobytes() + down_scales.tobytes())
+        streamed_down = StreamedWeight(
             precision=Precision.INT4,
             logical_shape=(6, 4),
+            data_ranges=[
+                WeightByteRange(str(down_source), 0, down_q4.nbytes),
+            ],
+            scale_ranges=[
+                WeightByteRange(
+                    str(down_source), down_q4.nbytes,
+                    down_scales.nbytes),
+            ],
+            group_size=2,
+            num_groups=down_scales.size,
         )
 
         g = GraphBuilder()
@@ -92,6 +107,7 @@ def main():
                     }],
                 },
             },
+            streamed_weights={"./" + down_name: streamed_down},
         )
 
         metadata = read_package_metadata(package_path)

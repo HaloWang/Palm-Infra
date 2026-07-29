@@ -46,8 +46,349 @@ static bool check_approx(const float* got, const float* ref, int n, float tol = 
     return true;
 }
 
+static float relative_l2_error(const float* got, const float* ref, int n) {
+    double error = 0.0;
+    double norm = 0.0;
+    for (int i = 0; i < n; ++i) {
+        const double delta =
+            static_cast<double>(got[i]) - static_cast<double>(ref[i]);
+        error += delta * delta;
+        norm += static_cast<double>(ref[i]) * ref[i];
+    }
+    return norm > 0.0
+        ? static_cast<float>(std::sqrt(error / norm))
+        : 0.0f;
+}
+
+static uint8_t reference_encode_fp8(float value) {
+    if (std::isnan(value)) return 0x7f;
+    const uint8_t sign = std::signbit(value) ? 0x80 : 0;
+    const float magnitude = std::min(std::fabs(value), 448.0f);
+    int best = 0;
+    float best_distance = magnitude;
+    for (int code = 1; code <= 126; ++code) {
+        const float distance =
+            std::fabs(magnitude -
+                      decode_fp8_e4m3fn(static_cast<uint8_t>(code)));
+        if (distance < best_distance ||
+            (distance == best_distance && (code & 1) == 0)) {
+            best = code;
+            best_distance = distance;
+        }
+    }
+    return static_cast<uint8_t>(sign | best);
+}
+
+static void reference_fp8_ue8m0_activation(const float* input, float* output,
+                                           int M, int K) {
+    constexpr int block_size = 128;
+    for (int m = 0; m < M; ++m) {
+        for (int begin = 0; begin < K; begin += block_size) {
+            const int end = std::min(begin + block_size, K);
+            float maximum = 1.0e-4f;
+            for (int k = begin; k < end; ++k) {
+                maximum = std::max(
+                    maximum, std::fabs(input[m * K + k]));
+            }
+            const int exponent = static_cast<int>(
+                std::ceil(std::log2(maximum / 448.0f)));
+            const float scale = std::ldexp(1.0f, exponent);
+            for (int k = begin; k < end; ++k) {
+                output[m * K + k] =
+                    decode_fp8_e4m3fn(encode_fp8_e4m3fn(
+                        std::clamp(
+                            input[m * K + k] / scale,
+                            -448.0f, 448.0f))) *
+                    scale;
+            }
+        }
+    }
+}
+
 int main() {
     srand(42);
+
+    // ---- FP8/MXFP4 scalar format decoding ----
+    {
+        CHECK(decode_e8m0(127) == 1.0f &&
+                  decode_e8m0(128) == 2.0f,
+              "E8M0 power-of-two scales");
+        bool all_e8m0_values_match = true;
+        for (int value = 0; value < 255; ++value) {
+            if (decode_e8m0(static_cast<uint8_t>(value)) !=
+                std::ldexp(1.0f, value - 127)) {
+                all_e8m0_values_match = false;
+                break;
+            }
+        }
+        CHECK(all_e8m0_values_match,
+              "E8M0 bit decoding matches every finite power");
+        CHECK(decode_fp8_e4m3fn(0x38) == 1.0f &&
+                  decode_fp8_e4m3fn(0x7e) == 448.0f &&
+                  decode_fp8_e4m3fn(0xb8) == -1.0f,
+              "FP8 E4M3FN decoding");
+        CHECK(encode_fp8_e4m3fn(1.0f) == 0x38 &&
+                  encode_fp8_e4m3fn(-1.0f) == 0xb8 &&
+                  encode_fp8_e4m3fn(500.0f) == 0x7e,
+              "FP8 E4M3FN encoding");
+        bool fp8_rounding_ok = true;
+        for (int i = 0; i <= 200000; ++i) {
+            const float value =
+                -500.0f + 1000.0f * static_cast<float>(i) / 200000.0f;
+            if (encode_fp8_e4m3fn(value) !=
+                reference_encode_fp8(value)) {
+                fp8_rounding_ok = false;
+                break;
+            }
+        }
+        for (int code = 0; code < 126 && fp8_rounding_ok; ++code) {
+            const float lower =
+                decode_fp8_e4m3fn(static_cast<uint8_t>(code));
+            const float upper =
+                decode_fp8_e4m3fn(static_cast<uint8_t>(code + 1));
+            const float midpoint = (lower + upper) * 0.5f;
+            const float probes[] = {
+                std::nextafter(midpoint, lower), midpoint,
+                std::nextafter(midpoint, upper)};
+            for (float probe : probes) {
+                if (encode_fp8_e4m3fn(probe) !=
+                    reference_encode_fp8(probe)) {
+                    fp8_rounding_ok = false;
+                    break;
+                }
+            }
+        }
+        CHECK(fp8_rounding_ok,
+              "FP8 E4M3FN fast encoder matches nearest-even reference");
+        CHECK(decode_mxfp4_e2m1(0x1) == 0.5f &&
+                  decode_mxfp4_e2m1(0x7) == 6.0f &&
+                  decode_mxfp4_e2m1(0xf) == -6.0f,
+              "MXFP4 E2M1 decoding");
+    }
+
+    // ---- exact F32 x MXFP4 and fast Q8 x MXFP4 GEMV ----
+    {
+        constexpr int M = 2;
+        constexpr int N = 3;
+        constexpr int K = 32;
+        float a[M * K];
+        for (int i = 0; i < M * K; ++i)
+            a[i] = static_cast<float>((i % 13) - 6) / 6.0f;
+        uint8_t packed[N * K / 2];
+        for (int i = 0; i < N * K / 2; ++i) {
+            const uint8_t low = static_cast<uint8_t>(i % 16);
+            const uint8_t high = static_cast<uint8_t>((15 - i) % 16);
+            packed[i] = low | static_cast<uint8_t>(high << 4);
+        }
+        uint8_t scales[N] = {127, 128, 126}; // 1, 2, .5
+        float dequantized[N * K];
+        for (int n = 0; n < N; ++n) {
+            for (int k = 0; k < K; ++k) {
+                const uint8_t byte = packed[n * (K / 2) + k / 2];
+                const uint8_t nibble =
+                    (k & 1) ? byte >> 4 : byte & 0x0f;
+                dequantized[n * K + k] =
+                    decode_mxfp4_e2m1(nibble) * decode_e8m0(scales[n]);
+            }
+        }
+        float exact[M * N] = {};
+        float reference[M * N] = {};
+        Tensor A = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a);
+        Tensor B = Tensor::create(
+            Precision::MXFP4, MemoryType::EXTERNAL, N, K, 1, 1, packed);
+        Tensor C = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, exact);
+        B.e8m0_scales = scales;
+        B.group_size = 32;
+        B.groups_per_row = 1;
+        B.num_groups = N;
+        kernel_matmul_mxfp4_reference(A, B, C);
+        ref_matmul(a, dequantized, reference, M, N, K);
+        CHECK(check_approx(exact, reference, M * N, 1e-5f),
+              "F32 x MXFP4 exact reference");
+
+        float fast[N] = {};
+        Tensor A1 = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1, a);
+        Tensor C1 = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1, fast);
+        kernel_matmul_fp32(A1, B, C1);
+        float fp8_a[K];
+        float fp8_reference[N] = {};
+        reference_fp8_ue8m0_activation(a, fp8_a, 1, K);
+        ref_matmul(fp8_a, dequantized, fp8_reference, 1, N, K);
+        CHECK(relative_l2_error(fast, fp8_reference, N) < 0.015f,
+              "FP8 x MXFP4 decode GEMV");
+
+        float small_batch[M * N] = {};
+        float rowwise[M * N] = {};
+        Tensor small_batch_output = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            N, M, 1, 1, small_batch);
+        kernel_matmul_fp32(A, B, small_batch_output);
+        for (int m = 0; m < M; ++m) {
+            Tensor row_input = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                K, 1, 1, 1, a + m * K);
+            Tensor row_output = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                N, 1, 1, 1, rowwise + m * N);
+            kernel_matmul_fp32(row_input, B, row_output);
+        }
+        CHECK(check_approx(
+                  small_batch, rowwise, M * N, 1e-5f),
+              "MXFP4 small GEMM matches individual GEMVs");
+    }
+
+    // ---- F32 x block-scaled FP8 E4M3 ----
+    {
+        constexpr int M = 2;
+        constexpr int N = 3;
+        constexpr int K = 4;
+        float a[M * K] = {1, 2, -1, .5f, -2, 1, .25f, 3};
+        uint8_t weights[N * K] = {
+            0x38, 0x40, 0xb8, 0x30,
+            0x40, 0x38, 0x00, 0xc0,
+            0x30, 0xb0, 0x38, 0x40,
+        };
+        uint8_t scales[1] = {128}; // one 128x128 tile, scale=2
+        float dequantized[N * K];
+        for (int i = 0; i < N * K; ++i)
+            dequantized[i] =
+                decode_fp8_e4m3fn(weights[i]) * 2.0f;
+        float output[M * N] = {};
+        float reference[M * N] = {};
+        Tensor A = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a);
+        Tensor B = Tensor::create(
+            Precision::FP8_E4M3, MemoryType::EXTERNAL,
+            N, K, 1, 1, weights);
+        Tensor C = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, output);
+        B.e8m0_scales = scales;
+        B.group_size = 128;
+        B.groups_per_row = 1;
+        B.num_groups = 1;
+        B.is_fp8_block128 = true;
+        CHECK(kernel_matmul_fp8_weight_f32_activation(A, B, C),
+              "direct F32 x FP8 E4M3 dispatch");
+        ref_matmul(a, dequantized, reference, M, N, K);
+        CHECK(check_approx(output, reference, M * N, 1e-5f),
+              "F32 x FP8 E4M3 block-128 reference");
+    }
+
+    // Exercise multiple FP8 scale tiles in both dimensions.  The grouped
+    // DeepSeek-V4 output projection uses this direct (unquantized activation)
+    // path with large matrices.
+    {
+        constexpr int M = 3;
+        constexpr int N = 256;
+        constexpr int K = 256;
+        float a[M * K];
+        uint8_t weights[N * K];
+        uint8_t scales[(N / 128) * (K / 128)] = {
+            126, 127, 128, 129,
+        };
+        float output[M * N] = {};
+        float reference[M * N] = {};
+        for (int i = 0; i < M * K; ++i)
+            a[i] = static_cast<float>((i * 17) % 61 - 30) / 31.0f;
+        for (int i = 0; i < N * K; ++i) {
+            const int magnitude = 1 + (i * 13) % 96;
+            weights[i] = static_cast<uint8_t>(
+                magnitude | ((i % 7 == 0) ? 0x80 : 0));
+        }
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < N; ++n) {
+                float sum = 0.0f;
+                for (int k = 0; k < K; ++k) {
+                    const float scale = decode_e8m0(
+                        scales[(n / 128) * (K / 128) + k / 128]);
+                    sum += a[m * K + k] *
+                           decode_fp8_e4m3fn(weights[n * K + k]) *
+                           scale;
+                }
+                reference[m * N + n] = sum;
+            }
+        }
+        Tensor A = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a);
+        Tensor B = Tensor::create(
+            Precision::FP8_E4M3, MemoryType::EXTERNAL,
+            N, K, 1, 1, weights);
+        Tensor C = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1, output);
+        B.e8m0_scales = scales;
+        B.group_size = 128;
+        B.groups_per_row = K / 128;
+        B.num_groups = sizeof(scales);
+        B.is_fp8_block128 = true;
+        CHECK(kernel_matmul_fp8_weight_f32_activation(A, B, C),
+              "direct F32 x FP8 E4M3 multi-tile dispatch");
+        CHECK(relative_l2_error(output, reference, M * N) < 2e-5f,
+              "direct F32 x FP8 E4M3 multi-tile reference");
+    }
+
+    // ---- fast Q8-dot F32 x FP8 E4M3 GEMV ----
+    {
+        constexpr int N = 5;
+        constexpr int K = 128;
+        float a[K];
+        uint8_t weights[N * K];
+        for (int k = 0; k < K; ++k)
+            a[k] = static_cast<float>((k % 17) - 8) / 8.0f;
+        for (int i = 0; i < N * K; ++i) {
+            // Cover signs, subnormals and all finite normal exponents while
+            // avoiding the two E4M3FN NaN encodings.
+            uint8_t value = static_cast<uint8_t>((i * 29) & 0xfe);
+            weights[i] = value;
+        }
+        uint8_t scales[1] = {125}; // 0.25
+        float dequantized[N * K];
+        for (int i = 0; i < N * K; ++i)
+            dequantized[i] =
+                decode_fp8_e4m3fn(weights[i]) * 0.25f;
+        float output[N] = {};
+        float reference[N] = {};
+        Tensor A = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1, a);
+        Tensor B = Tensor::create(
+            Precision::FP8_E4M3, MemoryType::EXTERNAL,
+            N, K, 1, 1, weights);
+        Tensor C = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1, output);
+        B.e8m0_scales = scales;
+        B.group_size = 128;
+        B.groups_per_row = 1;
+        B.num_groups = 1;
+        B.is_fp8_block128 = true;
+        kernel_matmul_fp32(A, B, C);
+        float fallback_output[N];
+        std::copy(output, output + N, fallback_output);
+        float fp8_a[K];
+        reference_fp8_ue8m0_activation(a, fp8_a, 1, K);
+        ref_matmul(fp8_a, dequantized, reference, 1, N, K);
+        CHECK(relative_l2_error(output, reference, N) < 0.025f,
+              "Q8-dot FP8 x FP8 E4M3 GEMV");
+
+        const size_t packed_bytes = pack_fp8_e4m3_q8dot_bytes(N, K);
+        std::vector<int8_t> packed(packed_bytes);
+        std::vector<float> packed_scales(
+            static_cast<size_t>(N) * K / 32);
+        CHECK(pack_fp8_e4m3_q8dot(
+                  weights, scales, N, K, packed.data(),
+                  packed_scales.data()),
+              "pack native FP8 to Q8-dot sidecar");
+        std::fill(output, output + N, 0.0f);
+        B.q8_repack_data = packed.data();
+        B.fp8_q8_scales = packed_scales.data();
+        kernel_matmul_fp32(A, B, C);
+        CHECK(relative_l2_error(output, reference, N) < 0.025f,
+              "packed Q8-dot FP8 x FP8 E4M3 GEMV");
+        CHECK(check_approx(output, fallback_output, N, 1e-5f),
+              "packed and portable FP8 Q8-dot paths agree");
+    }
 
     // ---- small matmul: 4x4 * 4x4 = 4x4 ----
     {
@@ -760,6 +1101,153 @@ int main() {
                       actual[i].data(), expected[i].data(), N, 1e-5f),
                   "INT8 batched GEMV matches individual GEMV");
             delete[] packed[i];
+        }
+    }
+
+    // DeepSeek-V4's shared gate/up projections use the same activation and
+    // native FP8 weights. The batched path must preserve the individual FP8
+    // activation quantization while reusing it across both GEMVs.
+    if (matmul_int4_q4dot_kernel_available()) {
+        constexpr int batch = 2;
+        constexpr int K = 128;
+        constexpr int N = 64;
+        constexpr int q8_groups = K / 32;
+        std::vector<float> input(K);
+        for (int k = 0; k < K; ++k)
+            input[k] = ((k * 11) % 41 - 20) * 0.03125f;
+
+        std::vector<std::vector<uint8_t>> weight_data(
+            batch, std::vector<uint8_t>((size_t)N * K));
+        std::vector<std::vector<uint8_t>> e8m0_scales(
+            batch, std::vector<uint8_t>(1));
+        std::vector<std::vector<int8_t>> packed(
+            batch,
+            std::vector<int8_t>(pack_fp8_e4m3_q8dot_bytes(N, K)));
+        std::vector<std::vector<float>> packed_scales(
+            batch, std::vector<float>((size_t)N * q8_groups));
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs, weights, outputs;
+        for (int i = 0; i < batch; ++i) {
+            e8m0_scales[i][0] = static_cast<uint8_t>(127 - i);
+            for (int n = 0; n < N; ++n) {
+                for (int k = 0; k < K; ++k) {
+                    const float value =
+                        ((n * 7 + k * (3 + i * 2)) % 31 - 15) * 0.125f;
+                    weight_data[i][(size_t)n * K + k] =
+                        encode_fp8_e4m3fn(value);
+                }
+            }
+            CHECK(pack_fp8_e4m3_q8dot(
+                      weight_data[i].data(), e8m0_scales[i].data(),
+                      N, K, packed[i].data(), packed_scales[i].data()),
+                  "pack FP8 sidecar for batched GEMV");
+            // Deliberately reuse the exact Tensor/data pointer. This is the
+            // shared-expert gate/up case and should quantize the activation
+            // only once.
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input.data()));
+            weights.push_back(Tensor::create(
+                Precision::FP8_E4M3, MemoryType::EXTERNAL, N, K, 1, 1,
+                weight_data[i].data()));
+            weights.back().e8m0_scales = e8m0_scales[i].data();
+            weights.back().group_size = 128;
+            weights.back().groups_per_row = 1;
+            weights.back().num_groups = 1;
+            weights.back().is_fp8_block128 = true;
+            weights.back().q8_repack_data = packed[i].data();
+            weights.back().fp8_q8_scales = packed_scales[i].data();
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(inputs.back(), weights.back(), reference);
+        }
+
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_int8_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "FP8 sidecar batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(check_approx(
+                      actual[i].data(), expected[i].data(), N, 1e-5f),
+                  "FP8 batched GEMV matches individual GEMV");
+        }
+    }
+
+    // Ready DeepSeek experts can be executed in one worker-pool dispatch.
+    // Gate/up routes share the hidden input; down routes keep independent
+    // intermediate inputs. Cover both forms in the same batch.
+    {
+        constexpr int batch = 3;
+        constexpr int K = 128;
+        constexpr int N = 64;
+        constexpr int groups = K / 32;
+        std::vector<float> shared_input(K);
+        std::vector<float> distinct_input(K);
+        for (int k = 0; k < K; ++k) {
+            shared_input[k] = ((k * 13) % 47 - 23) * 0.01953125f;
+            distinct_input[k] = ((k * 17) % 53 - 26) * 0.015625f;
+        }
+        std::vector<std::vector<uint8_t>> packed(
+            batch, std::vector<uint8_t>((size_t)N * K / 2));
+        std::vector<std::vector<uint8_t>> scales(
+            batch, std::vector<uint8_t>((size_t)N * groups));
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs, weights, outputs;
+        for (int i = 0; i < batch; ++i) {
+            for (int n = 0; n < N; ++n) {
+                for (int group = 0; group < groups; ++group)
+                    scales[i][(size_t)n * groups + group] =
+                        static_cast<uint8_t>(126 + ((n + group + i) % 3));
+                for (int k = 0; k < K; ++k) {
+                    const uint8_t nibble =
+                        static_cast<uint8_t>(
+                            (n * 5 + k * (3 + i * 2)) & 15);
+                    uint8_t& byte =
+                        packed[i][(size_t)n * (K / 2) + k / 2];
+                    if (k & 1)
+                        byte |= static_cast<uint8_t>(nibble << 4);
+                    else
+                        byte = nibble;
+                }
+            }
+            float* input_data =
+                i < 2 ? shared_input.data() : distinct_input.data();
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input_data));
+            weights.push_back(Tensor::create(
+                Precision::MXFP4, MemoryType::EXTERNAL, N, K, 1, 1,
+                packed[i].data()));
+            weights.back().e8m0_scales = scales[i].data();
+            weights.back().group_size = 32;
+            weights.back().groups_per_row = groups;
+            weights.back().num_groups = N * groups;
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(inputs.back(), weights.back(), reference);
+        }
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_mxfp4_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "MXFP4 batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(check_approx(
+                      actual[i].data(), expected[i].data(), N, 1e-5f),
+                  "MXFP4 batched GEMV matches individual GEMV");
         }
     }
 

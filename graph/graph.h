@@ -119,7 +119,13 @@ enum class OpType : uint32_t {
     GATED_DELTANET_CONV_DECODE = 112,
     MOE                 = 120,
     // MOE_COMBINE        = 121,
-    // GATED_ATTENTION    = 130,
+    HC_PRE               = 130,
+    HC_POST              = 131,
+    HC_HEAD              = 132,
+    DSV4_COMPRESSOR      = 160,
+    DSV4_INDEXER         = 161,
+    DSV4_SPARSE_ATTN     = 162,
+    DSV4_GROUPED_LINEAR  = 163,
     SHORTCONV      = 140,
     RWKV7           = 150,
     RWKV_TOKEN_SHIFT = 151,
@@ -166,6 +172,13 @@ inline const char* op_type_name(OpType op) {
     case OpType::GATED_DELTANET_PREFILL: return "GATED_DELTANET_PREFILL";
     case OpType::GATED_DELTANET_CONV_DECODE: return "GATED_DELTANET_CONV_DECODE";
     case OpType::MOE: return "MOE";
+    case OpType::HC_PRE: return "HC_PRE";
+    case OpType::HC_POST: return "HC_POST";
+    case OpType::HC_HEAD: return "HC_HEAD";
+    case OpType::DSV4_COMPRESSOR: return "DSV4_COMPRESSOR";
+    case OpType::DSV4_INDEXER: return "DSV4_INDEXER";
+    case OpType::DSV4_SPARSE_ATTN: return "DSV4_SPARSE_ATTN";
+    case OpType::DSV4_GROUPED_LINEAR: return "DSV4_GROUPED_LINEAR";
     case OpType::SHORTCONV: return "SHORTCONV";
     case OpType::RWKV7: return "RWKV7";
     case OpType::RWKV_TOKEN_SHIFT: return "RWKV_TOKEN_SHIFT";

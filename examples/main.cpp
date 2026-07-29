@@ -82,18 +82,7 @@ public:
         if (!isatty(STDIN_FILENO) || tcgetattr(STDIN_FILENO, &original_) != 0) {
             return;
         }
-        termios updated = original_;
-        // Handle Ctrl-C below instead of letting a signal terminate us while
-        // the terminal is in raw mode (which would leave the caller's shell
-        // without canonical input restoration).
-        updated.c_lflag &= ~(ICANON | ECHO | ISIG);
-        updated.c_cc[VMIN] = 1;
-        updated.c_cc[VTIME] = 0;
-        active_ = tcsetattr(STDIN_FILENO, TCSANOW, &updated) == 0;
-    }
-
-    ~TerminalLineReader() {
-        if (active_) tcsetattr(STDIN_FILENO, TCSANOW, &original_);
+        tty_ = true;
     }
 #else
     TerminalLineReader() = default;
@@ -106,7 +95,24 @@ public:
 #if !defined(MOLLM_HAVE_POSIX_TTY)
         return static_cast<bool>(std::getline(std::cin, line));
 #else
-        if (!active_) return static_cast<bool>(std::getline(std::cin, line));
+        if (!tty_) return static_cast<bool>(std::getline(std::cin, line));
+        termios updated = original_;
+        // Keep raw mode scoped to line editing. During model generation the
+        // original terminal mode (including ISIG) must be active so Ctrl-C
+        // interrupts the process normally.
+        updated.c_lflag &= ~(ICANON | ECHO | ISIG);
+        updated.c_cc[VMIN] = 1;
+        updated.c_cc[VTIME] = 0;
+        if (tcsetattr(STDIN_FILENO, TCSANOW, &updated) != 0) {
+            return static_cast<bool>(std::getline(std::cin, line));
+        }
+        struct TerminalRestore {
+            const termios& original;
+            ~TerminalRestore() {
+                tcsetattr(STDIN_FILENO, TCSANOW, &original);
+            }
+        } restore{original_};
+
         line.clear();
         int escape_state = 0;
         for (;;) {
@@ -179,7 +185,7 @@ public:
 private:
 #if defined(MOLLM_HAVE_POSIX_TTY)
     termios original_{};
-    bool active_ = false;
+    bool tty_ = false;
 #endif
 };
 

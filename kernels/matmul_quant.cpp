@@ -2,6 +2,7 @@
 #include "kernels/matmul_profile.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
 #include <vector>
@@ -43,6 +44,133 @@ static inline void quantize_q8_block32_neon(const float* src, float& scale,
     q_hi = vcombine_s8(vqmovn_s16(q45), vqmovn_s16(q67));
 }
 #endif
+
+namespace {
+
+constexpr int kFp8ActivationBlock = 128;
+
+float fp8_ue8m0_scale(const float* values, int count) {
+    float maximum = 0.0f;
+#if HAS_NEON && defined(__aarch64__)
+    float32x4_t vector_maximum = vdupq_n_f32(0.0f);
+    int i = 0;
+    for (; i + 3 < count; i += 4) {
+        vector_maximum = vmaxq_f32(
+            vector_maximum, vabsq_f32(vld1q_f32(values + i)));
+    }
+    maximum = vmaxvq_f32(vector_maximum);
+    for (; i < count; ++i)
+        maximum = std::max(maximum, std::fabs(values[i]));
+#else
+    for (int i = 0; i < count; ++i)
+        maximum = std::max(maximum, std::fabs(values[i]));
+#endif
+    // This is fast_round_scale(max(amax, 1e-4) / 448) from the reference
+    // implementation. Its E8M0 output is a power of two.
+    maximum = std::max(maximum, 1.0e-4f);
+    const int exponent = std::clamp(
+        static_cast<int>(std::ceil(std::log2(maximum / 448.0f))),
+        -127, 127);
+    return std::ldexp(1.0f, exponent);
+}
+
+void quantize_fp8_q8_row(const float* input, int K, int8_t* output,
+                         float* output_scales, float* fp8_dequant = nullptr) {
+    const int q8_blocks =
+        (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
+    const int fp8_blocks =
+        (K + kFp8ActivationBlock - 1) / kFp8ActivationBlock;
+    alignas(16) float coefficients[kFp8ActivationBlock];
+    for (int block = 0; block < fp8_blocks; ++block) {
+        const int begin = block * kFp8ActivationBlock;
+        const int end = std::min(begin + kFp8ActivationBlock, K);
+        const int count = end - begin;
+        const float activation_scale =
+            fp8_ue8m0_scale(input + begin, count);
+        const float inverse_activation_scale = 1.0f / activation_scale;
+        static const std::array<float, 127> decode_table = [] {
+            std::array<float, 127> values{};
+            for (size_t i = 0; i < values.size(); ++i)
+                values[i] = decode_fp8_e4m3fn(static_cast<uint8_t>(i));
+            return values;
+        }();
+        for (int i = 0; i < count; ++i) {
+            const float normalized = std::clamp(
+                input[begin + i] * inverse_activation_scale,
+                -448.0f, 448.0f);
+            const uint8_t encoded = encode_fp8_e4m3fn(normalized);
+            const uint8_t magnitude =
+                std::min<uint8_t>(encoded & 0x7f, 126);
+            const float coefficient =
+                std::signbit(normalized)
+                    ? -decode_table[magnitude]
+                    : decode_table[magnitude];
+            coefficients[i] = coefficient;
+            if (fp8_dequant) {
+                fp8_dequant[begin + i] =
+                    coefficient * activation_scale;
+            }
+        }
+        // The checkpoint activation scale is fixed for the 128-element FP8
+        // block. The internal Q8 representation may use a finer 32-element
+        // scale without changing those FP8 values; this reduces the extra
+        // approximation introduced solely for SDOT.
+        for (int group_begin = 0; group_begin < count;
+             group_begin += MATMUL_Q8_BLOCK) {
+            const int group_end =
+                std::min(group_begin + MATMUL_Q8_BLOCK, count);
+            float coefficient_maximum = 0.0f;
+            for (int i = group_begin; i < group_end; ++i) {
+                coefficient_maximum = std::max(
+                    coefficient_maximum, std::fabs(coefficients[i]));
+            }
+            const float coefficient_scale =
+                coefficient_maximum > 0.0f
+                    ? coefficient_maximum / 127.0f
+                    : 1.0f;
+            const float inverse_coefficient_scale =
+                coefficient_maximum > 0.0f
+                    ? 127.0f / coefficient_maximum
+                    : 0.0f;
+            int i = group_begin;
+#if HAS_NEON && defined(__aarch64__)
+            const float32x4_t inverse =
+                vdupq_n_f32(inverse_coefficient_scale);
+            for (; i + 15 < group_end; i += 16) {
+                const int32x4_t q0 = vcvtnq_s32_f32(
+                    vmulq_f32(vld1q_f32(coefficients + i), inverse));
+                const int32x4_t q1 = vcvtnq_s32_f32(
+                    vmulq_f32(vld1q_f32(coefficients + i + 4), inverse));
+                const int32x4_t q2 = vcvtnq_s32_f32(
+                    vmulq_f32(vld1q_f32(coefficients + i + 8), inverse));
+                const int32x4_t q3 = vcvtnq_s32_f32(
+                    vmulq_f32(vld1q_f32(coefficients + i + 12), inverse));
+                const int16x8_t q01 =
+                    vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
+                const int16x8_t q23 =
+                    vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
+                vst1q_s8(output + begin + i,
+                         vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23)));
+            }
+#endif
+            for (; i < group_end; ++i) {
+                const int quantized = std::clamp(
+                    static_cast<int>(std::nearbyint(
+                        coefficients[i] * inverse_coefficient_scale)),
+                    -127, 127);
+                output[begin + i] = static_cast<int8_t>(quantized);
+            }
+            const int q8_block =
+                (begin + group_begin) / MATMUL_Q8_BLOCK;
+            if (q8_block < q8_blocks) {
+                output_scales[q8_block] =
+                    activation_scale * coefficient_scale;
+            }
+        }
+    }
+}
+
+} // namespace
 
 void quantize_a_q8_blocks(const float* A, int M, int K, int lda, int K_storage,
                           std::vector<int8_t>& qA,
@@ -93,6 +221,52 @@ void quantize_a_q8_blocks(const float* A, int M, int K, int lda, int K_storage,
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     matmul_record_q8_quant_a(ms);
+}
+
+void quantize_a_fp8_q8_blocks(const float* A, int M, int K, int lda,
+                              int K_storage, std::vector<int8_t>& qA,
+                              std::vector<float>& a_scales) {
+    const auto begin = std::chrono::steady_clock::now();
+    K_storage = std::max(K_storage, K);
+    const int blocks_per_row =
+        (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
+    if (K_storage == K) {
+        qA.resize(static_cast<size_t>(M) * K_storage);
+    } else {
+        qA.assign(static_cast<size_t>(M) * K_storage, 0);
+    }
+    a_scales.resize(static_cast<size_t>(M) * blocks_per_row);
+    for (int m = 0; m < M; ++m) {
+        quantize_fp8_q8_row(
+            A + static_cast<size_t>(m) * lda, K,
+            qA.data() + static_cast<size_t>(m) * K_storage,
+            a_scales.data() + static_cast<size_t>(m) * blocks_per_row);
+    }
+    matmul_record_q8_quant_a(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin)
+            .count());
+}
+
+void quantize_a_fp8_dequant(const float* A, int M, int K, int lda,
+                            std::vector<float>& output) {
+    output.resize(static_cast<size_t>(M) * K);
+    for (int m = 0; m < M; ++m) {
+        const float* input = A + static_cast<size_t>(m) * lda;
+        float* destination = output.data() + static_cast<size_t>(m) * K;
+        for (int begin = 0; begin < K; begin += kFp8ActivationBlock) {
+            const int end = std::min(begin + kFp8ActivationBlock, K);
+            const float scale =
+                fp8_ue8m0_scale(input + begin, end - begin);
+            for (int k = begin; k < end; ++k) {
+                destination[k] =
+                    decode_fp8_e4m3fn(encode_fp8_e4m3fn(
+                        std::clamp(
+                            input[k] / scale, -448.0f, 448.0f))) *
+                    scale;
+            }
+        }
+    }
 }
 
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
@@ -246,6 +420,54 @@ void quantize_a_q8_blocks_even_odd(const float* A, int K,
     auto t1 = std::chrono::steady_clock::now();
     double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
     matmul_record_q8_quant_a(ms);
+}
+
+void quantize_a_fp8_q8_even_odd(const float* A, int K,
+                               std::vector<int8_t>& qA_even,
+                               std::vector<int8_t>& qA_odd,
+                               std::vector<float>& a_scales,
+                               std::vector<float>* fp8_dequant) {
+    const auto begin = std::chrono::steady_clock::now();
+    const int blocks =
+        (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
+    static thread_local std::vector<int8_t> contiguous;
+    contiguous.resize(static_cast<size_t>(K));
+    a_scales.resize(static_cast<size_t>(blocks));
+    if (fp8_dequant)
+        fp8_dequant->resize(static_cast<size_t>(K));
+    quantize_fp8_q8_row(
+        A, K, contiguous.data(), a_scales.data(),
+        fp8_dequant ? fp8_dequant->data() : nullptr);
+    qA_even.resize(static_cast<size_t>(blocks) * 16);
+    qA_odd.resize(static_cast<size_t>(blocks) * 16);
+    for (int block = 0; block < blocks; ++block) {
+        int8_t* even =
+            qA_even.data() + static_cast<size_t>(block) * 16;
+        int8_t* odd =
+            qA_odd.data() + static_cast<size_t>(block) * 16;
+        const int8_t* source =
+            contiguous.data() +
+            static_cast<size_t>(block) * MATMUL_Q8_BLOCK;
+        const int count = std::min(
+            MATMUL_Q8_BLOCK, K - block * MATMUL_Q8_BLOCK);
+#if HAS_NEON && defined(__aarch64__)
+        if (count == MATMUL_Q8_BLOCK) {
+            const int8x16_t low = vld1q_s8(source);
+            const int8x16_t high = vld1q_s8(source + 16);
+            vst1q_s8(even, vuzp1q_s8(low, high));
+            vst1q_s8(odd, vuzp2q_s8(low, high));
+            continue;
+        }
+#endif
+        for (int i = 0; i < 16; ++i) {
+            even[i] = i * 2 < count ? source[i * 2] : 0;
+            odd[i] = i * 2 + 1 < count ? source[i * 2 + 1] : 0;
+        }
+    }
+    matmul_record_q8_quant_a(
+        std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - begin)
+            .count());
 }
 
 void quantize_a_q8_g128_even_odd(const float* A, int K,

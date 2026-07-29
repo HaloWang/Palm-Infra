@@ -11,6 +11,15 @@ float sigmoid(float value) {
     return 1.0f / (1.0f + std::exp(-value));
 }
 
+float sqrt_softplus(float value) {
+    // log1p(exp(x)) without overflowing large positive router logits.
+    const float softplus =
+        value > 0.0f
+            ? value + std::log1p(std::exp(-value))
+            : std::log1p(std::exp(value));
+    return std::sqrt(softplus);
+}
+
 }  // namespace
 
 bool select_moe_routes(const float* logits,
@@ -23,7 +32,7 @@ bool select_moe_routes(const float* logits,
     const int top_k = params.top_k;
     if (!logits || num_tokens <= 0 || num_experts <= 0 ||
         top_k <= 0 || top_k > num_experts ||
-        (params.score_func != 0 && params.score_func != 1)) {
+        (params.score_func < 0 || params.score_func > 2)) {
         return false;
     }
 
@@ -55,9 +64,12 @@ bool select_moe_routes(const float* logits,
 
         const float* weight_source = token_logits;
         const float* selection_source = token_logits;
-        if (params.score_func == 1) {
+        if (params.score_func != 0) {
             for (int expert = 0; expert < num_experts; ++expert) {
-                scores[expert] = sigmoid(token_logits[expert]);
+                scores[expert] =
+                    params.score_func == 1
+                        ? sigmoid(token_logits[expert])
+                        : sqrt_softplus(token_logits[expert]);
                 choice_scores[expert] =
                     scores[expert] + (bias ? bias[expert] : 0.0f);
             }
@@ -130,7 +142,7 @@ bool select_moe_routes(const float* logits,
         }
 
         float sum = 0.0f;
-        if (params.score_func == 1) {
+        if (params.score_func != 0) {
             for (int k = 0; k < top_k; ++k) {
                 weights[k] = weight_source[indices[k]];
                 sum += weights[k];
@@ -152,6 +164,54 @@ bool select_moe_routes(const float* logits,
             for (int k = 0; k < top_k; ++k)
                 weights[k] *= inverse;
         }
+    }
+    return true;
+}
+
+bool select_moe_hash_routes(const float* logits,
+                            int num_tokens,
+                            const int32_t* token_ids,
+                            const int32_t* token_to_experts,
+                            int vocab_size,
+                            const MoeRoutingParams& params,
+                            std::vector<int>& expert_indices,
+                            std::vector<float>& expert_weights) {
+    if (!logits || !token_ids || !token_to_experts || num_tokens <= 0 ||
+        vocab_size <= 0 || params.num_experts <= 0 || params.top_k <= 0 ||
+        params.top_k > params.num_experts || params.score_func != 2) {
+        return false;
+    }
+    expert_indices.resize(
+        static_cast<size_t>(num_tokens) * params.top_k);
+    expert_weights.resize(
+        static_cast<size_t>(num_tokens) * params.top_k);
+    for (int token = 0; token < num_tokens; ++token) {
+        const int token_id = token_ids[token];
+        if (token_id < 0 || token_id >= vocab_size)
+            return false;
+        float sum = 0.0f;
+        for (int k = 0; k < params.top_k; ++k) {
+            const int expert =
+                token_to_experts[
+                    static_cast<size_t>(token_id) * params.top_k + k];
+            if (expert < 0 || expert >= params.num_experts)
+                return false;
+            const size_t output_index =
+                static_cast<size_t>(token) * params.top_k + k;
+            expert_indices[output_index] = expert;
+            const float weight = sqrt_softplus(
+                logits[static_cast<size_t>(token) * params.num_experts +
+                       expert]);
+            expert_weights[output_index] = weight;
+            sum += weight;
+        }
+        const float scale =
+            (params.normalize_topk && sum > 0.0f
+                 ? params.scaling_factor / sum
+                 : params.scaling_factor);
+        for (int k = 0; k < params.top_k; ++k)
+            expert_weights[
+                static_cast<size_t>(token) * params.top_k + k] *= scale;
     }
     return true;
 }

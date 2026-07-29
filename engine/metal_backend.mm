@@ -767,6 +767,9 @@ size_t esize(Precision p) {
     case Precision::FP16: return 2;
     case Precision::INT8: return 1;
     case Precision::INT4: return 1;
+    case Precision::FP8_E4M3: return 1;
+    case Precision::MXFP4: return 1;
+    case Precision::INT32: return 4;
     }
     return 4;
 }

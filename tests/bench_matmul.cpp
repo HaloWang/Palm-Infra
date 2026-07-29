@@ -1,4 +1,5 @@
 #include "kernels/tensor.h"
+#include "kernels/deepseek_v4_attention.h"
 #include "kernels/matmul.h"
 #include "kernels/threading.h"
 
@@ -34,12 +35,14 @@ struct BenchConfig {
     bool use_fp16 = false; // FP16 weight storage
     bool use_int8 = false; // INT8 weight storage
     bool use_int4 = false; // INT4 packed weight storage
+    bool use_mxfp4 = false;
     bool use_fp32 = false; // explicitly FP32 (default)
     bool interleave_pack = true;   // B interleaved packing (FP16/INT8)
     bool no_interleave_pack = false;
     int group_size = 0;     // quant group size; 0 = per-channel
     bool sparse_a = false;  // benchmark ReLU-squared sparse-A GEMV
     int density_pct = 10;   // nonzero percentage for --sparse-a
+    bool dsv4_grouped = false;
 };
 
 struct BenchResult {
@@ -123,6 +126,8 @@ static BenchConfig parse_args(int argc, char** argv) {
             cfg.use_int8 = true;
         } else if (arg == "--int4") {
             cfg.use_int4 = true;
+        } else if (arg == "--mxfp4") {
+            cfg.use_mxfp4 = true;
         } else if (arg == "--fp32") {
             cfg.use_fp32 = true;
         } else if (arg == "--group-size") {
@@ -133,6 +138,8 @@ static BenchConfig parse_args(int argc, char** argv) {
             }
         } else if (arg == "--sparse-a") {
             cfg.sparse_a = true;
+        } else if (arg == "--dsv4-grouped") {
+            cfg.dsv4_grouped = true;
         } else if (arg == "--density") {
             if (!require_value(argc, argv, i, "--density", value)) std::exit(1);
             if (!parse_int(value, cfg.density_pct) ||
@@ -158,6 +165,91 @@ static BenchConfig parse_args(int argc, char** argv) {
     return cfg;
 }
 
+static BenchResult run_dsv4_grouped_bench(const BenchConfig& cfg) {
+    constexpr int groups = 8;
+    constexpr int group_width = 4096;
+    constexpr int rank = 1024;
+    constexpr int input_size = groups * group_width;
+    constexpr int output_size = groups * rank;
+    constexpr int weight_sets = 4;
+    constexpr size_t weight_set_size =
+        static_cast<size_t>(output_size) * group_width;
+
+    std::vector<float> input(input_size);
+    std::vector<__fp16> packed_weight(
+        weight_sets * weight_set_size);
+    std::vector<float> output(output_size);
+    for (int i = 0; i < input_size; ++i)
+        input[i] = static_cast<float>((i % 31) - 15) / 32.0f;
+    for (size_t i = 0; i < packed_weight.size(); ++i)
+        packed_weight[i] =
+            static_cast<__fp16>(
+                static_cast<float>(
+                    static_cast<int>(i % 17) - 8) / 64.0f);
+
+    uint8_t unused_raw_weight = 0;
+    Tensor A = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        input_size, 1, 1, 1, input.data());
+    Tensor B = Tensor::create(
+        Precision::FP8_E4M3, MemoryType::EXTERNAL,
+        output_size, group_width, 1, 1, &unused_raw_weight);
+    B.fp8_bf16_fp16_data = packed_weight.data();
+    Tensor C = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_size, 1, 1, 1, output.data());
+    ThreadPool pool(cfg.num_threads);
+    ThreadPool* thread_pool =
+        cfg.num_threads > 1 ? &pool : nullptr;
+
+    for (int i = 0; i < cfg.warmup; ++i) {
+        B.fp8_bf16_fp16_data =
+            packed_weight.data() +
+            static_cast<size_t>(i % weight_sets) * weight_set_size;
+        if (!kernel_dsv4_grouped_linear(
+                A, B, C, groups, thread_pool)) {
+            std::fprintf(
+                stderr, "bench_matmul: DSV4 grouped-linear rejected input\n");
+            std::exit(1);
+        }
+    }
+
+    std::vector<double> times;
+    times.reserve(cfg.repeat);
+    for (int i = 0; i < cfg.repeat; ++i) {
+        B.fp8_bf16_fp16_data =
+            packed_weight.data() +
+            static_cast<size_t>(i % weight_sets) * weight_set_size;
+        const auto begin = std::chrono::steady_clock::now();
+        kernel_dsv4_grouped_linear(A, B, C, groups, thread_pool);
+        const auto end = std::chrono::steady_clock::now();
+        times.push_back(
+            std::chrono::duration<double, std::milli>(end - begin).count());
+    }
+    std::sort(times.begin(), times.end());
+
+    BenchResult result;
+    result.min_ms = times.front();
+    result.max_ms = times.back();
+    result.p50_ms = times[times.size() / 2];
+    for (double time : times)
+        result.avg_ms += time;
+    result.avg_ms /= times.size();
+    const double operations =
+        2.0 * output_size * group_width;
+    result.gflops =
+        operations / (result.avg_ms * 1.0e6);
+    // Keep the output observable and catch accidental all-zero kernels.
+    double checksum = 0.0;
+    for (float value : output)
+        checksum += value;
+    std::printf(
+        "DSV4 grouped-linear groups=%d group_width=%d rank=%d "
+        "threads=%d checksum=%.6f\n",
+        groups, group_width, rank, cfg.num_threads, checksum);
+    return result;
+}
+
 static BenchResult run_bench(const BenchConfig& cfg) {
     int M = cfg.M, K = cfg.K, N = cfg.N;
 
@@ -179,6 +271,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     bool is_fp16 = cfg.use_fp16;
     bool is_int8 = cfg.use_int8;
     bool is_int4 = cfg.use_int4;
+    bool is_mxfp4 = cfg.use_mxfp4;
 
     float* a_data = new float[M * K];
     float* c_data = new float[M * N];
@@ -201,6 +294,8 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int8_t* b_int8_packed_data = nullptr;
     int8_t* b_int8_q8dot_data = nullptr;
     uint8_t* b_int4_data = nullptr;
+    uint8_t* b_mxfp4_data = nullptr;
+    uint8_t* b_mxfp4_scales = nullptr;
     uint8_t* b_int4_q4dot_data = nullptr;
     uint8_t* b_int4_q4g32_data = nullptr;
     uint8_t* b_int4_q4g128_data = nullptr;
@@ -209,7 +304,31 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int group_size = cfg.group_size > 0 ? cfg.group_size : K;
     int groups_per_row = (K + group_size - 1) / group_size;
 
-    if (is_int8) {
+    if (is_mxfp4) {
+        if ((K % 32) != 0) {
+            std::fprintf(
+                stderr, "bench_matmul: MXFP4 requires K divisible by 32\n");
+            std::exit(1);
+        }
+        b_mxfp4_data = new uint8_t[
+            static_cast<size_t>(N) * K / 2];
+        b_mxfp4_scales = new uint8_t[
+            static_cast<size_t>(N) * K / 32];
+        for (size_t i = 0;
+             i < static_cast<size_t>(N) * K / 2; ++i) {
+            const uint8_t low =
+                static_cast<uint8_t>(std::rand() % 16);
+            const uint8_t high =
+                static_cast<uint8_t>(std::rand() % 16);
+            b_mxfp4_data[i] =
+                static_cast<uint8_t>(low | (high << 4));
+        }
+        std::fill(
+            b_mxfp4_scales,
+            b_mxfp4_scales + static_cast<size_t>(N) * K / 32,
+            static_cast<uint8_t>(127));
+        b_raw = b_mxfp4_data;
+    } else if (is_int8) {
         b_int8_data = new int8_t[N * K];
         scales_data = new float[N * groups_per_row];
         for (int n = 0; n < N; n++) {
@@ -280,11 +399,21 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     }
 
     Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-    Tensor B = Tensor::create(is_int4 ? Precision::INT4 : is_int8 ? Precision::INT8 : is_fp16 ? Precision::FP16 : Precision::FP32,
+    Tensor B = Tensor::create(is_mxfp4 ? Precision::MXFP4 :
+                              is_int4 ? Precision::INT4 :
+                              is_int8 ? Precision::INT8 :
+                              is_fp16 ? Precision::FP16 : Precision::FP32,
                               MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
     if (is_fp16)
         B.is_interleaved = g_matmul_config.use_interleave_pack;
-    if (is_int8 || is_int4) {
+    if (is_mxfp4) {
+        B.e8m0_scales = b_mxfp4_scales;
+        B.group_size = 32;
+        B.groups_per_row = static_cast<uint32_t>(K / 32);
+        B.num_groups =
+            static_cast<uint32_t>(
+                static_cast<size_t>(N) * K / 32);
+    } else if (is_int8 || is_int4) {
         B.scales = scales_data;
         B.group_size = (uint32_t)group_size;
         B.groups_per_row = (uint32_t)groups_per_row;
@@ -347,7 +476,10 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (b_int4_q4g32_data) delete[] b_int4_q4g32_data;
     if (b_int4_q4g128_data) delete[] b_int4_q4g128_data;
     if (b_int4_sparse_data) delete[] b_int4_sparse_data;
-    if (is_int8) {
+    if (is_mxfp4) {
+        delete[] b_mxfp4_data;
+        delete[] b_mxfp4_scales;
+    } else if (is_int8) {
         delete[] b_int8_data;
         delete[] scales_data;
     } else if (is_int4) {
@@ -362,10 +494,16 @@ static BenchResult run_bench(const BenchConfig& cfg) {
 int main(int argc, char** argv) {
     srand(42);
     BenchConfig cfg = parse_args(argc, argv);
-    BenchResult result = run_bench(cfg);
+    BenchResult result =
+        cfg.dsv4_grouped ? run_dsv4_grouped_bench(cfg) : run_bench(cfg);
 
-    std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
-                cfg.use_int4 ? "INT4" : cfg.use_int8 ? "INT8" : cfg.use_fp16 ? "FP16" : "FP32");
+    if (!cfg.dsv4_grouped) {
+        std::printf("M=%d K=%d N=%d threads=%d prec=%s\n", cfg.M, cfg.K, cfg.N, cfg.num_threads,
+                    cfg.use_mxfp4 ? "MXFP4" :
+                    cfg.use_int4 ? "INT4" :
+                    cfg.use_int8 ? "INT8" :
+                    cfg.use_fp16 ? "FP16" : "FP32");
+    }
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
     if (cfg.sparse_a) std::printf("  sparse_a=1 density=%d%%\n", cfg.density_pct);
     std::printf("  avg=%.4fms min=%.4fms max=%.4fms p50=%.4fms\n",

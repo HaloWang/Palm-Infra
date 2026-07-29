@@ -37,6 +37,7 @@ MappedFile::Header make_header(uint64_t data_size, uint64_t scales_size,
 
 int main() {
     float scales[8] = {};
+    unsigned char e8m0_scales[16] = {};
 
     {
         Tensor weight = make_weight(Precision::FP16, 2, 4);
@@ -102,6 +103,48 @@ int main() {
         CHECK(!mollm::detail::configure_weight_metadata(
                   conflicting, conflicting_header, scales, "conflicting"),
               "reject conflicting INT4 layout flags");
+    }
+
+    {
+        Tensor weight = make_weight(Precision::MXFP4, 2, 64);
+        const MappedFile::Header header =
+            make_header(64, 4, 32, 4);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  weight, header, e8m0_scales, "mxfp4"),
+              "accept valid MXFP4 metadata");
+        CHECK(weight.e8m0_scales == e8m0_scales &&
+                  weight.group_size == 32 &&
+                  weight.groups_per_row == 2 &&
+                  weight.num_groups == 4,
+              "attach MXFP4 E8M0 block-32 metadata");
+
+        MappedFile::Header wrong_group = header;
+        wrong_group.group_size = 16;
+        CHECK(!mollm::detail::configure_weight_metadata(
+                  weight, wrong_group, e8m0_scales, "mxfp4-wrong-group"),
+              "reject nonstandard MXFP4 group size");
+    }
+
+    {
+        Tensor weight = make_weight(Precision::FP8_E4M3, 129, 257);
+        const uint32_t groups = 2 * 3;
+        const MappedFile::Header header =
+            make_header(129 * 257, groups, 128, groups,
+                        MappedFile::FLAG_FP8_BLOCK128);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  weight, header, e8m0_scales, "fp8"),
+              "accept FP8 E4M3 128x128 block metadata");
+        CHECK(weight.e8m0_scales == e8m0_scales &&
+                  weight.is_fp8_block128 &&
+                  weight.groups_per_row == 3,
+              "attach FP8 E8M0 2D block metadata");
+
+        MappedFile::Header missing_layout = header;
+        missing_layout.flags = 0;
+        CHECK(!mollm::detail::configure_weight_metadata(
+                  weight, missing_layout, e8m0_scales,
+                  "fp8-missing-layout"),
+              "reject FP8 without scale-layout flag");
     }
 
     {

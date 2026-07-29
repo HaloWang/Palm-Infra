@@ -74,6 +74,36 @@ int main() {
         ran_any = true;
     }
 
+    // DeepSeek-V4 uses full-width-bar special tokens and an explicit BOS.
+    {
+        const char* path = "/tmp/mollm_deepseek_v4_tokenizer_test.json";
+        {
+            std::ofstream f(path);
+            f << R"({"model":{"vocab":{"a":0,"b":3,"c":4},"merges":[]},"added_tokens":[)"
+              << R"({"id":1,"content":"<｜end▁of▁sentence｜>"},)"
+              << R"({"id":2,"content":"<｜begin▁of▁sentence｜>"},)"
+              << R"({"id":10,"content":"<｜User｜>"},)"
+              << R"({"id":11,"content":"<｜Assistant｜>"},)"
+              << R"({"id":12,"content":"</think>"}]})";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path), "DeepSeek-V4 tokenizer loads");
+        CHECK(tok.bos_id() == 2, "DeepSeek-V4 BOS is detected");
+        CHECK(tok.eos_id() == 1, "DeepSeek-V4 EOS is detected");
+        check_ids(tok.apply_chat("a"), {2, 10, 0, 11, 12},
+                  "DeepSeek-V4 chat template");
+        check_ids(
+            tok.apply_chat({
+                {"user", "a"},
+                {"assistant", "b"},
+                {"user", "c"},
+            }),
+            {2, 10, 0, 11, 12, 3, 1, 10, 4, 11, 12},
+            "DeepSeek-V4 multi-turn chat preserves assistant prefix");
+        std::remove(path);
+        ran_any = true;
+    }
+
     // RWKV-world vocabulary: longest byte-prefix matching over the official
     // `id python-bytes-literal byte_length` format. This is deliberately a
     // tiny fixture; the production vocabulary has the same syntax.
@@ -224,6 +254,20 @@ int main() {
             check_ids(tok.encode("мару». Не"),
                       {173719, 3652, 71973, 152142},
                       "Qwen guillemet punctuation run matches HF");
+        }
+    }
+
+    {
+        Tokenizer tok;
+        const char* fixture = std::getenv("MOLLM_DSV4_TOKENIZER");
+        if (fixture && tok.load(fixture)) {
+            ran_any = true;
+            check_ids(
+                tok.apply_chat("你好，请用一句话介绍你自己。"),
+                {0, 128803, 30594, 303, 2788, 642, 34543, 6657,
+                 36005, 320, 128804, 128822},
+                "DeepSeek-V4 chat encoding matches official tokenizer");
+            CHECK(tok.eos_id() == 1, "DeepSeek-V4 official EOS id");
         }
     }
 

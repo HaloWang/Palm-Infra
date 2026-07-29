@@ -23,27 +23,101 @@ bool configure_weight_metadata(Tensor& tensor,
                                const MappedFile::Header& header,
                                const void* scales, const char* label) {
     tensor.scales = nullptr;
+    tensor.e8m0_scales = nullptr;
+    tensor.fp8_q8_scales = nullptr;
     tensor.group_size = 0;
     tensor.num_groups = 0;
     tensor.groups_per_row = 0;
     tensor.is_q4_repacked = false;
     tensor.is_q4_g32_packed = false;
     tensor.is_q4_g128_packed = false;
+    tensor.is_fp8_block128 = false;
     tensor.q4_g32_data = nullptr;
     tensor.q4_g128_data = nullptr;
 
     const bool is_quantized =
-        tensor.prec == Precision::INT8 || tensor.prec == Precision::INT4;
+        tensor.prec == Precision::INT8 || tensor.prec == Precision::INT4 ||
+        tensor.prec == Precision::FP8_E4M3 ||
+        tensor.prec == Precision::MXFP4;
     if (!is_quantized)
         return true;
 
     const int64_t rows = tensor.shape[0];
     const int64_t cols = tensor.shape[1];
+    if (rows <= 0 || cols <= 0) {
+        std::fprintf(stderr, "Engine: quantized weight %s has bad shape\n",
+                     label);
+        return false;
+    }
+
+    const uint64_t rows_u = static_cast<uint64_t>(rows);
+    const uint64_t cols_u = static_cast<uint64_t>(cols);
+
+    // OCP MXFP4 fixes every part of the microscaling format: E2M1 values,
+    // 32 consecutive K elements per group, and one E8M0 byte per group.
+    if (tensor.prec == Precision::MXFP4) {
+        uint64_t logical_elements = 0;
+        uint64_t expected_groups = 0;
+        if (header.flags != 0 || !scales || header.group_size != 32 ||
+            cols % 32 != 0 ||
+            !checked_multiply(rows_u, cols_u, logical_elements) ||
+            !checked_multiply(rows_u, cols_u / 32, expected_groups) ||
+            expected_groups > std::numeric_limits<uint32_t>::max() ||
+            header.data_size != logical_elements / 2 ||
+            header.scales_size != expected_groups ||
+            header.num_groups != expected_groups) {
+            std::fprintf(
+                stderr,
+                "Engine: MXFP4 weight %s requires packed E2M1 data and "
+                "E8M0 block-32 scales (N=%lld K=%lld)\n",
+                label, static_cast<long long>(rows),
+                static_cast<long long>(cols));
+            return false;
+        }
+        tensor.e8m0_scales = static_cast<const uint8_t*>(scales);
+        tensor.group_size = 32;
+        tensor.groups_per_row = static_cast<uint32_t>(cols / 32);
+        tensor.num_groups = header.num_groups;
+        return true;
+    }
+
+    // DeepSeek-V4 dense FP8 tensors use one E8M0 scale per 128x128 output/K
+    // tile. This is deliberately explicit: it is not the OCP MXFP8 layout.
+    if (tensor.prec == Precision::FP8_E4M3) {
+        uint64_t logical_elements = 0;
+        const uint64_t n_blocks = (rows_u + 127) / 128;
+        const uint64_t k_blocks = (cols_u + 127) / 128;
+        uint64_t expected_groups = 0;
+        if (header.flags != MappedFile::FLAG_FP8_BLOCK128 || !scales ||
+            header.group_size != 128 ||
+            !checked_multiply(rows_u, cols_u, logical_elements) ||
+            !checked_multiply(n_blocks, k_blocks, expected_groups) ||
+            expected_groups > std::numeric_limits<uint32_t>::max() ||
+            header.data_size != logical_elements ||
+            header.scales_size != expected_groups ||
+            header.num_groups != expected_groups) {
+            std::fprintf(
+                stderr,
+                "Engine: FP8 weight %s requires E4M3 data and E8M0 "
+                "128x128 block scales (N=%lld K=%lld)\n",
+                label, static_cast<long long>(rows),
+                static_cast<long long>(cols));
+            return false;
+        }
+        tensor.e8m0_scales = static_cast<const uint8_t*>(scales);
+        tensor.group_size = 128;
+        tensor.groups_per_row =
+            static_cast<uint32_t>(k_blocks);
+        tensor.num_groups = header.num_groups;
+        tensor.is_fp8_block128 = true;
+        return true;
+    }
+
     const bool header_embeds_bg32_scales =
         tensor.prec == Precision::INT4 &&
         (header.flags & MappedFile::FLAG_INT4_BG32) != 0;
     if ((!scales && !header_embeds_bg32_scales) ||
-        header.group_size == 0 || rows <= 0 || cols <= 0) {
+        header.group_size == 0) {
         std::fprintf(stderr,
                      "Engine: quantized weight %s missing scales/group "
                      "metadata\n",
@@ -51,8 +125,6 @@ bool configure_weight_metadata(Tensor& tensor,
         return false;
     }
 
-    const uint64_t rows_u = static_cast<uint64_t>(rows);
-    const uint64_t cols_u = static_cast<uint64_t>(cols);
     const uint64_t groups_per_row_u =
         1 + (cols_u - 1) / header.group_size;
     uint64_t expected_groups = 0;

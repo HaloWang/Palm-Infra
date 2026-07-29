@@ -243,6 +243,11 @@ void LLMEngine::reset() {
             std::memset(cp.rwkv_ffn_shift->data, 0,
                         cp.rwkv_ffn_shift->nbytes());
     }
+    for (const auto& entry : auxiliary_states_) {
+        Tensor* state = entry.second;
+        if (state && state->data)
+            std::memset(state->data, 0, state->nbytes());
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -503,10 +508,21 @@ void LLMEngine::generate_rope_cache(int seq_len, int start_pos, Tensor& cos,
 Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
                             const Tensor& hidden, const Tensor& mask,
                             const Tensor& cos, const Tensor& sin,
+                            const Tensor* token_ids,
                             bool defer_metal_end) {
     if (moe_ssd_cache_)
         moe_ssd_cache_->begin_forward_pass();
     auto& tensors = graph.runtime.tensors;
+    int32_t graph_position = static_cast<int32_t>(past_len_);
+    Tensor position_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        1, 1, 1, 1, &graph_position);
+    int32_t graph_n_tokens = exec_ctx.runtime_seq_len > 0
+        ? static_cast<int32_t>(exec_ctx.runtime_seq_len)
+        : static_cast<int32_t>(hidden.shape[1]);
+    Tensor n_tokens_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        1, 1, 1, 1, &graph_n_tokens);
 
     // Feed graph inputs by borrowing the caller-owned/helper tensors directly.
     // hidden/mask/cos/sin lifetime is managed by the caller; cache/state INPUTs
@@ -532,6 +548,15 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
             is_boundary = true;
         } else if (name == "sin") {
             *t = sin;
+            is_boundary = true;
+        } else if (name == "token_ids" && token_ids) {
+            *t = *token_ids;
+            is_boundary = true;
+        } else if (name == "position") {
+            *t = position_tensor;
+            is_boundary = true;
+        } else if (name == "n_tokens") {
+            *t = n_tokens_tensor;
             is_boundary = true;
         }
         // cache_k/cache_v/gdn state are persistent INPUT tensors.
@@ -560,6 +585,9 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         if (!defer_metal_end)
             metal_backend_->end_graph();
 #endif
+
+    if (exec_ctx.execution_failed)
+        return Tensor();
 
     if (!graph.graph_outputs.empty()) {
         uint32_t out_id = graph.graph_outputs.back();
@@ -613,6 +641,14 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return -1;
+    if (past_len_ > cfg_.n_ctx || n > cfg_.n_ctx - past_len_) {
+        fprintf(
+            stderr,
+            "prefill: %d tokens do not fit in remaining context "
+            "(past=%d, n_ctx=%d). Use /reset or a shorter prompt.\n",
+            n, past_len_, cfg_.n_ctx);
+        return -1;
+    }
     sampler_.accept(token_ids);
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
@@ -683,7 +719,8 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
             finish_prefill_phase();
             return -1;
         }
-        int chunk_size = std::min(remaining, graph_seq_len);
+        int chunk_size =
+            std::min({remaining, graph_seq_len, cfg_.n_ctx - past_len_});
         std::vector<int> chunk(token_ids.begin() + offset,
                                token_ids.begin() + offset + chunk_size);
         last_token = prefill_chunk(chunk, past_len_);
@@ -702,6 +739,14 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     int n = (int)token_ids.size();
     if (n == 0)
         return Tensor();
+    if (past_len_ > cfg_.n_ctx || n > cfg_.n_ctx - past_len_) {
+        fprintf(
+            stderr,
+            "prefill_hidden: %d tokens do not fit in remaining context "
+            "(past=%d, n_ctx=%d).\n",
+            n, past_len_, cfg_.n_ctx);
+        return Tensor();
+    }
 
     Backend* saved_prefill_backend = exec_ctx_prefill_.backend;
     bool short_ssd_cpu_prefill = false;
@@ -779,22 +824,34 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
-    Tensor out =
-        run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
+    std::vector<int32_t> graph_token_ids(
+        static_cast<size_t>(h.shape[1]), 0);
+    std::copy(token_ids.begin(), token_ids.end(), graph_token_ids.begin());
+    Tensor token_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        h.shape[1], 1, 1, 1, graph_token_ids.data());
+    Tensor out = run_graph(
+        graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin,
+        &token_tensor);
     mollm_set_matmul_profile_phase("unscoped");
-    Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
+    Tensor copied;
+    if (out.data)
+        copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
-    past_len_ += n;
-
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    if (out.data) {
+        past_len_ += n;
+        for (auto& cp : caches_) {
+            if (cp.k)
+                cache_meta(cp.k->data)->current_seq_len =
+                    (uint64_t)past_len_;
+            if (cp.v)
+                cache_meta(cp.v->data)->current_seq_len =
+                    (uint64_t)past_len_;
+        }
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
@@ -890,8 +947,23 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
-    Tensor out =
-        run_graph(graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin);
+    std::vector<int32_t> graph_token_ids(
+        static_cast<size_t>(h.shape[1]), 0);
+    std::copy(token_ids.begin(), token_ids.end(), graph_token_ids.begin());
+    Tensor token_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        h.shape[1], 1, 1, 1, graph_token_ids.data());
+    Tensor out = run_graph(
+        graph_prefill_, exec_ctx_prefill_, h, mask, cos, sin,
+        &token_tensor);
+    if (!out.data) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+        return -1;
+    }
 
     past_len_ = past + n;
 
@@ -919,7 +991,12 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
 
 int LLMEngine::decode(int token_id) {
     mollm_trace::ScopedEvent trace_decode("inference", "decode");
-    sampler_.accept(token_id);
+    if (past_len_ >= cfg_.n_ctx) {
+        fprintf(stderr,
+                "decode: context full (past=%d >= n_ctx=%d). Use /reset.\n",
+                past_len_, cfg_.n_ctx);
+        return -1;
+    }
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
@@ -940,8 +1017,21 @@ int LLMEngine::decode(int token_id) {
 #endif
 
     mollm_set_matmul_profile_phase("decode_graph");
-    Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
-                           defer_metal_lmhead);
+    int32_t graph_token_id = token_id;
+    Tensor token_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        1, 1, 1, 1, &graph_token_id);
+    Tensor out = run_graph(
+        graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
+        &token_tensor, defer_metal_lmhead);
+    if (!out.data) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
+        return -1;
+    }
 
     past_len_++;
 
@@ -954,6 +1044,7 @@ int LLMEngine::decode(int token_id) {
     }
 
     mollm_set_matmul_profile_phase("decode_lmhead");
+    sampler_.accept(token_id);
     int token = run_lmhead(out, 1, defer_metal_lmhead);
     mollm_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
@@ -966,6 +1057,13 @@ int LLMEngine::decode(int token_id) {
 
 Tensor LLMEngine::decode_hidden(int token_id) {
     mollm_trace::ScopedEvent trace_decode("inference", "decode_hidden");
+    if (past_len_ >= cfg_.n_ctx) {
+        fprintf(stderr,
+                "decode_hidden: context full (past=%d >= n_ctx=%d). "
+                "Use /reset.\n",
+                past_len_, cfg_.n_ctx);
+        return Tensor();
+    }
     Tensor h = embed({token_id});
     h.shape[1] = 1;
     h.compute_strides();
@@ -981,21 +1079,32 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     Tensor mask = build_causal_mask(1, past_len_);
 
     mollm_set_matmul_profile_phase("decode_graph");
-    Tensor out = run_graph(graph_decode_, exec_ctx_decode_, h, mask, cos, sin);
+    int32_t graph_token_id = token_id;
+    Tensor token_tensor = Tensor::create(
+        Precision::INT32, MemoryType::EXTERNAL,
+        1, 1, 1, 1, &graph_token_id);
+    Tensor out = run_graph(
+        graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
+        &token_tensor);
     mollm_set_matmul_profile_phase("unscoped");
-    Tensor copied = copy_tensor_contiguous(out, hidden_output_copy_);
+    Tensor copied;
+    if (out.data)
+        copied = copy_tensor_contiguous(out, hidden_output_copy_);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
-    past_len_++;
-
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    if (out.data) {
+        past_len_++;
+        for (auto& cp : caches_) {
+            if (cp.k)
+                cache_meta(cp.k->data)->current_seq_len =
+                    (uint64_t)past_len_;
+            if (cp.v)
+                cache_meta(cp.v->data)->current_seq_len =
+                    (uint64_t)past_len_;
+        }
     }
 
     finish_graph_temporaries(graph_decode_, exec_ctx_decode_);

@@ -1,4 +1,5 @@
 #include "graph/mmap_file.h"
+#include "kernels/tensor.h"
 
 #include <cerrno>
 #include <cstdio>
@@ -101,10 +102,12 @@ bool range_within_file(uint64_t offset, uint64_t length, size_t file_size) {
 bool valid_header(const MappedFile::Header& header, size_t file_size) {
     constexpr uint32_t known_flags = MappedFile::FLAG_INT4_Q4DOT |
                                      MappedFile::FLAG_INT4_BG128 |
-                                     MappedFile::FLAG_INT4_BG32;
+                                     MappedFile::FLAG_INT4_BG32 |
+                                     MappedFile::FLAG_FP8_BLOCK128;
     if ((header.flags & ~known_flags) != 0 ||
         header.ndim == 0 || header.ndim > 4 ||
-        header.precision > 3) {
+        header.precision >
+            static_cast<uint32_t>(Precision::INT32)) {
         return false;
     }
     for (uint32_t dim = 0; dim < header.ndim; ++dim) {

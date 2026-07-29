@@ -1,5 +1,6 @@
 #include "graph/execute.h"
 #include "engine/backend.h"
+#include "kernels/bf16.h"
 #include "kernels/moe.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
@@ -8,6 +9,7 @@
 #include <cassert>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 
 // ---------------------------------------------------------------------------
 // DimExpr evaluation — substitute runtime seq_len into a symbolic dim expr.
@@ -56,6 +58,13 @@ void reset_profile_stats(ExecContext& ctx) {
 void prepare_execution(ExecContext& ctx) {
     auto& nodes = ctx.graph->nodes;
     const size_t N = nodes.size();
+    ctx.emulate_bf16_activations = std::any_of(
+        nodes.begin(), nodes.end(),
+        [](const GraphNode& node) {
+            return node.op_type == OpType::DSV4_COMPRESSOR ||
+                   node.op_type == OpType::DSV4_INDEXER ||
+                   node.op_type == OpType::DSV4_SPARSE_ATTN;
+        });
     ctx.release_queue.assign(N, {});
     ctx.resolved_inputs.assign(N, {});
     for (size_t i = 0; i < N; ++i) {
@@ -78,7 +87,10 @@ void prepare_execution(ExecContext& ctx) {
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||
             node.op_type == OpType::SHORTCONV ||
             node.op_type == OpType::RMS_NORM_ROPE ||
-            node.op_type == OpType::ADD_RMS_NORM) {
+            node.op_type == OpType::ADD_RMS_NORM ||
+            node.op_type == OpType::DSV4_COMPRESSOR ||
+            node.op_type == OpType::DSV4_INDEXER ||
+            node.op_type == OpType::DSV4_SPARSE_ATTN) {
             return;
         }
     }
@@ -230,6 +242,13 @@ void execute_graph(ExecContext& ctx) {
     auto& nodes  = ctx.graph->nodes;
     auto& tensors = ctx.graph->runtime.tensors;
     auto* pool   = ctx.pool;
+    ctx.execution_failed = false;
+    if (!ctx.backend) {
+        std::fprintf(stderr, "execute_graph: no backend configured\n");
+        ctx.execution_failed = true;
+        return;
+    }
+    ctx.backend->clear_dispatch_error();
     // Device-resident backends (Metal) keep intermediates in device buffers,
     // so borrowed-view detection can't rely on host-pointer equality; classify
     // views by op type instead, and skip the host owner-id assertions.
@@ -312,6 +331,7 @@ void execute_graph(ExecContext& ctx) {
                                  "execute_graph: owner mismatch before release for node %u (%p owner=%u pool=%u)\n",
                                  node.id, t.data, t.owner_id, pool->id());
                     assert(false && "execute_graph owner mismatch");
+                    ctx.execution_failed = true;
                     return;
                 }
                 ctx.backend->free_output(t, pool);
@@ -457,6 +477,7 @@ void execute_graph(ExecContext& ctx) {
                     if (!buf) {
                         fprintf(stderr, "execute: pool acquire failed for node %u (%zu bytes)\n",
                                 node.id, nbytes);
+                        ctx.execution_failed = true;
                         return;
                     }
                 }
@@ -468,7 +489,8 @@ void execute_graph(ExecContext& ctx) {
         // vector to the real router from the next MoE layer on an idle SSD
         // worker, so its speculative reads can overlap this layer and the next
         // attention block. The next layer always recomputes its exact route.
-        if (ctx.moe_cross_layer_prefetch &&
+        if ((ctx.moe_cross_layer_prefetch ||
+             ctx.moe_hash_cross_layer_prefetch) &&
             node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
             inputs[0]->shape[1] == 1) {
             if (device_resident)
@@ -483,19 +505,58 @@ void execute_graph(ExecContext& ctx) {
                 const Tensor& next_router = tensors[next_inputs[1]];
                 const Tensor& next_gate = tensors[next_inputs[2]];
                 const Tensor& next_down = tensors[next_inputs[3]];
-                const Tensor* next_bias = next_inputs.size() > 8
-                    ? &tensors[next_inputs[8]] : nullptr;
-                MoeSsdPredictConfig config;
-                config.hidden_size = graph_params::get_i32(next_it->params, 0, 0);
-                config.num_experts = graph_params::get_i32(next_it->params, 1, 0);
-                config.top_k = graph_params::get_i32(next_it->params, 2, 0);
-                config.router_score_func = graph_params::get_i32(next_it->params, 5, 0);
-                config.n_group = graph_params::get_i32(next_it->params, 8, 1);
-                config.topk_group = graph_params::get_i32(next_it->params, 9, 1);
-                schedule_moe_cross_layer_prefetch(
-                    *inputs[0], next_router, next_bias,
-                    static_cast<const MoeSsdTensorSource*>(next_gate.moe_ssd_source),
-                    static_cast<const MoeSsdTensorSource*>(next_down.moe_ssd_source), config);
+                const int next_bias_input =
+                    graph_params::get_i32(next_it->params, 11, -1);
+                const Tensor* next_bias =
+                    next_bias_input >= 0 &&
+                            static_cast<size_t>(next_bias_input) <
+                                next_inputs.size()
+                        ? &tensors[next_inputs[next_bias_input]]
+                        : nullptr;
+                const int num_experts =
+                    graph_params::get_i32(next_it->params, 1, 0);
+                const int top_k =
+                    graph_params::get_i32(next_it->params, 2, 0);
+                const int token_ids_input =
+                    graph_params::get_i32(next_it->params, 12, -1);
+                const int hash_table_input =
+                    graph_params::get_i32(next_it->params, 13, -1);
+                const bool exact_hash_route =
+                    ctx.moe_hash_cross_layer_prefetch &&
+                    token_ids_input >= 0 && hash_table_input >= 0 &&
+                    static_cast<size_t>(token_ids_input) <
+                        next_inputs.size() &&
+                    static_cast<size_t>(hash_table_input) <
+                        next_inputs.size();
+                if (exact_hash_route) {
+                    schedule_moe_hash_cross_layer_prefetch(
+                        tensors[next_inputs[token_ids_input]],
+                        tensors[next_inputs[hash_table_input]],
+                        static_cast<const MoeSsdTensorSource*>(
+                            next_gate.moe_ssd_source),
+                        static_cast<const MoeSsdTensorSource*>(
+                            next_down.moe_ssd_source),
+                        num_experts, top_k);
+                } else if (ctx.moe_cross_layer_prefetch) {
+                    MoeSsdPredictConfig config;
+                    config.hidden_size =
+                        graph_params::get_i32(next_it->params, 0, 0);
+                    config.num_experts = num_experts;
+                    config.top_k = top_k;
+                    config.router_score_func =
+                        graph_params::get_i32(next_it->params, 5, 0);
+                    config.n_group =
+                        graph_params::get_i32(next_it->params, 8, 1);
+                    config.topk_group =
+                        graph_params::get_i32(next_it->params, 9, 1);
+                    schedule_moe_cross_layer_prefetch(
+                        *inputs[0], next_router, next_bias,
+                        static_cast<const MoeSsdTensorSource*>(
+                            next_gate.moe_ssd_source),
+                        static_cast<const MoeSsdTensorSource*>(
+                            next_down.moe_ssd_source),
+                        config);
+                }
             }
         }
 
@@ -505,6 +566,32 @@ void execute_graph(ExecContext& ctx) {
         const uint64_t trace_start = mollm_trace::now_ns();
         if (!inline_zero_copy_view)
             ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+        if (ctx.backend->dispatch_failed()) {
+            std::fprintf(
+                stderr, "execute: backend rejected node %u (%s)\n",
+                node.id, op_type_name(node.op_type));
+            ctx.execution_failed = true;
+            return;
+        }
+        if (ctx.emulate_bf16_activations) {
+            bool round_output =
+                node.op_type == OpType::RMS_NORM ||
+                node.op_type == OpType::MOE ||
+                node.op_type == OpType::HC_POST ||
+                node.op_type == OpType::HC_HEAD ||
+                node.op_type == OpType::DSV4_SPARSE_ATTN ||
+                node.op_type == OpType::DSV4_GROUPED_LINEAR;
+            if (node.op_type == OpType::MATMUL && inputs.size() >= 2 &&
+                inputs[1]) {
+                round_output =
+                    inputs[1]->prec == Precision::FP8_E4M3 ||
+                    inputs[1]->prec == Precision::MXFP4;
+            }
+            if (round_output)
+                mollm_round_to_bf16(
+                    out.ptr<float>(),
+                    static_cast<size_t>(out.nelements()));
+        }
         if (trace_start != 0) {
             const std::string args =
                 "{\"graph\":\"" + std::string(ctx.trace_label ? ctx.trace_label : "graph") +
@@ -578,6 +665,7 @@ void execute_graph(ExecContext& ctx) {
                                  "execute_graph: owner mismatch in release_queue for node %u (%p owner=%u pool=%u)\n",
                                  rel_id, t.data, t.owner_id, pool->id());
                     assert(false && "execute_graph release_queue owner mismatch");
+                    ctx.execution_failed = true;
                     return;
                 }
                 ctx.backend->free_output(t, pool);

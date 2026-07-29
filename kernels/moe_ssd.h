@@ -67,6 +67,16 @@ bool schedule_moe_cross_layer_prefetch(
     const MoeSsdTensorSource* next_down,
     const MoeSsdPredictConfig& config);
 
+// DeepSeek-V4's first layers route by an exact token-id lookup. Schedule the
+// next layer's known route without running an approximate gate predictor.
+bool schedule_moe_hash_cross_layer_prefetch(
+    const Tensor& token_ids,
+    const Tensor& token_to_experts,
+    const MoeSsdTensorSource* next_gate_up,
+    const MoeSsdTensorSource* next_down,
+    int num_experts,
+    int top_k);
+
 class MoeSsdCache {
 public:
     struct LayerStats {
@@ -135,6 +145,16 @@ public:
     bool request_many(const MoeSsdTensorSource* gate_up,
                       const MoeSsdTensorSource* down,
                       const std::vector<int>& experts);
+
+    // Keep as many of the previous token's highest-confidence routes as this
+    // layer's fair share of the global pool can hold. Entries remain evictable
+    // when capacity is genuinely exhausted, but ordinary streaming misses
+    // recycle unprotected/finished-layer entries first. A 1 GiB V4 cache
+    // protects roughly top-1 per layer, while larger caches can retain the
+    // complete route without hard-partitioning the shared pool.
+    bool retain_for_next_forward(const MoeSsdTensorSource* gate_up,
+                                 const MoeSsdTensorSource* down,
+                                 const std::vector<int>& experts);
 
     // Speculative reads are only serviced after real router requests.
     bool prefetch_many(const MoeSsdTensorSource* gate_up,
@@ -309,6 +329,7 @@ private:
     // while one MoE layer only needs to inspect its own small route window.
     std::unordered_map<int, std::vector<Entry*>> layer_entries_;
     std::unordered_map<int, size_t> layer_resident_bytes_;
+    std::unordered_map<int, std::vector<int>> retained_experts_;
     std::unordered_map<int, PredictionRecord> pending_predictions_;
     std::unordered_map<int, LayerCounters> layer_stats_;
     std::unordered_map<uint64_t, uint64_t> last_evicted_epoch_;

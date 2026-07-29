@@ -52,6 +52,11 @@ void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
         kernel_matmul_int8_gemv_batch(inputs, weights, outputs, thread_pool)) {
         return;
     }
+    if (thread_pool && output.shape[1] == 1 &&
+        kernel_matmul_mxfp4_gemv_batch(
+            inputs, weights, outputs, thread_pool)) {
+        return;
+    }
     for (size_t i = 0; i < batch; ++i)
         kernel_matmul_fp32(inputs[i], weights[i], outputs[i], thread_pool);
 }
@@ -69,7 +74,15 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     case Precision::INT8:
         matmul_dispatch_int8(A, B, C, thread_pool, act, act_n_begin, act_n_len,
-                             timer);
+                             timer, false);
+        return;
+    case Precision::MXFP4:
+        matmul_dispatch_mxfp4(A, B, C, thread_pool, act, act_n_begin,
+                              act_n_len, timer);
+        return;
+    case Precision::FP8_E4M3:
+        matmul_dispatch_fp8_e4m3(A, B, C, thread_pool, act, act_n_begin,
+                                 act_n_len, timer);
         return;
     default:
         matmul_dispatch_dense(A, B, C, thread_pool, act, act_n_begin, act_n_len,

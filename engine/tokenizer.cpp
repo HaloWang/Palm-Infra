@@ -132,17 +132,20 @@ bool Tokenizer::load_impl(const std::string& path) {
     }
 
     // Auto-detect bos/eos from added_tokens.
-    // Supports both Llama-3 (<|begin_of_text|>/<|end_of_text|>) and
-    // Qwen3.5 (<|im_start|>/<|im_end|>) conventions.
+    // Supports Llama-3, Qwen3.5, and DeepSeek-V4 conventions.
     if (added_tokens_.count("<|begin_of_text|>"))
         bos_id_ = added_tokens_["<|begin_of_text|>"];
     else if (added_tokens_.count("<|im_start|>"))
         bos_id_ = added_tokens_["<|im_start|>"];
+    else if (added_tokens_.count("<｜begin▁of▁sentence｜>"))
+        bos_id_ = added_tokens_["<｜begin▁of▁sentence｜>"];
 
     if (added_tokens_.count("<|end_of_text|>"))
         eos_id_ = added_tokens_["<|end_of_text|>"];
     else if (added_tokens_.count("<|im_end|>"))
         eos_id_ = added_tokens_["<|im_end|>"];
+    else if (added_tokens_.count("<｜end▁of▁sentence｜>"))
+        eos_id_ = added_tokens_["<｜end▁of▁sentence｜>"];
 
     return true;
 }
@@ -638,7 +641,8 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
         if (id < 0 || id >= (int)id_to_piece_.size()) continue;
         const auto& piece = id_to_piece_[id];
         if (!piece.empty() && piece[0] == '<' && piece.back() == '>' &&
-            piece.find('|') != std::string::npos)
+            (piece.find('|') != std::string::npos ||
+             piece.find("｜") != std::string::npos))
             continue;
         out += unicode_to_bytes(piece);
     }
@@ -686,12 +690,36 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
         return encode(prompt);
     }
     // Detect chat format from available special tokens.
+    // DeepSeek-V4:
+    //   <｜User｜>{content}<｜Assistant｜></think>
     // ChatML (Qwen3.5): <|im_start|>{role}\n{content}<|im_end|>\n
     // Llama-3 (Youtu-LLM-2B): <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
+    bool use_deepseek_v4 = (added_tokens_.count("<｜User｜>") > 0 &&
+                            added_tokens_.count("<｜Assistant｜>") > 0);
     bool use_chatml = (added_tokens_.count("<|im_start|>") > 0);
 
     std::string prompt;
-    if (use_chatml) {
+    if (use_deepseek_v4) {
+        prompt = "<｜begin▁of▁sentence｜>";
+        for (const auto& msg : messages) {
+            if (msg.role == "user" || msg.role == "developer") {
+                prompt += "<｜User｜>" + msg.content;
+            } else if (msg.role == "assistant") {
+                // Assistant history must carry the same response prefix that
+                // was used when that turn was generated. Omitting it changes
+                // the token stream on the next turn and invalidates prefix
+                // cache reuse.
+                prompt += "<｜Assistant｜></think>" + msg.content +
+                          "<｜end▁of▁sentence｜>";
+            } else {
+                // The official V4 encoder emits system content without a
+                // role marker.
+                prompt += msg.content;
+            }
+        }
+        if (!messages.empty() && messages.back().role != "assistant")
+            prompt += "<｜Assistant｜></think>";
+    } else if (use_chatml) {
         // ChatML format (no BOS token for Qwen3.5).
         // Qwen3.5 template: appends \n<think>\n\n</think>\n\n after assistant header
         // when enable_thinking is true (default).

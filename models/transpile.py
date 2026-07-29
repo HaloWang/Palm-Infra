@@ -20,7 +20,7 @@ import tempfile
 from dataclasses import dataclass, field
 from enum import IntEnum
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import BinaryIO, Callable, Optional, Sequence
 
 import numpy as np
 
@@ -32,6 +32,7 @@ GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
 GRAPH_VERSION = 3  # v3: added per-node dynamic[4] (DynamicKind)
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
+WEIGHT_FLAG_FP8_BLOCK128 = 1 << 3
 _CPP_QUANT_HELPER: str | None | bool = None
 _CPP_QUANT_HELPER_ANNOUNCED = False
 _CPP_QUANT_HELPER_MISSING_ANNOUNCED = False
@@ -73,6 +74,13 @@ class OpType(IntEnum):
     GATED_DELTANET_PREFILL = 111
     GATED_DELTANET_CONV_DECODE = 112
     MOE            = 120
+    HC_PRE         = 130
+    HC_POST        = 131
+    HC_HEAD        = 132
+    DSV4_COMPRESSOR = 160
+    DSV4_INDEXER = 161
+    DSV4_SPARSE_ATTN = 162
+    DSV4_GROUPED_LINEAR = 163
     SHORTCONV      = 140
     RWKV7          = 150
     RWKV_TOKEN_SHIFT = 151
@@ -85,6 +93,9 @@ class Precision(IntEnum):
     FP16 = 1
     INT8 = 2
     INT4 = 3
+    FP8_E4M3 = 4
+    MXFP4 = 5
+    INT32 = 6
 
 
 # ---------------------------------------------------------------------------
@@ -273,7 +284,7 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.SHORTCONV,
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
               OpType.RWKV_L2_NORM, OpType.RWKV_POST,
-              OpType.MOE):
+              OpType.MOE, OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
     if op == OpType.RMS_NORM_ROPE:
@@ -282,7 +293,9 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op in (OpType.ADD, OpType.MUL, OpType.SIGMOID_MUL):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op in (OpType.MATMUL, OpType.MATMUL_BATCH, OpType.GEMV_SPARSE_A):
+    if op in (OpType.MATMUL, OpType.MATMUL_BATCH, OpType.GEMV_SPARSE_A,
+              OpType.DSV4_INDEXER, OpType.DSV4_SPARSE_ATTN,
+              OpType.DSV4_GROUPED_LINEAR):
         a = inp(0).dim_expr if n_in >= 1 else _CONST4
         return (_CONST, a[1], _CONST, _CONST)
 
@@ -755,6 +768,21 @@ class GraphBuilder:
             offset += sz
         return results
 
+    def slice_range(self, x: int, offset: int, size: int, dim: int) -> int:
+        """Create one slice without materializing unused sibling slices."""
+        sx = self._nodes[x].out_shape
+        if dim < 0 or dim >= len(sx):
+            raise ValueError(f"slice dimension {dim} is out of range")
+        if offset < 0 or size < 0 or offset + size > sx[dim]:
+            raise ValueError(
+                f"slice [{offset}, {offset + size}) exceeds dimension "
+                f"{dim} of size {sx[dim]}")
+        out = list(sx)
+        out[dim] = size
+        return self._add(OpType.SLICE, [x], tuple(out),
+                         prec=self._nodes[x].out_prec,
+                         i32=[dim, offset, size])
+
     def tile(self, x: int, repeats: tuple) -> int:
         sx = self._nodes[x].out_shape
         r = list(repeats) + [1] * (4 - len(repeats))
@@ -929,16 +957,20 @@ class GraphBuilder:
     def moe(self, hidden: int, router: int,
             experts_gate_up: int, experts_down: int,
             shared_gate: int, shared_up: int, shared_down: int,
-            shared_expert_gate: int,
+            shared_expert_gate: int | None,
             hidden_size: int, num_experts: int, top_k: int,
             intermediate_size: int, shared_intermediate_size: int,
             router_bias: int | None = None,
             router_score_func: int = 0,
             norm_topk_prob: bool = True,
             has_shared_expert: bool = True,
+            shared_expert_has_gate: bool = True,
             n_group: int = 1,
             topk_group: int = 1,
-            routed_scaling_factor: float = 1.0) -> int:
+            routed_scaling_factor: float = 1.0,
+            swiglu_limit: float = 0.0,
+            hash_token_ids: int | None = None,
+            hash_table: int | None = None) -> int:
         """Fused Qwen-style sparse MLP.
 
         The expert tensors keep HF row-major layout:
@@ -946,10 +978,28 @@ class GraphBuilder:
           experts_down    [num_experts, hidden, intermediate]
         """
         sx = self._nodes[hidden].out_shape
-        inputs = [hidden, router, experts_gate_up, experts_down,
-                  shared_gate, shared_up, shared_down, shared_expert_gate]
+        inputs = [hidden, router, experts_gate_up, experts_down]
+        if has_shared_expert:
+            inputs.extend([shared_gate, shared_up, shared_down])
+            if shared_expert_has_gate:
+                if shared_expert_gate is None:
+                    raise ValueError(
+                        "gated shared expert requires a gate weight")
+                inputs.append(shared_expert_gate)
+        router_bias_input = -1
         if router_bias is not None:
+            router_bias_input = len(inputs)
             inputs.append(router_bias)
+        token_ids_input = -1
+        hash_table_input = -1
+        if hash_token_ids is not None or hash_table is not None:
+            if hash_token_ids is None or hash_table is None:
+                raise ValueError(
+                    "hash routing requires token ids and lookup table")
+            token_ids_input = len(inputs)
+            inputs.append(hash_token_ids)
+            hash_table_input = len(inputs)
+            inputs.append(hash_table)
         return self._add(OpType.MOE,
                          inputs,
                          sx,
@@ -959,8 +1009,127 @@ class GraphBuilder:
                               router_score_func,
                               1 if norm_topk_prob else 0,
                               1 if has_shared_expert else 0,
-                              n_group, topk_group],
-                         f32=[float(routed_scaling_factor)])
+                              n_group, topk_group,
+                              1 if shared_expert_has_gate else 0,
+                              router_bias_input, token_ids_input,
+                              hash_table_input],
+                         f32=[float(routed_scaling_factor),
+                              float(swiglu_limit)])
+
+    def hc_pre(self, x: int, fn: int, scale: int, base: int,
+               hidden_size: int, hc_mult: int = 4,
+               sinkhorn_iters: int = 20, norm_eps: float = 1e-6,
+               sinkhorn_eps: float = 1e-6) -> int:
+        sx = self._nodes[x].out_shape
+        packed_size = hidden_size + hc_mult + hc_mult * hc_mult
+        return self._add(
+            OpType.HC_PRE, [x, fn, scale, base],
+            (packed_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult, sinkhorn_iters],
+            f32=[norm_eps, sinkhorn_eps])
+
+    def hc_post(self, branch: int, residual: int, packed: int,
+                hidden_size: int, hc_mult: int = 4) -> int:
+        sr = self._nodes[residual].out_shape
+        return self._add(
+            OpType.HC_POST, [branch, residual, packed], sr,
+            prec=Precision.FP32, i32=[hidden_size, hc_mult])
+
+    def hc_head(self, x: int, fn: int, scale: int, base: int,
+                hidden_size: int, hc_mult: int = 4,
+                norm_eps: float = 1e-6, hc_eps: float = 1e-6) -> int:
+        sx = self._nodes[x].out_shape
+        return self._add(
+            OpType.HC_HEAD, [x, fn, scale, base],
+            (hidden_size, sx[1]), prec=Precision.FP32,
+            i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+
+    def dsv4_compressor(
+            self, hidden: int, wkv: int, wgate: int, ape: int,
+            norm: int, kv_state: int, score_state: int, cache: int,
+            position: int, n_tokens: int, hidden_size: int, head_dim: int,
+            ratio: int,
+            overlap: bool, rotate: bool, rope_dim: int,
+            original_context: int, norm_eps: float, rope_theta: float,
+            rope_factor: float, beta_fast: float, beta_slow: float) -> int:
+        """Update one DeepSeek-V4 learned-compression cache.
+
+        The scalar output is only a dependency token. Persistent state and
+        cache tensors are mutated in place.
+        """
+        return self._add(
+            OpType.DSV4_COMPRESSOR,
+            [hidden, wkv, wgate, ape, norm, kv_state, score_state,
+             cache, position, n_tokens],
+            (1,), prec=Precision.FP32,
+            i32=[hidden_size, head_dim, ratio,
+                 1 if overlap else 0, 1 if rotate else 0,
+                 rope_dim, original_context],
+            f32=[norm_eps, rope_theta, rope_factor, beta_fast, beta_slow])
+
+    def dsv4_indexer(
+            self, hidden: int, q_lora: int, wq_b: int,
+            weights_projection: int, compressor_wkv: int,
+            compressor_wgate: int, compressor_ape: int,
+            compressor_norm: int, kv_state: int, score_state: int,
+            cache: int, position: int, n_tokens: int, hidden_size: int,
+            q_lora_rank: int, num_heads: int, head_dim: int, top_k: int,
+            ratio: int,
+            overlap: bool, rotate: bool, rope_dim: int,
+            original_context: int, norm_eps: float, rope_theta: float,
+            rope_factor: float, beta_fast: float, beta_slow: float) -> int:
+        sequence = self._nodes[hidden].out_shape[1]
+        return self._add(
+            OpType.DSV4_INDEXER,
+            [hidden, q_lora, wq_b, weights_projection,
+             compressor_wkv, compressor_wgate, compressor_ape,
+             compressor_norm, kv_state, score_state, cache, position,
+             n_tokens],
+            (top_k, sequence), prec=Precision.INT32,
+            i32=[hidden_size, q_lora_rank, num_heads, head_dim, top_k,
+                 ratio, 1 if overlap else 0, 1 if rotate else 0,
+                 rope_dim, original_context],
+            f32=[norm_eps, rope_theta, rope_factor, beta_fast, beta_slow])
+
+    def dsv4_sparse_attention(
+            self, query: int, current_kv: int, sink: int, window_cache: int,
+            position: int, n_tokens: int, num_heads: int, head_dim: int,
+            window_size: int, compress_ratio: int, compressed_top_k: int,
+            rope_dim: int,
+            original_context: int, softmax_scale: float,
+            query_norm_eps: float, rope_theta: float, rope_factor: float,
+            beta_fast: float, beta_slow: float,
+            compressed_cache: int | None = None,
+            compressed_indices: int | None = None,
+            dependencies: Sequence[int] = ()) -> int:
+        inputs = [query, current_kv, sink, window_cache, position, n_tokens]
+        compressed_cache_input = -1
+        compressed_indices_input = -1
+        if compressed_cache is not None:
+            compressed_cache_input = len(inputs)
+            inputs.append(compressed_cache)
+        if compressed_indices is not None:
+            compressed_indices_input = len(inputs)
+            inputs.append(compressed_indices)
+        inputs.extend(dependencies)
+        return self._add(
+            OpType.DSV4_SPARSE_ATTN, inputs,
+            self._nodes[query].out_shape, prec=Precision.FP32,
+            i32=[num_heads, head_dim, window_size, compress_ratio,
+                 compressed_top_k, rope_dim, original_context,
+                 compressed_cache_input, compressed_indices_input],
+            f32=[softmax_scale, query_norm_eps, rope_theta, rope_factor,
+                 beta_fast, beta_slow])
+
+    def dsv4_grouped_linear(self, x: int, weight: int,
+                            groups: int) -> int:
+        sx = self._nodes[x].out_shape
+        sw = self._nodes[weight].out_shape
+        if groups <= 0 or sw[0] % groups != 0:
+            raise ValueError("invalid DeepSeek-V4 grouped projection shape")
+        return self._add(
+            OpType.DSV4_GROUPED_LINEAR, [x, weight],
+            (sw[0], sx[1]), prec=Precision.FP32, i32=[groups])
 
     # ---- save ----
 
@@ -1217,25 +1386,146 @@ def write_quantized_weight_file_cpp(path: str, data: np.ndarray,
     return True
 
 
+def _weight_header_bytes(*, flags: int, ndim: int, precision: Precision,
+                         shape: Sequence[int], data_size: int,
+                         scales_size: int, group_size: int,
+                         num_groups: int) -> bytes:
+    padded_shape = list(shape) + [1] * (4 - len(shape))
+    data_offset = 88
+    scales_offset = data_offset + data_size if scales_size else 0
+    header = struct.pack('<II', WEIGHT_MAGIC, flags)
+    header += struct.pack('<II', ndim, int(precision))
+    header += struct.pack('<qqqq', *padded_shape)
+    header += struct.pack('<QQ', data_offset, data_size)
+    header += struct.pack('<QQ', scales_offset, scales_size)
+    header += struct.pack('<II', group_size, num_groups)
+    assert len(header) == 88
+    return header
+
+
+@dataclass(frozen=True)
+class WeightByteRange:
+    """A byte range copied into a streamed XMAP weight.
+
+    ``transform`` is intended for same-size chunk conversions such as BF16 to
+    FP16. Native FP8 and MXFP4 tensors leave it unset and are copied verbatim.
+    """
+    path: str
+    offset: int
+    size: int
+    transform: Optional[Callable[[bytes], bytes]] = None
+    output_size: Optional[int] = None
+
+    @property
+    def written_size(self) -> int:
+        return self.size if self.output_size is None else self.output_size
+
+
+@dataclass
+class StreamedWeight:
+    """An XMAP weight assembled directly from source-file byte ranges."""
+    precision: Precision
+    logical_shape: tuple[int, ...]
+    data_ranges: Sequence[WeightByteRange]
+    scale_ranges: Sequence[WeightByteRange] = ()
+    group_size: int = 0
+    num_groups: int = 0
+    flags: int = 0
+
+    @property
+    def data_size(self) -> int:
+        return sum(segment.written_size for segment in self.data_ranges)
+
+    @property
+    def scales_size(self) -> int:
+        return sum(segment.written_size for segment in self.scale_ranges)
+
+    @property
+    def size(self) -> int:
+        return 88 + self.data_size + self.scales_size
+
+    def header(self) -> dict:
+        raw = _weight_header_bytes(
+            flags=self.flags, ndim=len(self.logical_shape),
+            precision=self.precision, shape=self.logical_shape,
+            data_size=self.data_size, scales_size=self.scales_size,
+            group_size=self.group_size, num_groups=self.num_groups)
+        values = WEIGHT_HEADER_STRUCT.unpack(raw)
+        return {
+            "flags": values[1], "ndim": values[2],
+            "precision": values[3], "shape": list(values[4:8]),
+            "data_offset": values[8], "data_size": values[9],
+            "scales_offset": values[10], "scales_size": values[11],
+            "group_size": values[12], "num_groups": values[13],
+        }
+
+    @staticmethod
+    def _copy_ranges(output: BinaryIO,
+                     ranges: Sequence[WeightByteRange],
+                     chunk_size: int = 8 * 1024 * 1024):
+        for segment in ranges:
+            remaining = segment.size
+            written = 0
+            with open(segment.path, "rb") as source:
+                source.seek(segment.offset)
+                while remaining:
+                    chunk = source.read(min(chunk_size, remaining))
+                    if not chunk:
+                        raise EOFError(
+                            f"short source range in {segment.path} at "
+                            f"{segment.offset + segment.size - remaining}")
+                    remaining -= len(chunk)
+                    if segment.transform is not None:
+                        chunk = segment.transform(chunk)
+                    output.write(chunk)
+                    written += len(chunk)
+            if written != segment.written_size:
+                raise ValueError(
+                    f"transformed range size mismatch for {segment.path}: "
+                    f"{written} != {segment.written_size}")
+
+    def write_to(self, output: BinaryIO):
+        output.write(_weight_header_bytes(
+            flags=self.flags, ndim=len(self.logical_shape),
+            precision=self.precision, shape=self.logical_shape,
+            data_size=self.data_size, scales_size=self.scales_size,
+            group_size=self.group_size, num_groups=self.num_groups))
+        self._copy_ranges(output, self.data_ranges)
+        self._copy_ranges(output, self.scale_ranges)
+
+
 def _write_weight_file(path: str, data: np.ndarray,
                        scales: np.ndarray | None = None,
                        group_size: int = 0,
                        num_groups: int = 0,
                        precision: Precision | None = None,
                        logical_shape: tuple[int, ...] | None = None,
-                       flags: int = 0):
-    """Write a .weights file with self-contained header."""
+                       flags: int = 0,
+                       scale_dtype=np.float32):
+    """Write a .weights file with a self-contained XMAP header.
+
+    Quantized INT8/INT4 formats use the default float32 scales. Native
+    FP8_E4M3 and MXFP4 checkpoints pass ``scale_dtype=np.uint8`` to preserve
+    their encoded E8M0 scale bytes without a decode/re-encode round trip.
+    """
     precision = _numpy_to_precision(data.dtype) if precision is None else precision
+    data = np.ascontiguousarray(data)
     logical_shape = tuple(data.shape) if logical_shape is None else tuple(logical_shape)
     ndim = len(logical_shape)
     if ndim <= 0 or ndim > 4:
         raise ValueError(f"weights require 1-4 logical dims, got {logical_shape}")
-    shape = list(logical_shape) + [1] * (4 - ndim)
     scales_bytes = b""
     scales_offset = 0
     scales_size = 0
     if scales is not None:
-        scales = np.asarray(scales, dtype=np.float32).reshape(-1)
+        scales = np.asarray(scales, dtype=scale_dtype).reshape(-1)
+        if precision in (Precision.FP8_E4M3, Precision.MXFP4):
+            if scales.dtype != np.uint8:
+                raise ValueError(
+                    f"{precision.name} requires raw uint8 E8M0 scales")
+        elif scales.dtype != np.float32:
+            raise ValueError(
+                f"{precision.name} requires float32 quantization scales")
         scales_bytes = scales.tobytes()
         scales_offset = 88 + data.nbytes
         scales_size = len(scales_bytes)
@@ -1244,15 +1534,11 @@ def _write_weight_file(path: str, data: np.ndarray,
         if num_groups != scales.size:
             raise ValueError(f"num_groups={num_groups} does not match scales={scales.size}")
 
-    header = struct.pack('<II', WEIGHT_MAGIC, flags)  # magic, flags
-    header += struct.pack('<II', ndim, int(precision))
-    header += struct.pack('<qqqq', *shape)
-    data_offset = 88  # sizeof(Header)
     data_size = data.nbytes
-    header += struct.pack('<QQ', data_offset, data_size)  # data offset, size
-    header += struct.pack('<QQ', scales_offset, scales_size)
-    header += struct.pack('<II', group_size, num_groups)
-    assert len(header) == 88
+    header = _weight_header_bytes(
+        flags=flags, ndim=ndim, precision=precision, shape=logical_shape,
+        data_size=data_size, scales_size=scales_size,
+        group_size=group_size, num_groups=num_groups)
 
     with open(path, 'wb') as f:
         f.write(header)
@@ -1328,7 +1614,8 @@ def _read_weight_header(path: str) -> dict:
 
 def _augment_moe_expert_storage(meta: dict,
                                 weight_files: dict,
-                                weight_paths: dict):
+                                weight_paths: dict,
+                                weight_headers: dict | None = None):
     """Resolve MoE expert aggregate tensors into package byte ranges.
 
     `qwen35_moe.py` emits logical per-layer split metadata. At package time we
@@ -1360,10 +1647,16 @@ def _augment_moe_expert_storage(meta: dict,
             ref = spec.get("weight")
             if ref not in weight_files and ref and not ref.startswith("./"):
                 ref = f"./{ref}"
-            if not ref or ref not in weight_files or ref not in weight_paths:
+            if (not ref or ref not in weight_files or
+                    (ref not in weight_paths and
+                     (weight_headers is None or ref not in weight_headers))):
                 raise KeyError(f"MoE expert metadata references unknown weight: {spec.get('weight')}")
 
-            header = _read_weight_header(weight_paths[ref])
+            header = (
+                weight_headers[ref]
+                if weight_headers is not None and ref in weight_headers
+                else _read_weight_header(weight_paths[ref])
+            )
             weight_offset, weight_size = weight_files[ref]
             rows_per_expert = int(spec["rows_per_expert"])
             expected_rows = layer_num_experts * rows_per_expert
@@ -1409,7 +1702,8 @@ def save_package(output_path: str,
                  tokenizer_path: str = "",
                  jinja_path: str = "",
                  g_vision: 'GraphBuilder | None' = None,
-                 remove_weight_files: bool = False):
+                 remove_weight_files: bool = False,
+                 streamed_weights: dict[str, StreamedWeight] | None = None):
     """Pack model graphs + weights + tokenizer + jinja into one .mollm file.
 
     Graphs are saved via the standard save() format (to temp files), then
@@ -1443,8 +1737,10 @@ def save_package(output_path: str,
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
         weight_paths = {}  # relative_name -> filesystem path used for packing
-        weight_entries = []  # (path, size), in package order
+        weight_headers = {}  # headers for streamed entries
+        weight_entries = []  # (path-or-StreamedWeight, size), package order
         weights_len = 0
+        streamed_weights = streamed_weights or {}
 
         graphs = [g_prefill, g_decode]
         if g_vision is not None:
@@ -1458,7 +1754,16 @@ def save_package(output_path: str,
                     continue
                 if ref in weight_files:
                     continue
-                # Find the weight file
+                if ref in streamed_weights:
+                    source = streamed_weights[ref]
+                    size = source.size
+                    offset = weights_len
+                    weights_len += size
+                    weight_entries.append((source, size))
+                    weight_files[ref] = [offset, size]
+                    weight_headers[ref] = source.header()
+                    continue
+                # Find the weight file.
                 wpath = os.path.join(weights_dir, ref) if not os.path.isabs(ref) else ref
                 if not os.path.exists(wpath):
                     wpath = os.path.join(tmp_dir, ref)
@@ -1474,7 +1779,8 @@ def save_package(output_path: str,
         # Step 4: build metadata
         meta = dict(metadata)
         meta["weights"] = weight_files
-        _augment_moe_expert_storage(meta, weight_files, weight_paths)
+        _augment_moe_expert_storage(
+            meta, weight_files, weight_paths, weight_headers)
         meta_json = json.dumps(meta, ensure_ascii=False).encode('utf-8')
 
         # Step 5: read tokenizer + jinja bytes
@@ -1515,7 +1821,11 @@ def save_package(output_path: str,
             f.write(vi_bytes)
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
-            for wpath, _ in weight_entries:
+            for source, _ in weight_entries:
+                if isinstance(source, StreamedWeight):
+                    source.write_to(f)
+                    continue
+                wpath = source
                 with open(wpath, 'rb') as wf:
                     while True:
                         n = wf.readinto(buf)

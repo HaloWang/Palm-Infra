@@ -82,3 +82,55 @@ bool schedule_moe_cross_layer_prefetch(
             }
         });
 }
+
+bool schedule_moe_hash_cross_layer_prefetch(
+    const Tensor& token_ids,
+    const Tensor& token_to_experts,
+    const MoeSsdTensorSource* next_gate_up,
+    const MoeSsdTensorSource* next_down,
+    int num_experts,
+    int top_k) {
+    if (!next_gate_up || !next_down || !next_gate_up->cache ||
+        next_gate_up->cache != next_down->cache ||
+        token_ids.prec != Precision::INT32 || !token_ids.data ||
+        token_ids.nelements() != 1 ||
+        token_to_experts.prec != Precision::INT32 ||
+        !token_to_experts.data || token_to_experts.shape[0] != top_k ||
+        num_experts <= 0 || top_k <= 0 || top_k > num_experts) {
+        return false;
+    }
+    const int vocab_size =
+        static_cast<int>(token_to_experts.shape[1]);
+    const int token_id = token_ids.ptr<int32_t>()[0];
+    if (vocab_size <= 0 || token_id < 0 || token_id >= vocab_size)
+        return false;
+
+    MoeSsdCache* cache = next_gate_up->cache;
+    if (!cache->can_prefetch_pairs(
+            next_gate_up, next_down, static_cast<size_t>(top_k))) {
+        return false;
+    }
+    const int32_t* table = token_to_experts.ptr<int32_t>();
+    return cache->submit_cross_layer_task(
+        [token_id, table, vocab_size, next_gate_up, next_down,
+         num_experts, top_k, cache] {
+            (void)vocab_size;
+            std::vector<int> experts;
+            experts.reserve(static_cast<size_t>(top_k));
+            for (int rank = 0; rank < top_k; ++rank) {
+                const int expert =
+                    table[static_cast<size_t>(token_id) * top_k + rank];
+                if (expert < 0 || expert >= num_experts)
+                    return;
+                experts.push_back(expert);
+            }
+            mollm_trace::ScopedEvent trace_event(
+                "ssd.predict", "next_layer_hash_route",
+                "{\"layer\":" +
+                    std::to_string(next_gate_up->spec.layer) + "}");
+            cache->prefetch_many(
+                next_gate_up, next_down, experts,
+                std::vector<float>(static_cast<size_t>(top_k), 1.0f),
+                experts.size());
+        });
+}

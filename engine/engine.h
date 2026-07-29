@@ -294,7 +294,11 @@ private:
     std::unordered_map<std::string, std::pair<uint64_t, uint64_t>> package_weight_map_;
     // Aggregate expert ranges (relative to package_weights_base_) bypassed by
     // SSD offload. Dense-only warmup must leave these untouched.
-    std::vector<std::pair<uint64_t, uint64_t>> moe_ssd_expert_ranges_;
+    // Package-relative weight ranges intentionally excluded from dense mmap
+    // warmup/mlock: paged experts and source tensors replaced by CPU
+    // sidecars.
+    std::vector<std::pair<uint64_t, uint64_t>>
+        mmap_weight_exclusion_ranges_;
     std::vector<std::pair<void*, size_t>> locked_dense_ranges_;
     // Optional demand-paged storage for routed MoE experts.
     std::unique_ptr<MoeSsdCache> moe_ssd_cache_;
@@ -344,6 +348,9 @@ private:
         bool is_linear_attn = false;
     };
     std::vector<CachePair> caches_;
+    // Plain model-specific persistent tensors keyed by their serialized
+    // `aux_state<N>` input id.
+    std::unordered_map<int, Tensor*> auxiliary_states_;
 
     /// Embed tokens.
     Tensor embed(const std::vector<int>& token_ids, int pad_to = 0);
@@ -366,6 +373,7 @@ private:
     Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
                      const Tensor& hidden, const Tensor& mask,
                      const Tensor& cos, const Tensor& sin,
+                     const Tensor* token_ids = nullptr,
                      bool defer_metal_end = false);
 
     /// Transactional public-load implementation and shared teardown path.

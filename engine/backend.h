@@ -47,6 +47,12 @@ public:
                           const std::vector<const Tensor*>& inputs,
                           Tensor* output, ThreadPool* thread_pool) = 0;
 
+    /// Reset/query a recoverable dispatch failure. Most kernels are legacy
+    /// void functions, so this side channel lets checked operators stop graph
+    /// execution without changing every backend dispatch signature at once.
+    virtual void clear_dispatch_error() {}
+    virtual bool dispatch_failed() const { return false; }
+
     // -----------------------------------------------------------------------
     // Storage allocation hooks.
     //
@@ -109,4 +115,10 @@ public:
     void dispatch(const GraphNode& node,
                   const std::vector<const Tensor*>& inputs,
                   Tensor* output, ThreadPool* thread_pool) override;
+
+    void clear_dispatch_error() override { dispatch_failed_ = false; }
+    bool dispatch_failed() const override { return dispatch_failed_; }
+
+private:
+    bool dispatch_failed_ = false;
 };

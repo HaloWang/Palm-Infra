@@ -3,6 +3,7 @@
 #include "kernels/moe_ssd.h"
 
 #include <cstdio>
+#include <cmath>
 #include <cstdint>
 #include <fstream>
 #include <limits>
@@ -110,6 +111,60 @@ int main() {
               "BG128 expert tensors omit redundant sidecars");
         check(cache.stats().bytes_read == 2 * block_bytes,
               "BG128 cache reads only embedded-scale data");
+    }
+
+    // Native MXFP4 experts keep one raw E8M0 byte per 32-value block.
+    {
+        const std::string mxfp4_path =
+            "/tmp/mollm_test_moe_ssd_mxfp4.bin";
+        std::vector<uint8_t> bytes(34, 0x22); // E2M1 value 1 in both nibbles
+        bytes[32] = 127; // gate scale = 1
+        bytes[33] = 127; // down scale = 1
+        {
+            std::ofstream out(mxfp4_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(bytes.data()),
+                      static_cast<std::streamsize>(bytes.size()));
+        }
+        auto mx_spec = [](const char* name, uint64_t data_offset,
+                          uint64_t scale_offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 1;
+            out.rows = 1;
+            out.cols = 32;
+            out.precision = Precision::MXFP4;
+            out.group_size = 32;
+            out.groups_per_row = 1;
+            out.data_offset = data_offset;
+            out.data_bytes = 16;
+            out.scales_offset = scale_offset;
+            out.scales_bytes = 1;
+            return out;
+        };
+        MoeSsdCache cache;
+        check(cache.open(mxfp4_path, bytes.size()),
+              "open MXFP4 cache");
+        check(cache.add_source(mx_spec("mx_gate", 0, 32)) &&
+                  cache.add_source(mx_spec("mx_down", 16, 33)),
+              "add MXFP4 sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("mx_gate"),
+                            cache.find_source("mx_down"), 0, gate, down),
+              "load MXFP4 expert");
+        check(gate.prec == Precision::MXFP4 && gate.e8m0_scales &&
+                  gate.e8m0_scales[0] == 127 && gate.group_size == 32,
+              "MXFP4 expert exposes raw E8M0 scale");
+        float activation[32];
+        for (float& value : activation) value = 1.0f;
+        float output = 0.0f;
+        Tensor a = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  32, 1, 1, 1, activation);
+        Tensor c = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                  1, 1, 1, 1, &output);
+        kernel_matmul_fp32(a, gate, c);
+        check(std::abs(output - 32.0f) < 0.25f,
+              "paged MXFP4 expert dispatches through matmul");
     }
 
     {
@@ -225,6 +280,63 @@ int main() {
         check(stats.evictions == 2, "one-entry cache evicts between deferred requests");
     }
 
+    // Hash-routed layers know the next route exactly from the token id. Verify
+    // that the cross-layer helper schedules only that lookup-table route and
+    // that ordinary demand feedback records both ranks as useful.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 2, true),
+              "open exact hash-prefetch cache");
+        check(cache.add_source(spec("hash_gate", 0)) &&
+                  cache.add_source(
+                      spec("hash_down", 6 * sizeof(uint16_t))),
+              "add exact hash-prefetch sources");
+        const MoeSsdTensorSource* gate =
+            cache.find_source("hash_gate");
+        const MoeSsdTensorSource* down =
+            cache.find_source("hash_down");
+        int32_t token_id = 1;
+        const int32_t lookup[] = {
+            0, 2,
+            1, 2,
+        };
+        Tensor tokens = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL,
+            1, 1, 1, 1, &token_id);
+        Tensor table = Tensor::create(
+            Precision::INT32, MemoryType::EXTERNAL,
+            2, 2, 1, 1, const_cast<int32_t*>(lookup));
+        check(schedule_moe_hash_cross_layer_prefetch(
+                  tokens, table, gate, down, 3, 2),
+              "schedule exact hash route");
+        for (int spin = 0;
+             spin < 10000 &&
+             (!cache.contains(gate, down, 1) ||
+              !cache.contains(gate, down, 2));
+             ++spin) {
+            std::this_thread::yield();
+        }
+        check(cache.contains(gate, down, 1) &&
+                  cache.contains(gate, down, 2) &&
+                  !cache.contains(gate, down, 0),
+              "hash prefetch contains only the selected experts");
+        check(cache.request_many(gate, down, {1, 2}),
+              "evaluate exact hash prediction");
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 1, gu, dw) &&
+                  cache.acquire(gate, down, 2, gu, dw),
+              "acquire exact hash-prefetched experts");
+        const auto stats = cache.stats();
+        check(stats.cross_layer_tasks == 1 &&
+                  stats.cross_layer_experts == 2 &&
+                  stats.cross_layer_used == 2,
+              "exact hash prefetch is fully useful");
+        check(stats.cross_layer_rank_hits.size() == 2 &&
+                  stats.cross_layer_rank_hits[0] == 1 &&
+                  stats.cross_layer_rank_hits[1] == 1,
+              "exact hash route reports perfect rank accuracy");
+    }
+
     // A transient pread failure must not poison an expert entry permanently.
     // Restore the backing file and verify that the next acquire removes the
     // failed entry, queues a fresh read, and succeeds.
@@ -324,6 +436,146 @@ int main() {
         check(cache.contains(g1, d1, 0), "global pool admits the next layer");
         check(cache.resident_count(g0, d0, {0, 1, 2}) == 2,
               "global pool evicts one layer-zero LRU entry");
+    }
+
+    // A sequential global scan should preserve stale entries from nearer
+    // future layers. Otherwise an early-layer miss evicts the very next
+    // layer's cached route and a cache smaller than one full forward pass
+    // collapses to zero hits.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 2),
+              "open forward-aware global cache");
+        auto gate0 = spec("forward_gate0", 0);
+        auto down0 = spec("forward_down0", 6 * sizeof(uint16_t));
+        auto gate1 = spec("forward_gate1", 0);
+        auto down1 = spec("forward_down1", 6 * sizeof(uint16_t));
+        auto gate2 = spec("forward_gate2", 0);
+        auto down2 = spec("forward_down2", 6 * sizeof(uint16_t));
+        gate1.layer = down1.layer = 1;
+        gate2.layer = down2.layer = 2;
+        check(cache.add_source(gate0) && cache.add_source(down0) &&
+                  cache.add_source(gate1) && cache.add_source(down1) &&
+                  cache.add_source(gate2) && cache.add_source(down2),
+              "add forward-aware cache sources");
+        check(cache.set_global_capacity_pool(true),
+              "enable forward-aware global pool");
+        const MoeSsdTensorSource* g0 =
+            cache.find_source("forward_gate0");
+        const MoeSsdTensorSource* d0 =
+            cache.find_source("forward_down0");
+        const MoeSsdTensorSource* g1 =
+            cache.find_source("forward_gate1");
+        const MoeSsdTensorSource* d1 =
+            cache.find_source("forward_down1");
+        const MoeSsdTensorSource* g2 =
+            cache.find_source("forward_gate2");
+        const MoeSsdTensorSource* d2 =
+            cache.find_source("forward_down2");
+        Tensor gu, dw;
+        check(cache.acquire(g1, d1, 0, gu, dw) &&
+                  cache.acquire(g2, d2, 0, gu, dw) &&
+                  cache.acquire(g2, d2, 1, gu, dw),
+              "populate next-forward future routes");
+        cache.begin_forward_pass();
+        check(cache.request_many(g0, d0, {0}),
+              "admit an early-layer miss");
+        check(cache.acquire(g0, d0, 0, gu, dw),
+              "acquire the early-layer miss");
+        check(cache.contains(g1, d1, 0),
+              "retain the nearest future-layer route");
+        check(cache.request_many(g1, d1, {0}) &&
+                  cache.acquire(g1, d1, 0, gu, dw),
+              "reuse the retained future-layer route");
+        check(cache.stats().hits == 1,
+              "forward-aware eviction converts the next layer to a hit");
+    }
+
+    // Protect high-confidence routes across forward boundaries. This tiny
+    // pool gives each layer room for only one retained route, so admitting a
+    // changed early-layer route should sacrifice the farthest future layer,
+    // not the immediately following layer.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 2),
+              "open retained-route global cache");
+        auto gate0 = spec("retained_gate0", 0);
+        auto down0 = spec("retained_down0", 6 * sizeof(uint16_t));
+        auto gate1 = spec("retained_gate1", 0);
+        auto down1 = spec("retained_down1", 6 * sizeof(uint16_t));
+        auto gate2 = spec("retained_gate2", 0);
+        auto down2 = spec("retained_down2", 6 * sizeof(uint16_t));
+        gate1.layer = down1.layer = 1;
+        gate2.layer = down2.layer = 2;
+        check(cache.add_source(gate0) && cache.add_source(down0) &&
+                  cache.add_source(gate1) && cache.add_source(down1) &&
+                  cache.add_source(gate2) && cache.add_source(down2),
+              "add retained-route cache sources");
+        check(cache.set_global_capacity_pool(true),
+              "enable retained-route global pool");
+        const MoeSsdTensorSource* g0 =
+            cache.find_source("retained_gate0");
+        const MoeSsdTensorSource* d0 =
+            cache.find_source("retained_down0");
+        const MoeSsdTensorSource* g1 =
+            cache.find_source("retained_gate1");
+        const MoeSsdTensorSource* d1 =
+            cache.find_source("retained_down1");
+        const MoeSsdTensorSource* g2 =
+            cache.find_source("retained_gate2");
+        const MoeSsdTensorSource* d2 =
+            cache.find_source("retained_down2");
+        Tensor gu, dw;
+        check(cache.retain_for_next_forward(g0, d0, {0, 1}) &&
+                  cache.retain_for_next_forward(g1, d1, {0, 1}) &&
+                  cache.retain_for_next_forward(g2, d2, {0, 1}),
+              "record one retained route per layer");
+        check(cache.acquire(g0, d0, 0, gu, dw) &&
+                  cache.acquire(g1, d1, 0, gu, dw) &&
+                  cache.acquire(g2, d2, 0, gu, dw),
+              "populate retained routes");
+        cache.begin_forward_pass();
+        check(cache.retain_for_next_forward(g0, d0, {1, 0}),
+              "replace the early layer retained route");
+        check(cache.request_many(g0, d0, {1}) &&
+                  cache.acquire(g0, d0, 1, gu, dw),
+              "admit the changed retained route");
+        check(cache.contains(g1, d1, 0),
+              "retained policy preserves the nearest future layer");
+        check(cache.request_many(g1, d1, {0}) &&
+                  cache.acquire(g1, d1, 0, gu, dw),
+              "reuse the retained next-layer route");
+        check(cache.stats().hits == 1,
+              "retained route produces a next-forward hit");
+    }
+
+    // Protect all resident members of a route before allocating its misses.
+    // Otherwise the leading miss can evict expert zero before request_many()
+    // reaches the trailing hit.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 16, 2), "open route-protection cache");
+        check(cache.add_source(spec("route_gate", 0)) &&
+                  cache.add_source(
+                      spec("route_down", 6 * sizeof(uint16_t))),
+              "add route-protection sources");
+        check(cache.set_global_capacity_pool(true),
+              "enable route-protection global pool");
+        const MoeSsdTensorSource* gate =
+            cache.find_source("route_gate");
+        const MoeSsdTensorSource* down =
+            cache.find_source("route_down");
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw) &&
+                  cache.acquire(gate, down, 1, gu, dw),
+              "populate route-protection cache");
+        cache.begin_forward_pass();
+        check(cache.request_many(gate, down, {2, 0}),
+              "request leading miss and trailing hit");
+        check(cache.contains(gate, down, 0),
+              "route admission retains its trailing cached hit");
+        check(!cache.contains(gate, down, 1),
+              "route admission evicts an expert outside the route");
     }
 
     // A backend handoff may discard CPU-resident payloads while retaining the

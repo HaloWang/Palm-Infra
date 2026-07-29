@@ -13,15 +13,15 @@ class ThreadPool;
 //   1 router             FP16/FP32 [num_experts, hidden]
 //   2 experts_gate_up    FP16/FP32/INT8/INT4 [num_experts*2*intermediate, hidden]
 //   3 experts_down       FP16/FP32/INT8/INT4 [num_experts*hidden, intermediate]
-//   4 shared_gate        FP16/FP32/INT8/INT4 [shared_intermediate, hidden]
-//   5 shared_up          FP16/FP32/INT8/INT4 [shared_intermediate, hidden]
-//   6 shared_down        FP16/FP32/INT8/INT4 [hidden, shared_intermediate]
-//   7 shared_expert_gate FP16/FP32 [1, hidden]
-//   8 router_bias        optional FP32 [num_experts], used by sigmoid routers
+// Optional inputs after slot 3 are described by the input-index parameters:
+// shared expert tensors occupy slots 4..6, followed by an optional shared
+// expert gate, router bias, token ids, and hash table as selected by the graph.
 //
 // Output:
 //   FP32 [hidden, seq]
-void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
+// Returns false instead of leaving a partial output when routing or SSD I/O
+// fails.
+bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       Tensor& output,
                       ThreadPool* thread_pool,
                       int hidden_size,
@@ -34,7 +34,12 @@ void kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       bool has_shared_expert = true,
                       int n_group = 1,
                       int topk_group = 1,
-                      float routed_scaling_factor = 1.0f);
+                      float routed_scaling_factor = 1.0f,
+                      bool shared_expert_has_gate = true,
+                      int router_bias_input = -1,
+                      int token_ids_input = -1,
+                      int hash_table_input = -1,
+                      float swiglu_limit = 0.0f);
 
 extern "C" int mollm_moe_profile_enabled();
 extern "C" void mollm_reset_moe_profile();

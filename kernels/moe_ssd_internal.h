@@ -58,6 +58,7 @@ struct MoeSsdCache::Entry {
     int pending_reads = 0;
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
     bool speculative = false;
+    bool retained = false;
     uint64_t forward_epoch = 0;
     uint64_t prediction_epoch = 0;
     float prediction_confidence = 0.0f;
