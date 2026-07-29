@@ -4,8 +4,30 @@ This page collects the CPU and Metal benchmark results used by the README.
 
 ## CPU
 
-These results compare mollm with llama.cpp on an Apple M5 Pro using four CPU
-threads. Unless a row says otherwise, the protocol is `pp256 + tg64`,
+### Linux x86_64 AVX2
+
+The x86 provider is runtime-dispatched and can be disabled with
+`MOLLM_X86_DISABLE_AVX2=1` for correctness checks and baseline measurements.
+The table below uses an AMD Ryzen 9 9950X, eight threads, `M=1`, `K=2048`,
+`N=6144`, five warmups, 20 measured iterations, and average throughput.
+
+| Weight format | Scalar | AVX2/FMA/F16C | Speedup |
+|---|---:|---:|---:|
+| FP32 | 5.9 GFLOP/s | **44.9 GFLOP/s** | 7.6x |
+| FP16 | 0.6 GFLOP/s | **408.1 GFLOP/s** | 680.2x |
+| W8G32 | 14.5 GFLOP/s | **270.4 GFLOP/s** | 18.6x |
+| W4G32 | 14.5 GFLOP/s | **226.6 GFLOP/s** | 15.6x |
+| W4G128 | 15.5 GFLOP/s | **304.5 GFLOP/s** | 19.6x |
+
+A real Qwen3.5-0.8B W4G32 greedy run produced identical text with AVX2 and
+the forced scalar fallback. On the same host, the measured prefill/decode
+rates were 117.7/75.6 tok/s with AVX2 and 13.1/9.1 tok/s with scalar code.
+These are development measurements rather than a cross-runtime comparison.
+
+### Apple Silicon
+
+The results below compare mollm with llama.cpp on an Apple M5 Pro using four
+CPU threads. Unless a row says otherwise, the protocol is `pp256 + tg64`,
 `warmup=3`, five independent processes, and the median throughput. `pp` is
 prompt/prefill tokens per second; `tg` is generated/decode tokens per second.
 

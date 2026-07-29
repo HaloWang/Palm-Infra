@@ -30,6 +30,10 @@ endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_arm.cpp)
+elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    set(MOLLM_CPU_PLATFORM_SOURCE
+        kernels/cpu_platform_x86.cpp
+        kernels/matmul_x86_avx2.cpp)
 else()
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
 endif()
@@ -111,6 +115,16 @@ set(PUBLIC_KERNEL_HEADERS
 )
 
 add_library(mollm_lib STATIC ${SOURCES})
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        set_source_files_properties(
+            kernels/matmul_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma;-mf16c")
+    else()
+        message(FATAL_ERROR
+            "The x86 AVX2 provider currently requires GCC or Clang")
+    endif()
+endif()
 add_library(mollm::mollm ALIAS mollm_lib)
 set_target_properties(mollm_lib PROPERTIES EXPORT_NAME mollm)
 target_include_directories(mollm_lib PUBLIC
@@ -194,7 +208,7 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "arm")
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=1)
     target_compile_definitions(mollm_lib PRIVATE __ARM_NEON=1)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
-    message(STATUS "Target: x86_64 (scalar fallback)")
+    message(STATUS "Target: x86_64 (runtime AVX2/FMA/F16C provider)")
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=0)
 else()
     message(STATUS "Target: ${CMAKE_SYSTEM_PROCESSOR} (scalar fallback)")

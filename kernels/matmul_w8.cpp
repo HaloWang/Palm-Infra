@@ -18,6 +18,12 @@ static void matmul_int8_scalar_range(const float* A, const int8_t* B,
     if (groups_per_row <= 0)
         groups_per_row = 1;
 
+    if (mollm::cpu::matmul_int8_range(
+            A, B, scales, C, N, K, group_size, groups_per_row, lda, K_weight,
+            ldc, m_begin, m_end, n_begin, n_end, b_interleaved)) {
+        return;
+    }
+
     for (int m = m_begin; m < m_end; m++) {
         float* c_row = C + m * ldc;
         for (int n = n_begin; n < n_end; n++) {
@@ -1358,7 +1364,10 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 
-    timer.set_shape("int8_scalar", M, N, K, group_size, groups_per_row,
+    timer.set_shape(mollm::cpu::capabilities().x86_avx2 && !b_interleaved
+                        ? "int8_avx2"
+                        : "int8_scalar",
+                    M, N, K, group_size, groups_per_row,
                     b_q8_repack != nullptr, b_interleaved, n_threads);
     if (!use_parallel) {
         matmul_int8_scalar_range(a_ptr, b_int8, scales, group_size,

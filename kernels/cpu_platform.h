@@ -10,6 +10,7 @@
 #include <cstdint>
 
 struct Tensor;
+class ThreadPool;
 
 #ifndef MOLLM_CPU_ARM_NEON
 #if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
@@ -40,6 +41,9 @@ struct Capabilities {
     bool fp16_vector_math = false;
     bool fp16_kv_cache = false;
     bool fp16_interleaved_weights = false;
+    bool x86_avx2 = false;
+    bool x86_fma = false;
+    bool x86_f16c = false;
 };
 
 const Capabilities& capabilities();
@@ -53,7 +57,22 @@ void relax();
 // has a portable decoder.  Returning false leaves the normal matmul dispatch
 // to select its architecture-specific kernel.
 bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
-                        int ldc);
+                        int ldc, ThreadPool* thread_pool);
+
+// Architecture-provider dense kernels. Returning false asks the caller to use
+// the portable scalar implementation. The x86 provider dispatches these to a
+// separately compiled AVX2/FMA/F16C translation unit after runtime probing.
+bool matmul_dense_fp32_range(const float* A, const float* B, float* C, int N,
+                             int K, int lda, int K_weight, int ldc,
+                             int m_begin, int m_end);
+bool matmul_dense_fp16_range(const float* A, const fp16_t* B, float* C, int N,
+                             int K, int lda, int K_weight, int ldc,
+                             int m_begin, int m_end, bool interleaved);
+bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
+                       float* C, int N, int K, int group_size,
+                       int groups_per_row, int lda, int K_weight, int ldc,
+                       int m_begin, int m_end, int n_begin, int n_end,
+                       bool interleaved);
 
 }  // namespace mollm::cpu
 
