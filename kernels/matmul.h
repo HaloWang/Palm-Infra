@@ -166,6 +166,8 @@ uint8_t* pack_b_q4dot_int4_full(const uint8_t* B_original, int N, int K,
 size_t pack_b_q4dot_g32_bytes(int N, int K);
 uint8_t* pack_b_q4dot_g32_full(const uint8_t* B_q4dot, const float* scales,
                                int N, int K, int groups_per_row);
+size_t pack_b_q4_vnni_bytes(int N, int K);
+uint8_t* pack_b_q4_vnni_full(const void* B_q4_g32, int N, int K);
 
 // Pack Q4-dot B plus W4G128 scales -> [N/8, K/128] blocks.
 // Each block stores float scales[8] then q4dot q[4][8][16].

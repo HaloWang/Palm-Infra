@@ -38,9 +38,13 @@ enum class X86Isa : uint8_t {
 
 #if MOLLM_CPU_ARM_NEON
 using fp16_t = __fp16;
+#elif defined(__clang__)
+// Clang exposes __fp16 as a storage-only type on x86. Keep it as the
+// canonical storage spelling so legacy kernel signatures remain compatible.
+using fp16_t = __fp16;
 #else
-// GCC and Clang support IEEE binary16 storage on x86 Linux.  It is used only
-// for model bytes and scalar conversion; it does not imply native FP16 SIMD.
+// GCC supports IEEE binary16 storage on x86 Linux. It is used only for model
+// bytes and scalar conversion; it does not imply native FP16 SIMD.
 using fp16_t = _Float16;
 #endif
 
@@ -56,6 +60,7 @@ struct Capabilities {
     bool x86_fma = false;
     bool x86_f16c = false;
     bool x86_avx512 = false;
+    bool x86_avx512_vnni = false;
     X86Isa x86_isa = X86Isa::SCALAR;
 };
 
@@ -91,7 +96,7 @@ bool matmul_int8_range(const float* A, const int8_t* B, const float* scales,
 
 }  // namespace mollm::cpu
 
-#if !MOLLM_CPU_ARM_NEON
+#if !MOLLM_CPU_ARM_NEON && !defined(__clang__)
 // Legacy CPU kernels still spell their storage element as `__fp16`.  Keep the
 // compatibility name at this one architecture boundary while those kernels
 // are moved behind providers; no generic caller needs a compiler extension.

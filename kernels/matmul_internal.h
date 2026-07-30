@@ -62,6 +62,16 @@ struct alignas(16) Q4B8G32Block {
 };
 static_assert(sizeof(Q4B8G32Block) == 160, "unexpected Q4B8G32Block size");
 
+// x86 VNNI prefill sidecar for one 8-output x 32-K block. Each row stores
+// four consecutive K nibbles for all eight outputs. Runtime unpacking then
+// feeds one VPDPBUSD that accumulates all eight outputs without horizontal
+// sums, while keeping the sidecar at the original four-bit density.
+struct alignas(16) Q4B8G32VnniBlock {
+    uint8_t q[8][16];
+};
+static_assert(sizeof(Q4B8G32VnniBlock) == 128,
+              "unexpected Q4B8G32VnniBlock size");
+
 struct alignas(16) Q8A4Block {
     float scales[4];
     int8_t even[4][16];

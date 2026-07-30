@@ -35,6 +35,7 @@ bool configure_weight_metadata(Tensor& tensor,
     tensor.is_fp8_block128 = false;
     tensor.q4_g32_data = nullptr;
     tensor.q4_g128_data = nullptr;
+    tensor.q4_vnni_data = nullptr;
 
     const bool is_quantized =
         tensor.prec == Precision::INT8 || tensor.prec == Precision::INT4 ||

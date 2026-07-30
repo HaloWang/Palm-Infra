@@ -250,6 +250,28 @@ void maybe_pack_int4_g32_weight(Tensor& weight, const std::string& key,
 void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
                             const void* weight_data,
                             PackedWeightMap& packed_weights) {
+    if (mollm::cpu::capabilities().x86_avx512_vnni &&
+        is_2d_linear_weight(weight) && weight.prec == Precision::INT4 &&
+        weight.is_q4_g32_packed && weight_data && weight.group_size == 32 &&
+        weight.shape[1] > 0 && (weight.shape[1] % 32) == 0 &&
+        key.find("lm_head") == std::string::npos &&
+        key.find("_experts_") == std::string::npos) {
+        const int N = static_cast<int>(weight.shape[0]);
+        const int K = static_cast<int>(weight.shape[1]);
+        const std::string vnni_key = key + "#int4_vnni";
+        auto it = packed_weights.find(vnni_key);
+        if (it == packed_weights.end()) {
+            uint8_t* packed = pack_b_q4_vnni_full(weight_data, N, K);
+            if (packed) {
+                const size_t bytes = pack_b_q4_vnni_bytes(N, K);
+                std::vector<uint8_t> buffer(packed, packed + bytes);
+                delete[] packed;
+                it = packed_weights.emplace(vnni_key, std::move(buffer)).first;
+            }
+        }
+        if (it != packed_weights.end())
+            weight.q4_vnni_data = it->second.data();
+    }
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(weight))
         return;
@@ -506,6 +528,52 @@ uint8_t* pack_b_q4dot_g32_full(const uint8_t* B_q4dot, const float* scales,
             const uint8_t* src_block =
                 src_tile + (size_t)qb * 8 * bytes_per_block;
             std::memcpy(block.q, src_block, 8 * bytes_per_block);
+        }
+    }
+    return raw;
+}
+
+size_t pack_b_q4_vnni_bytes(int N, int K) {
+    const int N_padded = ((N + 7) / 8) * 8;
+    return static_cast<size_t>(N_padded / 8) * (K / 32) *
+           sizeof(Q4B8G32VnniBlock);
+}
+
+uint8_t* pack_b_q4_vnni_full(const void* B_q4_g32, int N, int K) {
+    if (!B_q4_g32 || N <= 0 || K <= 0 || (K % 32) != 0)
+        return nullptr;
+    const int N_padded = ((N + 7) / 8) * 8;
+    const int groups = K / 32;
+    const auto* source = static_cast<const uint8_t*>(B_q4_g32);
+    auto* raw = new uint8_t[pack_b_q4_vnni_bytes(N, K)];
+    auto* destination = reinterpret_cast<Q4B8G32VnniBlock*>(raw);
+
+    for (int n_tile = 0; n_tile < N_padded / 8; ++n_tile) {
+        for (int group = 0; group < groups; ++group) {
+            Q4B8G32Block src;
+            const size_t block_index =
+                static_cast<size_t>(n_tile) * groups + group;
+            std::memcpy(&src,
+                        source + block_index * sizeof(Q4B8G32Block),
+                        sizeof(src));
+            auto& dst =
+                destination[block_index];
+            for (int chunk = 0; chunk < 8; ++chunk) {
+                for (int n = 0; n < 8; ++n) {
+                    for (int pair = 0; pair < 2; ++pair) {
+                        const int k = chunk * 4 + pair * 2;
+                        const uint8_t source_byte = src.q[n][k / 2];
+                        const uint8_t low =
+                            static_cast<uint8_t>(
+                                ((source_byte & 0x0f) + 8) & 0x0f);
+                        const uint8_t high =
+                            static_cast<uint8_t>(
+                                (((source_byte >> 4) & 0x0f) + 8) & 0x0f);
+                        dst.q[chunk][n * 2 + pair] =
+                            static_cast<uint8_t>(low | (high << 4));
+                    }
+                }
+            }
         }
     }
     return raw;

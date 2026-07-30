@@ -4,11 +4,14 @@
 #include "kernels/threading.h"
 #include "kernels/x86_avx2.h"
 #include "kernels/x86_avx512.h"
+#include "kernels/x86_vnni.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
+#include <vector>
 
 namespace mollm::cpu {
 
@@ -22,6 +25,11 @@ using Int4Fn = void (*)(const Tensor&, const Tensor&, Tensor&, int, int, int,
                         int, int, int);
 using Int8Fn = void (*)(const float*, const int8_t*, const float*, float*, int,
                         int, int, int, int, int, int, int, int, int, int);
+using Int4VnniFn = void (*)(const int8_t*, const float*, const int16_t*,
+                            const Tensor&, Tensor&, int, int, int, int, int,
+                            int);
+using QuantizeVnniFn = void (*)(const float*, int8_t*, float*, int16_t*, int,
+                                int, int, int);
 
 struct X86Dispatch {
     Capabilities caps;
@@ -29,6 +37,8 @@ struct X86Dispatch {
     DenseFp32Fn fp32 = nullptr;
     DenseFp16Fn fp16 = nullptr;
     Int4Fn int4 = nullptr;
+    Int4VnniFn int4_vnni = nullptr;
+    QuantizeVnniFn quantize_vnni = nullptr;
     Int8Fn int8 = nullptr;
 };
 
@@ -40,6 +50,9 @@ X86Dispatch detect_dispatch() {
     const bool has_fma = __builtin_cpu_supports("fma");
     const bool has_f16c = __builtin_cpu_supports("f16c");
     const bool has_avx512 = __builtin_cpu_supports("avx512f");
+    const bool has_avx512_bw = __builtin_cpu_supports("avx512bw");
+    const bool has_avx512_vl = __builtin_cpu_supports("avx512vl");
+    const bool has_avx512_vnni = __builtin_cpu_supports("avx512vnni");
 
     const char* requested = std::getenv("MOLLM_X86_ISA");
     const bool force_scalar =
@@ -57,12 +70,18 @@ X86Dispatch detect_dispatch() {
         dispatch.caps.x86_fma = true;
         dispatch.caps.x86_f16c = has_f16c;
         dispatch.caps.x86_avx512 = true;
+        dispatch.caps.x86_avx512_vnni =
+            has_avx512_bw && has_avx512_vl && has_avx512_vnni;
         dispatch.caps.x86_isa = X86Isa::AVX512;
         dispatch.name = "x86-avx512";
         dispatch.fp32 = x86::matmul_fp32_avx512_range;
         if (has_f16c)
             dispatch.fp16 = x86::matmul_fp16_avx512_range;
         dispatch.int4 = x86::matmul_int4_bg_avx512_range;
+        if (dispatch.caps.x86_avx512_vnni)
+            dispatch.int4_vnni = x86::matmul_int4_bg32_vnni_range;
+        if (dispatch.caps.x86_avx512_vnni)
+            dispatch.quantize_vnni = x86::quantize_q8_vnni_range;
         dispatch.int8 = x86::matmul_int8_avx512_range;
         return dispatch;
     }
@@ -120,6 +139,46 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
     const bool is_bg128 = B.is_q4_g128_packed && bg128 && B.group_size == 128;
     if ((!is_q4dot && !is_bg32 && !is_bg128) || groups <= 0)
         return false;
+
+    const auto int4_vnni = dispatch().int4_vnni;
+    const auto quantize_vnni = dispatch().quantize_vnni;
+    const bool use_vnni =
+        int4_vnni && quantize_vnni && is_bg32 && B.q4_vnni_data && M >= 4 &&
+        K % 32 == 0;
+    if (use_vnni) {
+        struct VnniScratch {
+            std::vector<int8_t> qA;
+            std::vector<float> scales;
+            std::vector<int16_t> sums;
+        };
+        thread_local VnniScratch scratch;
+        scratch.qA.resize(static_cast<size_t>(M) * K);
+        scratch.scales.resize(static_cast<size_t>(M) * groups);
+        scratch.sums.resize(static_cast<size_t>(M) * groups);
+        int8_t* const quantized_a = scratch.qA.data();
+        float* const activation_scales = scratch.scales.data();
+        int16_t* const activation_sums = scratch.sums.data();
+        const auto quant_begin = std::chrono::steady_clock::now();
+        quantize_vnni(A.ptr<float>(), quantized_a, activation_scales,
+                      activation_sums, K, lda, 0, M);
+        const auto quant_end = std::chrono::steady_clock::now();
+        matmul_record_q8_quant_a(
+            std::chrono::duration<double, std::milli>(
+                quant_end - quant_begin).count());
+        const int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        if (n_threads > 1) {
+            thread_pool->parallel_for(
+                0, M, 4, [&](int, int begin, int end) {
+                    int4_vnni(quantized_a, activation_scales,
+                              activation_sums, B, C, K, ldc, begin, end, 0,
+                              N);
+                });
+        } else {
+            int4_vnni(quantized_a, activation_scales, activation_sums, B, C,
+                      K, ldc, 0, M, 0, N);
+        }
+        return true;
+    }
 
     const auto int4_kernel = dispatch().int4;
     const bool use_simd =

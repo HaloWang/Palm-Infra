@@ -383,6 +383,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q4_repack_data = nullptr;
             t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
+            t.q4_vnni_data = nullptr;
 #ifdef MOLLM_METAL
             // Alias this weight into the registered device weight buffer NOW,
             // while t.data still points at the raw mmap region (before any CPU

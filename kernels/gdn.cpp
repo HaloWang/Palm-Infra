@@ -1,5 +1,10 @@
 #include "kernels/gdn.h"
 #include "kernels/shortconv.h"
+#include "kernels/cpu_platform.h"
+
+#if defined(MOLLM_CPU_X86_SIMD)
+#include "kernels/gdn_x86.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -63,7 +68,8 @@ static void fused_gdn_head(
     float* state, float* out,
     int num_heads, int k_dim, int v_dim, int num_v_heads, int seq_len,
     int data_seq_len, int a_row_stride, int b_row_stride, int z_row_stride,
-    bool use_l2norm, float rms_eps, float l2norm_eps, float scale)
+    bool use_l2norm, float rms_eps, float l2norm_eps, float scale,
+    int vh_begin, int vh_end)
 {
     int qkv_dim   = num_heads * k_dim;       // key_dim (q/k are key_heads * k_dim)
     int z_dim     = num_v_heads * v_dim;
@@ -74,7 +80,7 @@ static void fused_gdn_head(
     std::vector<float> q_n(k_dim), k_n(k_dim);
     std::vector<float> kv_mem(v_dim), delta(v_dim), attn_out(v_dim);
 
-    for (int vh = 0; vh < num_v_heads; vh++) {
+    for (int vh = vh_begin; vh < vh_end; vh++) {
         int kh = vh / repeat;  // key head index (0.8B: vh==kh, 4B: vh/2)
 
         float* state_h = state + vh * state_size;
@@ -177,6 +183,12 @@ void kernel_gdn_prefill(const OpParams& params,
     kernel_gdn_prefill_neon(params, inputs, outputs, thread_pool);
     return;
 #endif
+#if defined(MOLLM_CPU_X86_SIMD)
+    if (mollm::cpu::capabilities().x86_avx512) {
+        kernel_gdn_x86_avx512(params, inputs, outputs, thread_pool);
+        return;
+    }
+#endif
     int num_heads   = graph_params::get_i32(params, 0, 16);
     int k_head_dim  = graph_params::get_i32(params, 1, 128);
     int v_head_dim  = graph_params::get_i32(params, 2, 128);
@@ -219,13 +231,21 @@ void kernel_gdn_prefill(const OpParams& params,
         }
     }
 
-    fused_gdn_head(qkv_data, a_data, b_data, z_data,
-                   neg_exp_A.data(), dtb_data, norm_data,
-                   state_data, out_data,
-                   num_heads, k_head_dim, v_head_dim, num_v_heads,
-                   process_len, seq_len,
-                   a_row_stride, b_row_stride, z_row_stride,
-                   use_l2norm, rms_eps, l2norm_eps, scale);
+    auto process_heads = [&](int, int vh_begin, int vh_end) {
+        fused_gdn_head(qkv_data, a_data, b_data, z_data,
+                       neg_exp_A.data(), dtb_data, norm_data,
+                       state_data, out_data,
+                       num_heads, k_head_dim, v_head_dim, num_v_heads,
+                       process_len, seq_len,
+                       a_row_stride, b_row_stride, z_row_stride,
+                       use_l2norm, rms_eps, l2norm_eps, scale,
+                       vh_begin, vh_end);
+    };
+    if (thread_pool && num_v_heads >= 2) {
+        thread_pool->parallel_for(0, num_v_heads, 1, process_heads);
+    } else {
+        process_heads(0, 0, num_v_heads);
+    }
 }
 
 // ---------------------------------------------------------------------------
