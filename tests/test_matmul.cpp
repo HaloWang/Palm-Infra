@@ -1429,6 +1429,15 @@ int main() {
         CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
               "INT4 Q8-dot GEMM BG32 reference");
 
+        uint8_t* q4_vnni = nullptr;
+        if (mollm::cpu::capabilities().x86_avx512_vnni) {
+            q4_vnni = pack_b_q4_vnni_full(q4_g32, N, K);
+            B.q4_vnni_data = q4_vnni;
+            kernel_matmul_fp32(A, B, C);
+            CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+                  "INT4 Q8-dot GEMM BG32 x86 VNNI reference");
+        }
+
         Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
                                          N, K, 1, 1, q4_repack);
         B_direct.scales = scales.data();
@@ -1442,6 +1451,7 @@ int main() {
               "INT4 Q8-dot GEMM direct q4 layout matmul");
         delete[] q4_repack;
         delete[] q4_g32;
+        delete[] q4_vnni;
     }
 
     {

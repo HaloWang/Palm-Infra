@@ -32,6 +32,10 @@ int main() {
         std::fprintf(stderr, "F16C selected without an x86 SIMD tier\n");
         return 1;
     }
+    if (caps.x86_avx512_vnni && !caps.x86_avx512) {
+        std::fprintf(stderr, "AVX-512 VNNI selected without AVX-512\n");
+        return 1;
+    }
 
     const char* requested = std::getenv("MOLLM_X86_ISA");
     if ((std::getenv("MOLLM_X86_DISABLE_AVX2") ||

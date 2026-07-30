@@ -88,6 +88,7 @@ struct Tensor {
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
     const void* q4_g32_data = nullptr; // optional [N/8, K/32] G32 packed INT4+scales
     const void* q4_g128_data = nullptr; // optional [N/8, K/128] G128 packed INT4+scales
+    const void* q4_vnni_data = nullptr; // optional compact [N/8,K/32,8,16B] x86 VNNI sidecar
     const void* sparse_data = nullptr; // optional [N/8,K,8] sparse-A GEMV layout
     // Optional CPU MoE SSD source. Aggregate expert tensors use this instead
     // of data when expert weights are paged in on demand.

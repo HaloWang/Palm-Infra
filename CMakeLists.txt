@@ -33,7 +33,10 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     set(MOLLM_CPU_PLATFORM_SOURCE
         kernels/cpu_platform_x86.cpp
         kernels/matmul_x86_avx2.cpp
-        kernels/matmul_x86_avx512.cpp)
+        kernels/matmul_x86_avx512.cpp
+        kernels/matmul_x86_vnni.cpp
+        kernels/gdn_x86_avx512.cpp
+        kernels/attention_x86_avx512.cpp)
 else()
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
 endif()
@@ -122,6 +125,16 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         set_source_files_properties(
             kernels/matmul_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma;-mf16c")
+        set_source_files_properties(
+            kernels/matmul_x86_vnni.cpp
+            PROPERTIES COMPILE_OPTIONS
+                       "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mfma")
+        set_source_files_properties(
+            kernels/gdn_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+        set_source_files_properties(
+            kernels/attention_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
     else()
         message(FATAL_ERROR
             "The x86 SIMD providers currently require GCC or Clang")
@@ -221,6 +234,10 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
 else()
     message(STATUS "Target: ${CMAKE_SYSTEM_PROCESSOR} (scalar fallback)")
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CPU_ARM_NEON=0)
+endif()
+
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
+    target_compile_definitions(mollm_lib PRIVATE MOLLM_CPU_X86_SIMD=1)
 endif()
 
 # Apple-specific: link Accelerate for optional BLAS (future use)
