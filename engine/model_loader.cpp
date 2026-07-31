@@ -176,6 +176,20 @@ void LLMEngine::clear_model_state() {
     sampler_.reset();
 }
 
+size_t LLMEngine::cpu_weight_sidecar_bytes() const {
+    size_t bytes = 0;
+    for (const auto& [key, buffer] : packed_weights_) {
+        (void)key;
+        bytes += buffer.size();
+    }
+    for (const auto& [key, prepared] : prepared_weights_) {
+        (void)key;
+        for (const auto& buffer : prepared.layouts)
+            bytes += buffer.size();
+    }
+    return bytes;
+}
+
 size_t LLMEngine::warmup_package_weights() {
     if (!package_weights_base_ || package_weights_size_ == 0)
         return 0;
@@ -393,6 +407,11 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             native_fp8_weight_nodes.insert(node.inputs[1]);
         }
     }
+
+    const bool build_cpu_weight_sidecars =
+        !accelerator_backend_ ||
+        exec_ctx.backend != accelerator_backend_.get() ||
+        accelerator_backend_->wants_cpu_weight_sidecars();
 
     for (auto& node : g.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty())
@@ -635,15 +654,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     wref.find("embed_tokens") != std::string::npos ||
                     wref.find("vision_pos_embed.weights") !=
                         std::string::npos;
-                const bool metal_only_weight =
-                    cfg_.device == Device::METAL && accelerator_backend_ &&
-                    exec_ctx.backend == accelerator_backend_.get();
-                // Resident Metal consumes package-native FP16/W8 bytes (and
-                // builds its own W4 device layout). CPU q8-dot/interleaved
-                // sidecars duplicate nearly the entire model and are never
-                // read on this path. Hybrid SSD decode still loads its CPU
-                // graph separately and prepares the required sidecars there.
-                if (!metal_only_weight) {
+                // Resident accelerators consume package-native weights or
+                // their own prepared layouts. Avoid duplicating CPU sidecars
+                // unless the selected backend still needs reference fallback.
+                if (build_cpu_weight_sidecars) {
                     prepare_matmul_weight(
                         t, wref, data, packed_weights_, prepared_weights_,
                         !lookup_table,
@@ -707,10 +721,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             node.params.str[0].find("embed_tokens") != std::string::npos ||
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;
-        const bool metal_only_weight =
-            cfg_.device == Device::METAL && accelerator_backend_ &&
-            exec_ctx.backend == accelerator_backend_.get();
-        if (!metal_only_weight) {
+        if (build_cpu_weight_sidecars) {
             prepare_matmul_weight(
                 t, wpath, t.data, packed_weights_, prepared_weights_,
                 !lookup_table,
