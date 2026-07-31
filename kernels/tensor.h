@@ -6,6 +6,7 @@
 #include <cstring>
 
 #include "kernels/cpu_platform.h"
+#include "kernels/prepared_weight.h"
 
 // ---------------------------------------------------------------------------
 // mollm — Tensor definition
@@ -88,7 +89,11 @@ struct Tensor {
     const void* q4_repack_data = nullptr; // optional [N/8, K/32, 8, 16B] INT4 dot layout
     const void* q4_g32_data = nullptr; // optional [N/8, K/32] G32 packed INT4+scales
     const void* q4_g128_data = nullptr; // optional [N/8, K/128] G128 packed INT4+scales
-    const void* q4_vnni_data = nullptr; // optional compact [N/8,K/32,8,16B] x86 VNNI sidecar
+    // Non-owning reference to backend-specific load-time layouts. Row views
+    // retain the same prepared weight and advance this logical output-row
+    // offset instead of manufacturing backend-specific sidecar pointers.
+    const PreparedWeight* prepared_weight = nullptr;
+    size_t prepared_weight_row_offset = 0;
     const void* sparse_data = nullptr; // optional [N/8,K,8] sparse-A GEMV layout
     // Optional CPU MoE SSD source. Aggregate expert tensors use this instead
     // of data when expert weights are paged in on demand.

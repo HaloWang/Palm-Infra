@@ -66,6 +66,7 @@ bool matmul_int4_q4dot_kernel_available();
 void prepare_matmul_weight(Tensor& weight, const std::string& key,
                            const void* weight_data,
                            PackedWeightMap& packed_weights,
+                           PreparedWeightMap& prepared_weights,
                            bool pack_fp16 = true,
                            bool pack_fp8 = true);
 
