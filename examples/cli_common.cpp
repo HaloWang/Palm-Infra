@@ -362,7 +362,14 @@ bool load_runtime(const CliCommonOptions& opts, Tokenizer& tokenizer,
         error = "package did not expose a tokenizer path";
         return false;
     }
-    if (!tokenizer.load(tok_path)) {
+    const auto architecture_it =
+        engine.package_metadata().find("architecture");
+    const std::string architecture =
+        architecture_it != engine.package_metadata().end()
+            ? architecture_it->second
+            : std::string();
+    if (!tokenizer.load(tok_path, engine.config().chat_template_path,
+                        architecture)) {
         error = std::string("failed to load tokenizer: ") + tok_path;
         return false;
     }

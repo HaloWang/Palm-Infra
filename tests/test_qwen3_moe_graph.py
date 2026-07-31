@@ -46,7 +46,8 @@ def main():
     g = build_graph(".", tiny_cfg(), seq_len=8, n_ctx=64, is_prefill=True)
 
     moe_nodes = [n for n in g._nodes if n.op_type == OpType.MOE]
-    check(len(moe_nodes) == 2, "layers after first_k_dense_replace use MOE")
+    check(len(moe_nodes) == 2,
+          "layers after first_k_dense_replace use MOE")
     for node in moe_nodes:
         check(node.params_i32[1] == 8, "MOE num_experts")
         check(node.params_i32[2] == 2, "MOE top_k")
@@ -60,6 +61,28 @@ def main():
     for node in sdpa_nodes:
         check(node.params_i32[2] == 4, "SDPA num_heads")
         check(node.params_i32[3] == 2, "SDPA num_kv_heads")
+
+    def count(op):
+        return sum(n.op_type == op for n in g._nodes)
+
+    check(count(OpType.ADD_RMS_NORM) == 6,
+          "attention and MLP residual pairs use ADD_RMS_NORM")
+    check(count(OpType.ADD) == 0,
+          "Qwen3-MoE graph has no standalone residual add")
+    check(count(OpType.QK_RMS_NORM_ROPE) == 3,
+          "each layer fuses Q and K normalization/materialization/RoPE")
+    check(count(OpType.RMS_NORM_ROPE) == 0,
+          "Qwen3-MoE no longer dispatches Q and K separately")
+    check(count(OpType.ROTARY_EMBED) == 0,
+          "fused Q/K path has no standalone RoPE")
+    check(count(OpType.RMS_NORM) == 1,
+          "only the initial input RMSNorm remains standalone")
+    check(count(OpType.CONTIGUOUS) == 3,
+          "only attention output materialization remains")
+    check(count(OpType.SWIGLU) == 1,
+          "the dense layer uses a merged gate/up projection")
+    check(count(OpType.SILU) == 0 and count(OpType.MUL) == 0,
+          "merged dense gate/up removes standalone SiLU and multiply")
 
     cfg = tiny_cfg()
     cfg.pop("n_routed_experts")

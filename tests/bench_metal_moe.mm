@@ -1,8 +1,8 @@
-// Microbenchmark for the decode-time Metal SSD-MoE routed-expert kernel.
+// Microbenchmark for Metal selected-expert BG128 decode kernels.
 //
 // The buffers use the same Shared storage and native BG128 package layout as
-// the full-Metal SSD path. This isolates selected GEMV compute from model
-// loading, routing, I/O scheduling, and the rest of the graph.
+// the resident and full-Metal SSD paths. This isolates selected GEMV compute
+// from model loading, routing, I/O scheduling, and the rest of the graph.
 
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
@@ -33,6 +33,21 @@ struct Case {
     int activation_rows;
     int activation_repeat;
 };
+
+enum class KernelMode {
+    SLOTS,
+    TENSOR,
+    RESIDENT,
+};
+
+const char* mode_name(KernelMode mode) {
+    switch (mode) {
+        case KernelMode::SLOTS: return "slots";
+        case KernelMode::TENSOR: return "tensor";
+        case KernelMode::RESIDENT: return "resident";
+    }
+    return "unknown";
+}
 
 [[noreturn]] void fail(const char* message) {
     std::fprintf(stderr, "bench_metal_moe: %s\n", message);
@@ -74,7 +89,10 @@ void initialize_weights(id<MTLBuffer> buffer, size_t expert_bytes,
 double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
                 id<MTLComputePipelineState> pipeline, const Case& c,
                 int selections, int warmup, int iterations,
-                bool private_weights, bool tensor_kernel, int layers) {
+                bool private_weights, KernelMode mode, int layers,
+                int resident_nsg) {
+    const bool tensor_kernel = mode == KernelMode::TENSOR;
+    const bool resident_kernel = mode == KernelMode::RESIDENT;
     const int groups_per_row = c.k / 128;
     const size_t expert_bytes =
         static_cast<size_t>(c.n / 8) * groups_per_row * kBg128Bytes;
@@ -98,7 +116,9 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
                     "benchmark expert output");
     id<MTLBuffer> activation_scales =
         make_buffer(device,
-                    static_cast<size_t>(c.activation_rows) * sizeof(float),
+                    static_cast<size_t>(c.activation_rows) *
+                        (resident_kernel ? groups_per_row : 1) *
+                        sizeof(float),
                     "benchmark activation scales");
     id<MTLBuffer> weight_offsets =
         make_buffer(device,
@@ -116,8 +136,14 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
         activation_data[i] = static_cast<int8_t>((i * 29 + 11) % 255 - 127);
     initialize_weights(weight_staging, expert_bytes, selections * layers);
     auto* scale_data = static_cast<float*>(activation_scales.contents);
-    for (int row = 0; row < c.activation_rows; ++row)
-        scale_data[row] = 0.003f * static_cast<float>(row + 1);
+    const int scales_per_row = resident_kernel ? groups_per_row : 1;
+    for (int row = 0; row < c.activation_rows; ++row) {
+        for (int group = 0; group < scales_per_row; ++group) {
+            scale_data[row * scales_per_row + group] =
+                0.003f * static_cast<float>(row + 1) *
+                (1.0f + 0.001f * static_cast<float>(group));
+        }
+    }
     auto* offsets_data = static_cast<uint64_t*>(weight_offsets.contents);
     auto* indices_data = static_cast<uint32_t*>(selection_indices.contents);
     for (int layer = 0; layer < layers; ++layer) {
@@ -163,7 +189,6 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
             [command_buffer computeCommandEncoder];
         [encoder setComputePipelineState:pipeline];
         [encoder setBuffer:activation offset:0 atIndex:0];
-        [encoder setBuffer:weights offset:0 atIndex:1];
         [encoder setBuffer:output offset:0 atIndex:2];
         [encoder setBytes:&params length:sizeof(params) atIndex:3];
         [encoder setBuffer:activation_scales offset:0 atIndex:4];
@@ -174,9 +199,19 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
                                             atIndex:0];
         }
         for (int repeat = 0; repeat < repeats; ++repeat) {
-            const NSUInteger metadata_offset =
-                static_cast<NSUInteger>(repeat % layers) * selections;
+            const NSUInteger layer =
+                static_cast<NSUInteger>(repeat % layers);
+            const NSUInteger metadata_offset = layer * selections;
+            [encoder setBuffer:weights
+                        offset:resident_kernel
+                            ? layer * dispatch_weight_bytes
+                            : 0
+                       atIndex:1];
             if (tensor_kernel) {
+                [encoder setBuffer:selection_indices
+                            offset:metadata_offset * sizeof(uint32_t)
+                           atIndex:6];
+            } else if (resident_kernel) {
                 [encoder setBuffer:selection_indices
                             offset:metadata_offset * sizeof(uint32_t)
                            atIndex:6];
@@ -192,6 +227,14 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
                 [encoder dispatchThreadgroups:
                              MTLSizeMake(1, (c.n + 63) / 64, selections)
                     threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+            } else if (resident_kernel) {
+                const int rows_per_tg = resident_nsg * 8;
+                [encoder dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (c.n + rows_per_tg - 1) / rows_per_tg,
+                                 1, selections)
+                    threadsPerThreadgroup:
+                             MTLSizeMake(32, resident_nsg, 1)];
             } else {
                 [encoder dispatchThreadgroups:
                              MTLSizeMake((c.n + 31) / 32, 1, selections)
@@ -239,7 +282,7 @@ double run_case(id<MTLDevice> device, id<MTLCommandQueue> queue,
         "weights=%5.1f MiB "
         "gpu=%8.1f us wall=%8.1f us effective=%6.1f GB/s checksum=%g\n",
         c.name, private_weights ? "private" : "shared",
-        tensor_kernel ? "tensor" : "native",
+        mode_name(mode),
         c.k, c.n, selections, layers,
         static_cast<double>(dispatch_weight_bytes) / (1024.0 * 1024.0),
         gpu_us,
@@ -257,11 +300,34 @@ int main(int argc, char** argv) {
         if (argc > 2) warmup = std::max(0, std::atoi(argv[2]));
         const bool private_weights =
             argc > 3 && std::string(argv[3]) == "private";
-        const bool tensor_kernel =
-            argc > 4 && std::string(argv[4]) == "tensor";
-        const int layers = tensor_kernel
+        KernelMode mode = KernelMode::SLOTS;
+        if (argc > 4) {
+            const std::string requested = argv[4];
+            if (requested == "tensor") {
+                mode = KernelMode::TENSOR;
+            } else if (requested == "resident") {
+                mode = KernelMode::RESIDENT;
+            } else if (requested != "slots" && requested != "native") {
+                std::fprintf(stderr,
+                             "usage: %s [iterations] [warmup] "
+                             "[shared|private] "
+                             "[slots|tensor|resident] [layers]\n",
+                             argv[0]);
+                return 2;
+            }
+        }
+        const int layers = mode == KernelMode::TENSOR
             ? 1
             : (argc > 5 ? std::max(1, std::atoi(argv[5])) : 8);
+        const int resident_nsg =
+            argc > 6 ? std::max(1, std::atoi(argv[6])) : 8;
+        if (resident_nsg != 1 && resident_nsg != 2 &&
+            resident_nsg != 4 && resident_nsg != 8 &&
+            resident_nsg != 16) {
+            std::fprintf(stderr,
+                         "resident simdgroups must be 1, 2, 4, 8, or 16\n");
+            return 2;
+        }
 
         id<MTLDevice> device = MTLCreateSystemDefaultDevice();
         if (!device) fail("no Metal device");
@@ -279,10 +345,21 @@ int main(int argc, char** argv) {
                          error.localizedDescription.UTF8String);
             return 1;
         }
-        NSString* function_name =
-            tensor_kernel
-                ? @"gemm_selected_w4a8_i8a_i4b_f32c"
-                : @"gemv_selected_slots_bg128_i8a_i4b_f32c";
+        NSString* function_name = nil;
+        switch (mode) {
+            case KernelMode::SLOTS:
+                function_name =
+                    @"gemv_selected_slots_bg128_i8a_i4b_f32c";
+                break;
+            case KernelMode::TENSOR:
+                function_name =
+                    @"gemm_selected_w4a8_i8a_i4b_f32c";
+                break;
+            case KernelMode::RESIDENT:
+                function_name =
+                    @"gemv_selected_experts_bg128_i8a_i4b_f32c";
+                break;
+        }
         id<MTLFunction> function =
             [library newFunctionWithName:function_name];
         if (!function) fail("selected BG128 kernel is missing");
@@ -295,17 +372,20 @@ int main(int argc, char** argv) {
             return 1;
         }
 
-        std::printf("device=%s iterations=%d warmup=%d weights=%s kernel=%s\n",
+        std::printf("device=%s iterations=%d warmup=%d weights=%s "
+                    "kernel=%s resident_nsg=%d\n",
                     device.name.UTF8String, iterations, warmup,
                     private_weights ? "private" : "shared",
-                    tensor_kernel ? "tensor" : "native");
+                    mode_name(mode), resident_nsg);
         const Case cases[] = {
+            {"gate2k", 1536, 2048, 1, 8},
+            {"down2k", 2048, 768, 8, 1},
             {"gate_up", 2048, 3072, 1, 8},
             {"down", 3072, 1024, 8, 1},
         };
         for (const Case& c : cases)
             run_case(device, queue, pipeline, c, 8, warmup, iterations,
-                     private_weights, tensor_kernel, layers);
+                     private_weights, mode, layers, resident_nsg);
     }
     return 0;
 }

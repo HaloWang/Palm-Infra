@@ -3,6 +3,7 @@
 
 #include "kernels/tensor.h"
 #include "kernels/matmul.h"
+#include "kernels/moe.h"
 #include "kernels/rwkv.h"
 #include "engine/metal_backend.h"
 #include "graph/graph.h"
@@ -107,6 +108,35 @@ int main() {
               "Metal pool rejects duplicate release");
         mb.free_output(first, nullptr);
         mb.free_output(second, nullptr);
+    }
+
+    // A hybrid operator can close the current command buffer for a CPU read.
+    // The next Metal dispatch in the same graph must resume encoding lazily.
+    {
+        constexpr int N = 64;
+        Tensor a = make_dev(mb, Precision::FP32, N, 1);
+        Tensor b = make_dev(mb, Precision::FP32, N, 1);
+        Tensor first = make_dev(mb, Precision::FP32, N, 1);
+        Tensor second = make_dev(mb, Precision::FP32, N, 1);
+        auto* ap = static_cast<float*>(a.data);
+        auto* bp = static_cast<float*>(b.data);
+        for (int i = 0; i < N; ++i) {
+            ap[i] = 0.25f * i;
+            bp[i] = 1.0f - 0.125f * i;
+        }
+        GraphNode add;
+        add.op_type = OpType::ADD;
+        mb.begin_graph();
+        mb.dispatch(add, {&a, &b}, &first, nullptr);
+        mb.synchronize_for_host_read();
+        mb.dispatch(add, {&first, &b}, &second, nullptr);
+        mb.end_graph();
+        std::vector<float> ref(N);
+        for (int i = 0; i < N; ++i)
+            ref[i] = ap[i] + 2.0f * bp[i];
+        CHECK(close(static_cast<const float*>(second.data), ref.data(), N,
+                    1e-6f, 1e-6f),
+              "Metal dispatch resumes after host-read synchronization");
     }
 
     // ---- GEMM: M=8, K=64, N=32 ----
@@ -794,6 +824,74 @@ int main() {
               "RMS_NORM_ROPE strided D=256 S=5 H=3");
     }
 
+    // ---- QK_RMS_NORM_ROPE: Q and K rows share one dispatch --------------
+    {
+        const int D=128, S=5, QH=3, KH=2, rope=64;
+        const int qrows=S*QH, krows=S*KH;
+        Tensor QP = make_dev(mb, Precision::FP32, D+5, qrows);
+        Tensor KP = make_dev(mb, Precision::FP32, D+7, krows);
+        Tensor Q = QP.view_2d(D, qrows);
+        Tensor K = KP.view_2d(D, krows);
+        Tensor QW = make_dev(mb, Precision::FP32, D, 1);
+        Tensor KW = make_dev(mb, Precision::FP32, D, 1);
+        Tensor COS = make_dev(mb, Precision::FP32, rope/2, S);
+        Tensor SIN = make_dev(mb, Precision::FP32, rope/2, S);
+        Tensor O = make_dev3(mb, Precision::FP32, D, S, QH+KH);
+        std::vector<float> qp((size_t)(D+5)*qrows, 123.f);
+        std::vector<float> kp((size_t)(D+7)*krows, 123.f);
+        std::vector<float> q((size_t)D*qrows), k((size_t)D*krows);
+        std::vector<float> qw(D), kw(D);
+        std::vector<float> cs((size_t)(rope/2)*S);
+        std::vector<float> sn((size_t)(rope/2)*S);
+        fill_rand(q.data(),q.size()); fill_rand(k.data(),k.size());
+        fill_rand(qw.data(),qw.size()); fill_rand(kw.data(),kw.size());
+        fill_rand(cs.data(),cs.size()); fill_rand(sn.data(),sn.size());
+        for(int r=0;r<qrows;r++)
+            memcpy(qp.data()+(size_t)r*(D+5),
+                   q.data()+(size_t)r*D, (size_t)D*4);
+        for(int r=0;r<krows;r++)
+            memcpy(kp.data()+(size_t)r*(D+7),
+                   k.data()+(size_t)r*D, (size_t)D*4);
+        memcpy(QP.data,qp.data(),qp.size()*4);
+        memcpy(KP.data,kp.data(),kp.size()*4);
+        memcpy(QW.data,qw.data(),qw.size()*4);
+        memcpy(KW.data,kw.data(),kw.size()*4);
+        memcpy(COS.data,cs.data(),cs.size()*4);
+        memcpy(SIN.data,sn.data(),sn.size()*4);
+        metal_op(mb, OpType::QK_RMS_NORM_ROPE,
+                 {&Q,&K,&QW,&KW,&COS,&SIN}, O,
+                 {rope,0,QH}, {1e-6f});
+
+        std::vector<float> ref((size_t)D*(qrows+krows));
+        auto reference = [&](const std::vector<float>& x,
+                             const std::vector<float>& w,
+                             int rows, int row_offset) {
+            for(int r=0;r<rows;r++){
+                double ss=0;
+                for(int d=0;d<D;d++)
+                    ss+=(double)x[(size_t)r*D+d]*x[(size_t)r*D+d];
+                float scale=1.f/std::sqrt((float)(ss/D)+1e-6f);
+                int pos=r%S;
+                for(int i=0;i<rope/2;i++){
+                    float x0=x[(size_t)r*D+i]*scale*w[i];
+                    float x1=x[(size_t)r*D+i+rope/2]*scale*w[i+rope/2];
+                    float c=cs[(size_t)pos*(rope/2)+i];
+                    float s=sn[(size_t)pos*(rope/2)+i];
+                    ref[(size_t)(row_offset+r)*D+i]=x0*c-x1*s;
+                    ref[(size_t)(row_offset+r)*D+i+rope/2]=x1*c+x0*s;
+                }
+                for(int d=rope;d<D;d++)
+                    ref[(size_t)(row_offset+r)*D+d]=
+                        x[(size_t)r*D+d]*scale*w[d];
+            }
+        };
+        reference(q, qw, qrows, 0);
+        reference(k, kw, krows, qrows);
+        CHECK(close((const float*)O.data,ref.data(),D*(qrows+krows),
+                    4e-4f,4e-4f),
+              "QK_RMS_NORM_ROPE strided Q/K");
+    }
+
     // ---- ADD_RMS_NORM: update residual in place + normalized output -------
     {
         int D = 128, rows = 5;
@@ -1273,11 +1371,18 @@ int main() {
     run_sdpa(63, 0, "SDPA prefill S=63 past=0");     // < one C=64 block, ragged
     run_sdpa(65, 3, "SDPA prefill S=65 past=3");     // C=64 boundary cross + past
 
-    // Production config: dk=dv=128, GQA 8/2 (exercises PV=128, NO=PV8/NSG=4 PV MMA).
+    // Production config: dk=dv=128, GQA 8/2.
     auto run_sdpa128 = [&](int S, int past, const char* label) {
         run_sdpa_cfg(S, past, 128, 128, 8, 2, 512, label);
     };
     run_sdpa128(1, 7, "SDPA decode hd=128 S=1 past=7");
+    run_sdpa128(1, 255, "SDPA decode hd=128 S=1 past=255");
+    run_sdpa_cfg(1, 511, 128, 128, 8, 2, 1024,
+                 "SDPA decode hd=128 S=1 past=511");
+    run_sdpa_cfg(1, 1023, 128, 128, 8, 2, 2048,
+                 "SDPA decode hd=128 S=1 past=1023", 3e-2f);
+    run_sdpa_cfg(1, 3071, 128, 128, 8, 2, 4096,
+                 "SDPA decode hd=128 S=1 past=3071", 3e-2f);
     run_sdpa_cfg(1, 7, 256, 256, 8, 2, 512,
                  "SDPA decode hd=256 S=1 past=7");
     run_sdpa_cfg(1, 255, 256, 256, 8, 2, 512,
@@ -1290,6 +1395,10 @@ int main() {
     run_sdpa128(128, 0, "SDPA prefill hd=128 S=128 past=0");
     run_sdpa128(256, 0, "SDPA prefill hd=128 S=256 past=0");
     run_sdpa128(70, 13, "SDPA prefill hd=128 S=70 past=13"); // ragged Q tile + C cross + past
+    run_sdpa_cfg(64, 0, 256, 256, 8, 2, 512,
+                 "SDPA prefill hd=256 S=64 past=0");
+    run_sdpa_cfg(64, 0, 192, 128, 16, 16, 512,
+                 "SDPA prefill dk=192 dv=128 S=64 past=0");
     run_sdpa_cfg(1, 0,   192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=0",   3e-3f);
     run_sdpa_cfg(1, 31,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=31",  3e-3f);
     run_sdpa_cfg(1, 32,  192, 128, 16, 16, 512, "SDPA fused decode dk=192 dv=128 past=32",  3e-3f);
@@ -1373,6 +1482,128 @@ int main() {
             CHECK(close((const float*)C.data, ref.data(), M*N,
                         1e-2f, 3e-2f), label);
         }
+    }
+
+    // ---- W4A16 prefill GEMM (generic G32/G64 and specialized G128) -----------
+    // Both variants use the decoded offset-binary [nibbles|scales] layout.
+    // Keeping G64 here guards the non-specialized function-constant path.
+    {
+        setenv("MOLLM_METAL_W4_PREFILL_MODE", "fast", 1);
+        constexpr int M = 64;
+        constexpr int K = 256;
+        constexpr int N = 64;
+        for (int group_size : {32, 64, 128}) {
+            const int groups_per_row = K / group_size;
+            std::vector<float> a(M * K);
+            for (int i = 0; i < M * K; ++i)
+                a[i] =
+                    0.001f *
+                    static_cast<float>(
+                        (i * 29 + 17) % 101 - 50);
+            std::vector<int8_t> weights(N * K);
+            std::vector<float> scales(N * groups_per_row);
+            for (int n = 0; n < N; ++n) {
+                for (int group = 0;
+                     group < groups_per_row; ++group) {
+                    scales[n * groups_per_row + group] =
+                        0.002f *
+                        static_cast<float>(
+                            1 + (n + group) % 5);
+                }
+                for (int k = 0; k < K; ++k)
+                    weights[n * K + k] =
+                        static_cast<int8_t>(
+                            (n * 7 + k * 3) % 16 - 8);
+            }
+
+            const size_t packed_bytes =
+                static_cast<size_t>(N) * K / 2;
+            const size_t scale_bytes =
+                scales.size() * sizeof(float);
+            std::vector<uint8_t> storage(
+                packed_bytes + scale_bytes);
+            for (int n = 0; n < N; ++n) {
+                for (int k = 0; k < K; k += 2) {
+                    const int lo =
+                        static_cast<int>(
+                            weights[n * K + k]) +
+                        8;
+                    const int hi =
+                        static_cast<int>(
+                            weights[n * K + k + 1]) +
+                        8;
+                    storage[
+                        static_cast<size_t>(n) *
+                            (K / 2) +
+                        k / 2] =
+                        static_cast<uint8_t>(
+                            (hi << 4) | lo);
+                }
+            }
+            std::memcpy(
+                storage.data() + packed_bytes,
+                scales.data(), scale_bytes);
+            mb.register_weight_region(
+                storage.data(), storage.size());
+
+            Tensor A =
+                make_dev(mb, Precision::FP32, K, M);
+            std::memcpy(
+                A.data, a.data(),
+                a.size() * sizeof(float));
+            Tensor C =
+                make_dev(mb, Precision::FP32, N, M);
+            Tensor B = Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL,
+                N, K, 1, 1, storage.data());
+            B.scales =
+                reinterpret_cast<const float*>(
+                    storage.data() + packed_bytes);
+            B.group_size =
+                static_cast<uint32_t>(group_size);
+            B.groups_per_row =
+                static_cast<uint32_t>(groups_per_row);
+            B.num_groups =
+                static_cast<uint32_t>(
+                    N * groups_per_row);
+            mb.wrap_weight(B);
+            metal_matmul(mb, A, B, C);
+
+            std::vector<float> reference(M * N);
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    double sum = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        const float weight =
+                            static_cast<float>(
+                                static_cast<__fp16>(
+                                    static_cast<float>(
+                                        weights[n * K + k]) *
+                                    scales[
+                                        n * groups_per_row +
+                                        k / group_size]));
+                        sum +=
+                            static_cast<double>(
+                                a[m * K + k]) *
+                            static_cast<double>(weight);
+                    }
+                    reference[m * N + n] =
+                        static_cast<float>(sum);
+                }
+            }
+            char label[80];
+            std::snprintf(
+                label, sizeof(label),
+                "W4A16 GEMM G%d function-constant path",
+                group_size);
+            CHECK(
+                close(
+                    static_cast<const float*>(C.data),
+                    reference.data(), M * N,
+                    1e-2f, 3e-2f),
+                label);
+        }
+        unsetenv("MOLLM_METAL_W4_PREFILL_MODE");
     }
 
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
@@ -1528,7 +1759,7 @@ int main() {
             B.q4_g128_data = blocks.data();
             B.scales = sw.data();          // placeholder; decode rebuilds from blocks
             mb.wrap_weight(B);
-            mb.wrap_weight_int4_g128(B);   // decode packed blocks -> raw nibbles
+            mb.wrap_weight_int4(B);   // decode packed blocks -> raw nibbles
 
             if (balanced_probe)
                 unsetenv("MOLLM_METAL_W4_PREFILL_MODE");
@@ -1721,6 +1952,415 @@ int main() {
         }
         CHECK(close((const float*)OUT.data, ref.data(), O0*s1*s2, 1e-6f, 1e-6f),
               "CONCAT dim0 strided(A=slice) [6|6] s1=4 s2=3");
+    }
+
+    // ---- Resident native-BG128 MoE decode ---------------------------------
+    // Covers GPU routing with a no-shared-expert input layout and the direct
+    // selected-expert kernel used by resident W4 packages.
+    if (mb.has_tensor_path()) {
+        struct alignas(16) Q4B8G128Block {
+            float scales[8];
+            uint8_t q[4][8][16];
+        };
+        constexpr int H = 128;
+        constexpr int I = 128;
+        constexpr int E = 256;
+        constexpr int TOP = 8;
+        constexpr int GU_ROWS = E * 2 * I;
+        constexpr int DOWN_ROWS = E * H;
+        constexpr int GU_BLOCKS = (GU_ROWS / 8) * (H / 128);
+        constexpr int DOWN_BLOCKS = (DOWN_ROWS / 8) * (I / 128);
+        std::vector<Q4B8G128Block> packed(GU_BLOCKS + DOWN_BLOCKS);
+        for (size_t block = 0; block < packed.size(); ++block) {
+            for (int channel = 0; channel < 8; ++channel)
+                packed[block].scales[channel] =
+                    0.001f * static_cast<float>(1 + (block + channel) % 5);
+            for (int qgi = 0; qgi < 4; ++qgi)
+                for (int channel = 0; channel < 8; ++channel)
+                    for (int byte = 0; byte < 16; ++byte) {
+                        int lo = static_cast<int>(
+                                     (block * 13 + qgi * 7 +
+                                      channel * 3 + byte) %
+                                     16) -
+                                 8;
+                        int hi = static_cast<int>(
+                                     (block * 5 + qgi * 11 +
+                                      channel + byte * 3) %
+                                     16) -
+                                 8;
+                        packed[block].q[qgi][channel][byte] =
+                            static_cast<uint8_t>(
+                                ((hi & 15) << 4) | (lo & 15));
+                    }
+        }
+        CHECK(mb.register_weight_region(
+                  packed.data(), packed.size() * sizeof(Q4B8G128Block)),
+              "register native-BG128 MoE weight region");
+
+        Tensor x = make_dev(mb, Precision::FP32, H, 1);
+        Tensor router = make_dev(mb, Precision::FP16, E, H);
+        Tensor bias = make_dev(mb, Precision::FP32, E, 1);
+        Tensor out = make_dev(mb, Precision::FP32, H, 1);
+        fill_rand(static_cast<float*>(x.data), H);
+        std::memset(router.data, 0, router.nbytes());
+        auto* bias_data = static_cast<float*>(bias.data);
+        for (int e = 0; e < E; ++e)
+            bias_data[e] =
+                0.01f * static_cast<float>((e * 37) % E) - 0.64f;
+
+        auto make_bg128 = [&](int rows, int k,
+                              Q4B8G128Block* data) {
+            Tensor weight = Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL,
+                rows, k, 1, 1, data);
+            weight.group_size = 128;
+            weight.groups_per_row = k / 128;
+            weight.num_groups =
+                static_cast<uint32_t>(rows * weight.groups_per_row);
+            weight.is_q4_g128_packed = true;
+            weight.q4_g128_data = data;
+            mb.wrap_weight_int4(weight, true);
+            return weight;
+        };
+        Tensor gate_up = make_bg128(GU_ROWS, H, packed.data());
+        Tensor down = make_bg128(
+            DOWN_ROWS, I, packed.data() + GU_BLOCKS);
+        std::vector<const Tensor*> inputs = {
+            &x, &router, &gate_up, &down, &bias};
+
+        GraphNode moe;
+        moe.op_type = OpType::MOE;
+        moe.params.i32 = {
+            H, E, TOP, I, I, 1, 1, 0, 1, 1, 0, 4, -1, -1};
+        moe.params.f32 = {1.0f, 0.0f};
+        mb.begin_graph();
+        mb.dispatch(moe, inputs, &out, nullptr);
+        mb.end_graph();
+
+        std::vector<float> ref_data(H);
+        Tensor ref = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            H, 1, 1, 1, ref_data.data());
+        bool ref_ok = kernel_qwen3_moe(
+            inputs, ref, nullptr, H, E, TOP, I, I,
+            1, true, false, 1, 1, 1.0f, false, 4);
+        CHECK(ref_ok, "CPU reference native-BG128 MoE decode");
+        CHECK(close(static_cast<const float*>(out.data), ref_data.data(), H,
+                    2e-3f, 3e-2f),
+              "Metal resident native-BG128 MoE matches CPU");
+
+        // The production 128-expert path uses a smaller selector
+        // threadgroup than the 256-expert case above. Reuse the first half of
+        // each resident tensor so this scheduling specialization has direct
+        // CPU parity coverage.
+        constexpr int E128 = 128;
+        Tensor router128 = router;
+        router128.shape[0] = E128;
+        Tensor bias128 = bias;
+        bias128.shape[0] = E128;
+        Tensor gate_up128 = gate_up;
+        gate_up128.shape[0] = E128 * 2 * I;
+        Tensor down128 = down;
+        down128.shape[0] = E128 * H;
+        std::vector<const Tensor*> inputs128 = {
+            &x, &router128, &gate_up128, &down128, &bias128};
+        GraphNode moe128 = moe;
+        moe128.params.i32[1] = E128;
+        mb.begin_graph();
+        mb.dispatch(moe128, inputs128, &out, nullptr);
+        mb.end_graph();
+        ref_ok = kernel_qwen3_moe(
+            inputs128, ref, nullptr, H, E128, TOP, I, I,
+            1, true, false, 1, 1, 1.0f, false, 4);
+        CHECK(ref_ok,
+              "CPU reference 128-expert native-BG128 MoE decode");
+        CHECK(close(static_cast<const float*>(out.data), ref_data.data(), H,
+                    2e-3f, 3e-2f),
+              "Metal 128-expert native-BG128 MoE matches CPU");
+
+        moe.params.i32[8] = 8;
+        moe.params.i32[9] = 4;
+        mb.begin_graph();
+        mb.dispatch(moe, inputs, &out, nullptr);
+        mb.end_graph();
+        ref_ok = kernel_qwen3_moe(
+            inputs, ref, nullptr, H, E, TOP, I, I,
+            1, true, false, 8, 4, 1.0f, false, 4);
+        CHECK(ref_ok,
+              "CPU reference grouped-sigmoid native-BG128 MoE decode");
+        CHECK(close(static_cast<const float*>(out.data), ref_data.data(), H,
+                    2e-3f, 3e-2f),
+              "Metal grouped-sigmoid native-BG128 MoE matches CPU");
+
+        // Exercise the softmax specialization with non-uniform router logits.
+        auto* router_data = static_cast<__fp16*>(router.data);
+        for (int e = 0; e < E; ++e) {
+            const float coefficient =
+                0.0005f *
+                static_cast<float>((e * 17) % E - E / 2);
+            for (int h = 0; h < H; ++h)
+                router_data[e * H + h] = (__fp16)coefficient;
+        }
+        moe.params.i32[5] = 0;
+        moe.params.i32[8] = 1;
+        moe.params.i32[9] = 1;
+        moe.params.i32[11] = -1;
+        mb.begin_graph();
+        mb.dispatch(moe, inputs, &out, nullptr);
+        mb.end_graph();
+
+        ref_ok = kernel_qwen3_moe(
+            inputs, ref, nullptr, H, E, TOP, I, I,
+            0, true, false, 1, 1, 1.0f, false, -1);
+        CHECK(ref_ok, "CPU reference softmax native-BG128 MoE decode");
+        CHECK(close(static_cast<const float*>(out.data), ref_data.data(), H,
+                    2e-3f, 3e-2f),
+              "Metal softmax native-BG128 MoE matches CPU");
+
+        // Multi-token prefill uses the expert-grouped native-BG128 path. Keep
+        // this separate from the M=1 checks above so route compaction, grouped
+        // activation indexing, and canonical output scatter are all covered.
+        constexpr int PREFILL_S = 64;
+        Tensor prefill_x =
+            make_dev(mb, Precision::FP32, H, PREFILL_S);
+        Tensor prefill_out =
+            make_dev(mb, Precision::FP32, H, PREFILL_S);
+        fill_rand(
+            static_cast<float*>(prefill_x.data),
+            H * PREFILL_S);
+        std::vector<const Tensor*> prefill_inputs = {
+            &prefill_x, &router, &gate_up, &down, &bias};
+        mb.begin_graph();
+        mb.dispatch(moe, prefill_inputs, &prefill_out, nullptr);
+        mb.end_graph();
+
+        std::vector<float> prefill_ref_data(H * PREFILL_S);
+        Tensor prefill_ref = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            H, PREFILL_S, 1, 1, prefill_ref_data.data());
+        ref_ok = kernel_qwen3_moe(
+            prefill_inputs, prefill_ref, nullptr,
+            H, E, TOP, I, I,
+            0, true, false, 1, 1, 1.0f, false, -1);
+        CHECK(ref_ok,
+              "CPU reference grouped native-BG128 MoE prefill");
+        CHECK(close(
+                  static_cast<const float*>(prefill_out.data),
+                  prefill_ref_data.data(), H * PREFILL_S,
+                  2e-3f, 3e-2f),
+              "Metal grouped native-BG128 MoE prefill matches CPU");
+        std::vector<float> prefill_first(
+            static_cast<const float*>(prefill_out.data),
+            static_cast<const float*>(prefill_out.data) +
+                H * PREFILL_S);
+        mb.begin_graph();
+        mb.dispatch(moe, prefill_inputs, &prefill_out, nullptr);
+        mb.end_graph();
+        CHECK(std::memcmp(
+                  prefill_first.data(), prefill_out.data,
+                  prefill_first.size() * sizeof(float)) == 0,
+              "Metal grouped native-BG128 MoE replay is deterministic");
+
+        // The parallel selector is also used for grouped sigmoid routing in
+        // multi-token prefill. Cover its group filtering and correction-bias
+        // path independently from the softmax case above.
+        moe.params.i32[5] = 1;
+        moe.params.i32[8] = 8;
+        moe.params.i32[9] = 4;
+        moe.params.i32[11] = 4;
+        mb.begin_graph();
+        mb.dispatch(moe, prefill_inputs, &prefill_out, nullptr);
+        mb.end_graph();
+        ref_ok = kernel_qwen3_moe(
+            prefill_inputs, prefill_ref, nullptr,
+            H, E, TOP, I, I,
+            1, true, false, 8, 4, 1.0f, false, 4);
+        CHECK(ref_ok,
+              "CPU reference grouped-sigmoid BG128 MoE prefill");
+        CHECK(close(
+                  static_cast<const float*>(prefill_out.data),
+                  prefill_ref_data.data(), H * PREFILL_S,
+                  2e-3f, 3e-2f),
+              "Metal grouped-sigmoid BG128 MoE prefill matches CPU");
+
+        // Force routes to spread evenly across all experts. Each token is a
+        // different one-hot hidden row and owns eight router rows, so every
+        // expert receives exactly two routes. This exercises the adaptive
+        // grouped-MoE Route16 branch; the concentrated cases above select
+        // Route32.
+        std::memset(router.data, 0, router.nbytes());
+        std::memset(prefill_x.data, 0, prefill_x.nbytes());
+        router_data = static_cast<__fp16*>(router.data);
+        auto* spread_x =
+            static_cast<float*>(prefill_x.data);
+        for (int token = 0; token < PREFILL_S; ++token) {
+            const int hidden = token % H;
+            spread_x[token * H + hidden] = 1.0f;
+            for (int rank = 0; rank < TOP; ++rank) {
+                const int expert =
+                    (hidden * TOP + rank) % E;
+                router_data[expert * H + hidden] =
+                    (__fp16)(1.0f + 0.01f * rank);
+            }
+        }
+        moe.params.i32[5] = 0;
+        moe.params.i32[8] = 1;
+        moe.params.i32[9] = 1;
+        moe.params.i32[11] = -1;
+        mb.begin_graph();
+        mb.dispatch(moe, prefill_inputs, &prefill_out, nullptr);
+        mb.end_graph();
+        ref_ok = kernel_qwen3_moe(
+            prefill_inputs, prefill_ref, nullptr,
+            H, E, TOP, I, I,
+            0, true, false, 1, 1, 1.0f, false, -1);
+        CHECK(ref_ok,
+              "CPU reference spread-route BG128 MoE prefill");
+        CHECK(close(
+                  static_cast<const float*>(prefill_out.data),
+                  prefill_ref_data.data(), H * PREFILL_S,
+                  2e-3f, 3e-2f),
+              "Metal spread-route Route16 MoE prefill matches CPU");
+    }
+
+    // ---- Resident native-BG32 MoE decode and grouped prefill --------------
+    // Package W4G32 tensors use embedded per-eight-channel scales and signed
+    // two's-complement nibbles. Cover both the selected decode kernel and the
+    // expert-grouped prefill kernel against the CPU packed-BG32 path.
+    if (mb.has_tensor_path()) {
+        struct alignas(16) Q4B8G32Block {
+            float scales[8];
+            uint8_t q[8][16];
+        };
+        static_assert(sizeof(Q4B8G32Block) == 160);
+        constexpr int H = 128;
+        constexpr int I = 128;
+        constexpr int E = 128;
+        constexpr int TOP = 8;
+        constexpr int GPR = H / 32;
+        constexpr int GU_ROWS = E * 2 * I;
+        constexpr int DOWN_ROWS = E * H;
+        constexpr int GU_BLOCKS = (GU_ROWS / 8) * GPR;
+        constexpr int DOWN_BLOCKS = (DOWN_ROWS / 8) * GPR;
+        std::vector<Q4B8G32Block> packed(
+            GU_BLOCKS + DOWN_BLOCKS);
+        for (size_t block = 0; block < packed.size(); ++block) {
+            for (int channel = 0; channel < 8; ++channel) {
+                packed[block].scales[channel] =
+                    0.001f *
+                    static_cast<float>(1 + (block + channel) % 5);
+                for (int byte = 0; byte < 16; ++byte) {
+                    const int lo =
+                        static_cast<int>(
+                            (block * 13 + channel * 3 + byte) % 16) -
+                        8;
+                    const int hi =
+                        static_cast<int>(
+                            (block * 5 + channel + byte * 3) % 16) -
+                        8;
+                    packed[block].q[channel][byte] =
+                        static_cast<uint8_t>(
+                            ((hi & 15) << 4) | (lo & 15));
+                }
+            }
+        }
+        CHECK(mb.register_weight_region(
+                  packed.data(),
+                  packed.size() * sizeof(Q4B8G32Block)),
+              "register native-BG32 MoE weight region");
+
+        auto make_bg32 = [&](int rows, int k,
+                             Q4B8G32Block* data) {
+            Tensor weight = Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL,
+                rows, k, 1, 1, data);
+            weight.group_size = 32;
+            weight.groups_per_row = k / 32;
+            weight.num_groups =
+                static_cast<uint32_t>(
+                    rows * weight.groups_per_row);
+            weight.is_q4_g32_packed = true;
+            weight.q4_g32_data = data;
+            mb.wrap_weight_int4(weight, true);
+            return weight;
+        };
+        Tensor gate_up =
+            make_bg32(GU_ROWS, H, packed.data());
+        Tensor down = make_bg32(
+            DOWN_ROWS, I, packed.data() + GU_BLOCKS);
+        Tensor router =
+            make_dev(mb, Precision::FP16, E, H);
+        Tensor bias =
+            make_dev(mb, Precision::FP32, E, 1);
+        std::memset(router.data, 0, router.nbytes());
+        auto* bias_data = static_cast<float*>(bias.data);
+        for (int expert = 0; expert < E; ++expert)
+            bias_data[expert] =
+                0.01f *
+                    static_cast<float>((expert * 37) % E) -
+                0.64f;
+
+        GraphNode moe;
+        moe.op_type = OpType::MOE;
+        moe.params.i32 = {
+            H, E, TOP, I, I, 1, 1, 0, 8, 4, 0, 4, -1, -1};
+        moe.params.f32 = {1.0f, 0.0f};
+
+        Tensor x =
+            make_dev(mb, Precision::FP32, H, 1);
+        Tensor out =
+            make_dev(mb, Precision::FP32, H, 1);
+        fill_rand(static_cast<float*>(x.data), H);
+        std::vector<const Tensor*> inputs = {
+            &x, &router, &gate_up, &down, &bias};
+        mb.begin_graph();
+        mb.dispatch(moe, inputs, &out, nullptr);
+        mb.end_graph();
+
+        std::vector<float> ref_data(H);
+        Tensor ref = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            H, 1, 1, 1, ref_data.data());
+        bool ref_ok = kernel_qwen3_moe(
+            inputs, ref, nullptr, H, E, TOP, I, I,
+            1, true, false, 8, 4, 1.0f, false, 4);
+        CHECK(ref_ok, "CPU reference native-BG32 MoE decode");
+        CHECK(close(
+                  static_cast<const float*>(out.data),
+                  ref_data.data(), H, 2e-4f, 3e-3f),
+              "Metal resident native-BG32 MoE matches CPU");
+
+        constexpr int PREFILL_S = 64;
+        Tensor prefill_x =
+            make_dev(mb, Precision::FP32, H, PREFILL_S);
+        Tensor prefill_out =
+            make_dev(mb, Precision::FP32, H, PREFILL_S);
+        fill_rand(
+            static_cast<float*>(prefill_x.data),
+            H * PREFILL_S);
+        std::vector<const Tensor*> prefill_inputs = {
+            &prefill_x, &router, &gate_up, &down, &bias};
+        mb.begin_graph();
+        mb.dispatch(
+            moe, prefill_inputs, &prefill_out, nullptr);
+        mb.end_graph();
+
+        std::vector<float> prefill_ref_data(
+            H * PREFILL_S);
+        Tensor prefill_ref = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            H, PREFILL_S, 1, 1, prefill_ref_data.data());
+        ref_ok = kernel_qwen3_moe(
+            prefill_inputs, prefill_ref, nullptr,
+            H, E, TOP, I, I,
+            1, true, false, 8, 4, 1.0f, false, 4);
+        CHECK(ref_ok,
+              "CPU reference grouped native-BG32 MoE prefill");
+        CHECK(close(
+                  static_cast<const float*>(prefill_out.data),
+                  prefill_ref_data.data(), H * PREFILL_S,
+                  2e-3f, 3e-2f),
+              "Metal grouped native-BG32 MoE prefill matches CPU");
     }
 
     if (failures == 0) printf("All Metal op parity tests passed.\n");

@@ -387,7 +387,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             // Alias this weight into the registered device weight buffer NOW,
             // while t.data still points at the raw mmap region (before any CPU
             // load-time repacking rewrites t.data to an out-of-region buffer).
-            // INT4 g128 weights need a second pass after quant metadata is set
+            // Packed INT4 weights need a second pass after quant metadata is set
             // (see finalize_metal_weight) to decode the packed block layout.
             if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
                 as_metal(metal_backend_)->wrap_weight(t);
@@ -395,15 +395,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         };
 
 #ifdef MOLLM_METAL
-        // Second pass for INT4 g128 weights: once quant metadata + q4_g128_data
-        // are populated, decode the CPU Q4B8G128Block layout into a Metal raw
-        // nibble+scale device buffer. No-op for non-INT4 weights.
+        // Once packed-INT4 metadata is populated, decode ordinary linear
+        // weights into a Metal raw nibble+scale sidecar. Aggregate experts
+        // remain in their native BG32/BG128 package layout.
         auto finalize_metal_weight = [&]() {
             if (metal_backend_ && exec_ctx.backend == metal_backend_.get()) {
                 bool is_aggregate_expert =
                     wref.find("_experts_") != std::string::npos;
                 as_metal(metal_backend_)
-                    ->wrap_weight_int4_g128(t, is_aggregate_expert);
+                    ->wrap_weight_int4(t, is_aggregate_expert);
             }
         };
 #else
@@ -814,6 +814,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
     exec_ctx_prefill_.moe_hash_cross_layer_prefetch = false;
     exec_ctx_decode_.moe_cross_layer_prefetch =
+        cfg_.moe_ssd_cache_bytes != 0 &&
         !cfg_.metal_ssd_full && cfg_.moe_ssd_global_cache &&
         cfg_.moe_ssd_cross_layer_prefetch;
     exec_ctx_decode_.moe_hash_cross_layer_prefetch =
@@ -862,13 +863,16 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     }
     std::string pf_path, dc_path, vi_path;
     {
-        std::string tok_tmp;
+        std::string tok_tmp, jinja_tmp;
         if (!load_package(cfg.package_path, pf_path, dc_path, vi_path,
-                          tok_tmp)) {
+                          tok_tmp, jinja_tmp)) {
             return false;
         }
         if (!tok_tmp.empty()) {
             cfg_.tokenizer_path = tok_tmp;
+        }
+        if (!jinja_tmp.empty()) {
+            cfg_.chat_template_path = jinja_tmp;
         }
     }
 

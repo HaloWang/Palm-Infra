@@ -238,7 +238,6 @@ if(MOLLM_METAL)
     else()
         message(STATUS "Metal 4 tensor API not available — simdgroup GEMM only")
     endif()
-
     add_custom_command(
         OUTPUT ${MOLLM_METAL_AIR}
         COMMAND xcrun -sdk macosx metal ${MOLLM_METAL_FLAGS} -c ${MOLLM_METAL_SRC}
@@ -398,6 +397,20 @@ if(MOLLM_BUILD_TESTS)
         target_link_libraries(bench_metal_moe PRIVATE mollm_lib)
         set_source_files_properties(
             tests/bench_metal_moe.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
+        add_executable(
+            bench_metal_w4_gemv tests/bench_metal_w4_gemv.mm)
+        target_link_libraries(bench_metal_w4_gemv PRIVATE mollm_lib)
+        set_source_files_properties(
+            tests/bench_metal_w4_gemv.mm
+            PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
+
+        add_executable(
+            bench_metal_w4_gemm tests/bench_metal_w4_gemm.mm)
+        target_link_libraries(bench_metal_w4_gemm PRIVATE mollm_lib)
+        set_source_files_properties(
+            tests/bench_metal_w4_gemm.mm
             PROPERTIES COMPILE_OPTIONS "-fobjc-arc")
     endif()
 endif()

@@ -18,7 +18,12 @@ struct ChatMessage {
 
 class Tokenizer {
 public:
-    bool load(const std::string& tokenizer_json_path);
+    // Load the tokenizer and, when available, the package's authoritative
+    // Jinja chat template. `architecture` is only a compatibility fallback
+    // for old packages that did not embed their template.
+    bool load(const std::string& tokenizer_json_path,
+              const std::string& chat_template_path = {},
+              const std::string& architecture = {});
 
     std::vector<int> encode(const std::string& text) const;
     std::string decode(const std::vector<int>& ids) const;
@@ -47,6 +52,24 @@ public:
 
 private:
     enum class Format { HF_BPE, RWKV_WORLD } format_ = Format::HF_BPE;
+    enum class ChatTemplateStyle {
+        AUTO,
+        CHATML_PLAIN,
+        CHATML_THINKING,
+        LLAMA3_HEADERS,
+        ROLE_TOKENS,
+        ROLE_MIDDLE,
+        DEEPSEEK_V4,
+    };
+    ChatTemplateStyle chat_template_style_ = ChatTemplateStyle::AUTO;
+
+    enum class PreTokenizerStyle {
+        QWEN_SINGLE_DIGIT,
+        DIGIT_TRIPLES_CJK,
+    };
+    PreTokenizerStyle pre_tokenizer_style_ =
+        PreTokenizerStyle::QWEN_SINGLE_DIGIT;
+
     std::unordered_map<std::string, int> vocab_;
     std::vector<std::string> id_to_piece_;
 
@@ -77,6 +100,8 @@ private:
     std::vector<std::string> rwkv_id_to_bytes_;
     bool rwkv_legacy_chat_template_ = false;
     bool load_impl(const std::string& path);
+    bool configure_chat_template(const std::string& path,
+                                 const std::string& architecture);
     bool load_rwkv_vocab(const std::string& path);
     std::vector<int> encode_rwkv(const std::string& text) const;
 

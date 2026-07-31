@@ -43,10 +43,13 @@ void Tokenizer::build_byte_tables() {
 
 // --- Load tokenizer.json ---------------------------------------------------
 
-bool Tokenizer::load(const std::string& path) {
+bool Tokenizer::load(const std::string& path,
+                     const std::string& chat_template_path,
+                     const std::string& architecture) {
     Tokenizer loaded;
     try {
-        if (!loaded.load_impl(path))
+        if (!loaded.load_impl(path) ||
+            !loaded.configure_chat_template(chat_template_path, architecture))
             return false;
     } catch (const std::exception& e) {
         fprintf(stderr, "tokenizer: failed to load %s: %s\n", path.c_str(),
@@ -54,6 +57,82 @@ bool Tokenizer::load(const std::string& path) {
         return false;
     }
     *this = std::move(loaded);
+    return true;
+}
+
+bool Tokenizer::configure_chat_template(const std::string& path,
+                                        const std::string& architecture) {
+    std::string source;
+    if (!path.empty()) {
+        std::ifstream file(path, std::ios::binary);
+        if (!file.is_open()) {
+            fprintf(stderr, "tokenizer: cannot open chat template %s\n",
+                    path.c_str());
+            return false;
+        }
+        file.seekg(0, std::ios::end);
+        const std::streamoff size = file.tellg();
+        if (size < 0) {
+            fprintf(stderr, "tokenizer: cannot size chat template %s\n",
+                    path.c_str());
+            return false;
+        }
+        source.resize(static_cast<size_t>(size));
+        file.seekg(0, std::ios::beg);
+        if (!source.empty() &&
+            !file.read(source.data(), static_cast<std::streamsize>(source.size()))) {
+            fprintf(stderr, "tokenizer: cannot read chat template %s\n",
+                    path.c_str());
+            return false;
+        }
+    }
+
+    // We intentionally implement the plain text-generation branches used by
+    // the CLI rather than embedding a general-purpose Jinja interpreter.
+    // Unlike special-token guessing, the packaged template source
+    // unambiguously identifies templates that share the same vocabulary.
+    if (source.find("<｜im▁middle｜>") != std::string::npos &&
+        source.find("<｜im▁end｜>") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::ROLE_MIDDLE;
+    } else if (source.find("<|User|>") != std::string::npos &&
+               source.find("<|Assistant|>") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::ROLE_TOKENS;
+    } else if (source.find("<|im_start|>") != std::string::npos) {
+        // Qwen3's default template starts generation immediately after the
+        // assistant header. It only emits an empty thinking block when the
+        // caller explicitly sets enable_thinking=false. Do not mistake that
+        // optional branch for templates (such as Qwen3.5's) that emit the
+        // block by default.
+        const bool explicit_disable_only =
+            source.find("enable_thinking is defined and enable_thinking is false") !=
+                std::string::npos &&
+            source.find("enable_thinking is defined and enable_thinking is true") ==
+                std::string::npos;
+        chat_template_style_ =
+            source.find("<think>") != std::string::npos &&
+                    !explicit_disable_only
+                ? ChatTemplateStyle::CHATML_THINKING
+                : ChatTemplateStyle::CHATML_PLAIN;
+    } else if (source.find("<|start_header_id|>") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::LLAMA3_HEADERS;
+    } else if (source.find("<｜User｜>") != std::string::npos &&
+               source.find("<｜Assistant｜>") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::DEEPSEEK_V4;
+    } else if (!source.empty()) {
+        fprintf(stderr,
+                "tokenizer: unrecognized packaged chat template; using "
+                "special-token compatibility fallback\n");
+    }
+
+    if (source.empty()) {
+        // Compatibility for already-converted packages. New conversions
+        // should embed the source template instead.
+        if (architecture == "qwen3") {
+            chat_template_style_ = ChatTemplateStyle::CHATML_PLAIN;
+        } else if (architecture == "deepseek-v4") {
+            chat_template_style_ = ChatTemplateStyle::DEEPSEEK_V4;
+        }
+    }
     return true;
 }
 
@@ -83,6 +162,35 @@ bool Tokenizer::load_impl(const std::string& path) {
     }
 
     build_byte_tables();
+
+    // Most supported BPE tokenizers use the Qwen/Llama single-regex
+    // pre-tokenizer below. Some MoE checkpoints instead apply two isolated
+    // splits before their main regex: Unicode numbers in groups of at most
+    // three, then contiguous CJK/Kana text. Detect that tokenizer-defined
+    // pipeline rather than tying the behavior to a model name.
+    if (root.contains("pre_tokenizer")) {
+        const auto& pre = root["pre_tokenizer"];
+        if (pre.value("type", "") == "Sequence" &&
+            pre.contains("pretokenizers")) {
+            bool digit_triples = false;
+            bool cjk_split = false;
+            for (const auto& step : pre["pretokenizers"]) {
+                if (step.value("type", "") != "Split" ||
+                    !step.contains("pattern") ||
+                    !step["pattern"].contains("Regex")) {
+                    continue;
+                }
+                const std::string pattern =
+                    step["pattern"]["Regex"].get<std::string>();
+                digit_triples |= pattern == "\\p{N}{1,3}";
+                cjk_split |= pattern.find("[一-龥") != std::string::npos;
+            }
+            if (digit_triples && cjk_split) {
+                pre_tokenizer_style_ =
+                    PreTokenizerStyle::DIGIT_TRIPLES_CJK;
+            }
+        }
+    }
 
     const auto& vocab_obj = root["model"]["vocab"];
     int max_id = 0;
@@ -144,6 +252,8 @@ bool Tokenizer::load_impl(const std::string& path) {
         eos_id_ = added_tokens_["<|end_of_text|>"];
     else if (added_tokens_.count("<|im_end|>"))
         eos_id_ = added_tokens_["<|im_end|>"];
+    else if (added_tokens_.count("<｜im▁end｜>"))
+        eos_id_ = added_tokens_["<｜im▁end｜>"];
     else if (added_tokens_.count("<｜end▁of▁sentence｜>"))
         eos_id_ = added_tokens_["<｜end▁of▁sentence｜>"];
 
@@ -210,6 +320,39 @@ static bool is_cjk_or_kana_letter(int cp) {
            (cp >= 0x3105 && cp <= 0x312F);     // Bopomofo
 }
 
+static bool is_digit_triple_number(int cp) {
+    return (cp >= '0' && cp <= '9') ||
+           (cp >= 0x0660 && cp <= 0x0669) ||   // Arabic-Indic
+           (cp >= 0x06F0 && cp <= 0x06F9) ||   // Extended Arabic-Indic
+           (cp >= 0x0966 && cp <= 0x096F) ||   // Devanagari
+           (cp >= 0x09E6 && cp <= 0x09EF) ||   // Bengali
+           (cp >= 0x0E50 && cp <= 0x0E59) ||   // Thai
+           (cp >= 0xFF10 && cp <= 0xFF19);     // Fullwidth
+}
+
+static bool is_exact_cjk_split_letter(int cp) {
+    return (cp >= 0x4E00 && cp <= 0x9FA5) ||
+           (cp >= 0x3040 && cp <= 0x309F) ||
+           (cp >= 0x30A0 && cp <= 0x30FF);
+}
+
+static bool is_unicode_symbol(int cp) {
+    return (cp >= 0x20A0 && cp <= 0x20CF) ||   // Currency symbols
+           (cp >= 0x2100 && cp <= 0x214F) ||   // Letterlike symbols
+           (cp >= 0x2190 && cp <= 0x2BFF) ||   // Arrows/math/technical
+           (cp >= 0x1F000 && cp <= 0x1FAFF);
+}
+
+static bool is_punctuation_or_symbol(int cp) {
+    if ((cp >= '!' && cp <= '/') ||
+        (cp >= ':' && cp <= '@') ||
+        (cp >= '[' && cp <= '`') ||
+        (cp >= '{' && cp <= '~')) {
+        return true;
+    }
+    return is_common_unicode_punctuation(cp) || is_unicode_symbol(cp);
+}
+
 static bool is_letter(int cp) {
     if (cp >= 'A' && cp <= 'Z') return true;
     if (cp >= 'a' && cp <= 'z') return true;
@@ -218,7 +361,10 @@ static bool is_letter(int cp) {
     // Approximate Unicode \p{L}/\p{M} for scripts outside the CJK ranges used
     // by our fixtures. Keep common Unicode punctuation out so it can follow
     // the punctuation branch instead of being folded into letter runs.
-    if (cp > 0x7F && !is_common_unicode_punctuation(cp)) return true;
+    if (cp > 0x7F && !is_common_unicode_punctuation(cp) &&
+        !is_digit_triple_number(cp) && !is_unicode_symbol(cp)) {
+        return true;
+    }
     return false;
 }
 
@@ -265,19 +411,8 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
     std::vector<std::string> out;
     if (text.empty()) return out;
 
-    struct Span { int start; int end; bool is_cjk; };
-    std::vector<Span> spans = {{0, (int)text.size(), false}};
-
-    // Apply the tokenizer.json Split regex.
-    //
-    // The regex tries alternatives in order at each position:
-    //   1. (?i:'s|'t|'re|'ve|'m|'ll|'d)
-    //   2. [^\r\n\p{L}\p{N}]?[\p{L}\p{M}]+
-    //   3. \p{N}
-    //   4.  ?[^\s\p{L}\p{M}\p{N}]+[\r\n]*
-    //   5. \s*[\r\n]+
-    //   6. \s+(?!\S)  — whitespace NOT followed by non-whitespace (backtracks)
-    //   7. \s+
+    const bool digit_triples_cjk =
+        pre_tokenizer_style_ == PreTokenizerStyle::DIGIT_TRIPLES_CJK;
 
     auto emit = [&](int abs_start, int abs_end) {
         if (abs_end > abs_start)
@@ -307,26 +442,73 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
         return 0;
     };
 
-    for (auto& span : spans) {
-        if (span.is_cjk) {
-            out.push_back(text.substr(span.start, span.end - span.start));
-            continue;
-        }
-
-        CharReader r{text.c_str() + span.start, span.end - span.start};
+    {
+        CharReader r{text.c_str(), (int)text.size()};
 
         while (r.pos < r.size) {
             int start = r.pos;
             int len;
             int cp = r.peek_cp(len);
 
-            // --- Alt 1: contraction ---
-            {
+            // The multi-stage tokenizer isolates number chunks and CJK/Kana
+            // runs before applying its main regex.
+            if (digit_triples_cjk && is_digit_triple_number(cp)) {
+                int count = 0;
+                while (r.pos < r.size && count < 3) {
+                    int l;
+                    int c = r.peek_cp(l);
+                    if (!is_digit_triple_number(c)) break;
+                    r.advance(l);
+                    count++;
+                }
+                emit(start, r.pos);
+                continue;
+            }
+            if (digit_triples_cjk && is_exact_cjk_split_letter(cp)) {
+                while (r.pos < r.size) {
+                    int l;
+                    int c = r.peek_cp(l);
+                    if (!is_exact_cjk_split_letter(c)) break;
+                    r.advance(l);
+                }
+                emit(start, r.pos);
+                continue;
+            }
+
+            // Main-regex alternative 1. The traditional profile has explicit
+            // contractions. The staged profile uses ASCII punctuation plus an
+            // ASCII letter run, which covers those contractions as well as
+            // pieces such as "@interface" and ",world".
+            if (!digit_triples_cjk) {
                 int ct = try_contraction(r);
                 if (ct > 0) {
                     r.pos += ct;
-                    emit(span.start + start, span.start + r.pos);
+                    emit(start, r.pos);
                     continue;
+                }
+            } else if (is_punctuation_or_symbol(cp) && cp < 0x80) {
+                const int punct_len = len;
+                const int next_pos = r.pos + punct_len;
+                if (next_pos < r.size) {
+                    int next_len;
+                    const int next =
+                        utf8_codepoint(r.data + next_pos,
+                                      r.size - next_pos, next_len);
+                    if ((next >= 'A' && next <= 'Z') ||
+                        (next >= 'a' && next <= 'z')) {
+                        r.advance(punct_len);
+                        while (r.pos < r.size) {
+                            int l;
+                            const int c = r.peek_cp(l);
+                            if (!((c >= 'A' && c <= 'Z') ||
+                                  (c >= 'a' && c <= 'z'))) {
+                                break;
+                            }
+                            r.advance(l);
+                        }
+                        emit(start, r.pos);
+                        continue;
+                    }
                 }
             }
 
@@ -338,13 +520,23 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             {
                 int save = r.pos;
 
-                // Optional prefix: non-newline, non-letter, non-digit
-                if (!is_newline(cp) && !is_letter(cp) && !is_digit(cp) && cp != -1) {
+                // The staged regex excludes punctuation and symbols from its
+                // optional prefix. It must also leave a space before an
+                // already-isolated CJK run as a separate piece.
+                const bool prefix_allowed =
+                    digit_triples_cjk
+                        ? (!is_newline(cp) && !is_letter(cp) &&
+                           !is_punctuation_or_symbol(cp) && cp != -1)
+                        : (!is_newline(cp) && !is_letter(cp) &&
+                           !is_digit(cp) && cp != -1);
+                if (prefix_allowed) {
                     int next_pos = r.pos + len;
                     if (next_pos < r.size) {
                         int l2;
                         int cp2 = utf8_codepoint(r.data + next_pos, r.size - next_pos, l2);
-                        if (is_letter(cp2)) {
+                        if (is_letter(cp2) &&
+                            !(digit_triples_cjk &&
+                              is_exact_cjk_split_letter(cp2))) {
                             r.advance(len);
                         }
                     }
@@ -352,13 +544,15 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
 
                 int flen;
                 int fcp = r.peek_cp(flen);
-                if (is_letter(fcp)) {
+                if (is_letter(fcp) &&
+                    !(digit_triples_cjk &&
+                      is_exact_cjk_split_letter(fcp))) {
                     while (r.pos < r.size) {
                         int l; int c = r.peek_cp(l);
-                        if (!is_letter(c)) break;
+                        if (!is_letter(c) && !is_unicode_mark(c)) break;
                         r.advance(l);
                     }
-                    emit(span.start + start, span.start + r.pos);
+                    emit(start, r.pos);
                     continue;
                 }
 
@@ -369,10 +563,10 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
             cp = r.peek_cp(len);
             start = r.pos;
 
-            // --- Alt 3: single digit ---
+            // --- Alt 3: single digit (traditional profile) ---
             if (is_digit(cp)) {
                 r.advance(len);
-                emit(span.start + start, span.start + r.pos);
+                emit(start, r.pos);
                 continue;
             }
 
@@ -387,26 +581,40 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                     if (next_pos < r.size) {
                         int l2;
                         int cp2 = utf8_codepoint(r.data + next_pos, r.size - next_pos, l2);
-                        if (!is_whitespace(cp2) && !is_letter(cp2) && !is_digit(cp2) && !is_newline(cp2)) {
+                        const bool punct =
+                            digit_triples_cjk
+                                ? is_punctuation_or_symbol(cp2)
+                                : (!is_whitespace(cp2) && !is_letter(cp2) &&
+                                   !is_digit(cp2) && !is_newline(cp2));
+                        if (punct) {
                             r.advance(len);
                             cp = cp2;
                             len = l2;
                         }
                     }
                 }
-                if (!(r.pos < r.size &&
-                      !is_whitespace(cp) && !is_letter(cp) && !is_digit(cp) && !is_newline(cp))) {
+                const bool punct =
+                    digit_triples_cjk
+                        ? is_punctuation_or_symbol(cp)
+                        : (!is_whitespace(cp) && !is_letter(cp) &&
+                           !is_digit(cp) && !is_newline(cp));
+                if (!(r.pos < r.size && punct)) {
                     r.pos = save;
                 } else {
                     start = save;
                     while (r.pos < r.size) {
                         int l; int c = r.peek_cp(l);
-                        if (is_whitespace(c) || is_letter(c) || is_digit(c)) break;
+                        const bool is_punct =
+                            digit_triples_cjk
+                                ? is_punctuation_or_symbol(c)
+                                : (!is_whitespace(c) && !is_letter(c) &&
+                                   !is_digit(c));
+                        if (!is_punct) break;
                         r.advance(l);
                     }
                     while (r.pos < r.size && (r.data[r.pos] == '\r' || r.data[r.pos] == '\n'))
                         r.advance(1);
-                    emit(span.start + start, span.start + r.pos);
+                    emit(start, r.pos);
                     continue;
                 }
             }
@@ -426,7 +634,7 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                         if (!is_newline(nc)) break;
                         r.advance(nl);
                     }
-                    emit(span.start + start, span.start + r.pos);
+                    emit(start, r.pos);
                     continue;
                 }
                 r.pos = save;
@@ -461,13 +669,13 @@ std::vector<std::string> Tokenizer::pre_tokenize(const std::string& text) const 
                         }
                     }
                 }
-                emit(span.start + start, span.start + r.pos);
+                emit(start, r.pos);
                 continue;
             }
 
             // Fallback: single character
             r.advance(len);
-            emit(span.start + start, span.start + r.pos);
+            emit(start, r.pos);
         }
     }
 
@@ -689,17 +897,84 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
         for (const auto& message : messages) prompt += message.content;
         return encode(prompt);
     }
-    // Detect chat format from available special tokens.
+    // Old packages did not always embed their chat template. Retain the
+    // special-token inference only as a compatibility fallback.
+    // Role-middle:
+    //   <｜User｜>user<｜im▁middle｜>{content}<｜im▁end｜>
     // DeepSeek-V4:
     //   <｜User｜>{content}<｜Assistant｜></think>
     // ChatML (Qwen3.5): <|im_start|>{role}\n{content}<|im_end|>\n
     // Llama-3 (Youtu-LLM-2B): <|start_header_id|>{role}<|end_header_id|>\n\n{content}<|eot_id|>
-    bool use_deepseek_v4 = (added_tokens_.count("<｜User｜>") > 0 &&
-                            added_tokens_.count("<｜Assistant｜>") > 0);
-    bool use_chatml = (added_tokens_.count("<|im_start|>") > 0);
+    ChatTemplateStyle style = chat_template_style_;
+    if (style == ChatTemplateStyle::AUTO) {
+        const bool role_middle =
+            added_tokens_.count("<｜User｜>") > 0 &&
+            added_tokens_.count("<｜Assistant｜>") > 0 &&
+            added_tokens_.count("<｜im▁middle｜>") > 0 &&
+            added_tokens_.count("<｜im▁end｜>") > 0;
+        if (role_middle) {
+            style = ChatTemplateStyle::ROLE_MIDDLE;
+        } else if (added_tokens_.count("<｜User｜>") > 0 &&
+                   added_tokens_.count("<｜Assistant｜>") > 0) {
+            style = ChatTemplateStyle::DEEPSEEK_V4;
+        } else if (added_tokens_.count("<|im_start|>") > 0) {
+            style = ChatTemplateStyle::CHATML_THINKING;
+        } else {
+            style = ChatTemplateStyle::LLAMA3_HEADERS;
+        }
+    }
 
     std::string prompt;
-    if (use_deepseek_v4) {
+    if (style == ChatTemplateStyle::ROLE_MIDDLE) {
+        prompt = "<｜begin▁of▁sentence｜>";
+        int last_user_index = -1;
+        for (size_t i = 0; i < messages.size(); ++i) {
+            if (messages[i].role == "user")
+                last_user_index = static_cast<int>(i);
+        }
+        auto trim = [](const std::string& text) {
+            const size_t begin = text.find_first_not_of(" \t\r\n");
+            if (begin == std::string::npos) return std::string();
+            const size_t end = text.find_last_not_of(" \t\r\n");
+            return text.substr(begin, end - begin + 1);
+        };
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            if (msg.role == "system") {
+                prompt += "<｜System｜>system<｜im▁middle｜>" +
+                          msg.content + "<｜im▁end｜>";
+            } else if (msg.role == "user") {
+                prompt += "<｜User｜>user<｜im▁middle｜>" +
+                          msg.content + "<｜im▁end｜>";
+            } else if (msg.role == "assistant") {
+                std::string reasoning;
+                std::string content = msg.content;
+                const size_t think_end = content.rfind("</think>");
+                if (think_end != std::string::npos) {
+                    reasoning = content.substr(0, think_end);
+                    const size_t think_begin = reasoning.rfind("<think>");
+                    if (think_begin != std::string::npos)
+                        reasoning.erase(0, think_begin + 7);
+                    content.erase(0, think_end + 8);
+                } else if (content.rfind("<think>", 0) == 0) {
+                    reasoning = content.substr(7);
+                    content.clear();
+                }
+                prompt +=
+                    "<｜Assistant｜>assistant<｜im▁middle｜><think>\n";
+                if (static_cast<int>(i) > last_user_index)
+                    prompt += trim(reasoning);
+                prompt += "\n</think>\n\n";
+                prompt += trim(content);
+                prompt += "<｜im▁end｜>";
+            }
+            // Developer/tool messages require the tool-aware branch of the
+            // Jinja template and are intentionally omitted by the plain chat
+            // CLI, matching the tokenizer's no-tools behavior.
+        }
+        prompt +=
+            "<｜Assistant｜>assistant<｜im▁middle｜><think>\n";
+    } else if (style == ChatTemplateStyle::DEEPSEEK_V4) {
         prompt = "<｜begin▁of▁sentence｜>";
         for (const auto& msg : messages) {
             if (msg.role == "user" || msg.role == "developer") {
@@ -719,16 +994,31 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
         }
         if (!messages.empty() && messages.back().role != "assistant")
             prompt += "<｜Assistant｜></think>";
-    } else if (use_chatml) {
-        // ChatML format (no BOS token for Qwen3.5).
-        // Qwen3.5 template: appends \n<think>\n\n</think>\n\n after assistant header
-        // when enable_thinking is true (default).
+    } else if (style == ChatTemplateStyle::CHATML_PLAIN ||
+               style == ChatTemplateStyle::CHATML_THINKING) {
+        // ChatML format (no BOS token).
         for (size_t i = 0; i < messages.size(); i++) {
             const auto& msg = messages[i];
             prompt += "<|im_start|>" + msg.role + "\n" + msg.content + "<|im_end|>\n";
         }
-        // Prime assistant response with thinking tags
-        prompt += "<|im_start|>assistant\n<think>\n\n</think>\n\n";
+        prompt += "<|im_start|>assistant\n";
+        if (style == ChatTemplateStyle::CHATML_THINKING)
+            prompt += "<think>\n\n</think>\n\n";
+    } else if (style == ChatTemplateStyle::ROLE_TOKENS) {
+        if (bos_id_ >= 0 && bos_id_ < static_cast<int>(id_to_piece_.size()))
+            prompt = id_to_piece_[bos_id_];
+        for (const auto& msg : messages) {
+            if (msg.role == "system") {
+                prompt += msg.content;
+            } else if (msg.role == "user") {
+                prompt += "<|User|>" + msg.content;
+            } else if (msg.role == "assistant") {
+                prompt += "<|Assistant|>" + msg.content +
+                          "<|end_of_text|>";
+            }
+        }
+        if (!messages.empty() && messages.back().role != "assistant")
+            prompt += "<|Assistant|>";
     } else {
         // Llama-3 format
         prompt = "<|begin_of_text|>";

@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <chrono>
 #include <cstdio>
+#include <fstream>
+#include <sstream>
 
 // Pack-A profiling counters (defined in kernels/matmul.cpp)
 extern "C" {
@@ -367,7 +369,21 @@ int main(int argc, char** argv) {
         return error == "help" ? 0 : 1;
     }
 
-    if (opts.prompt.empty() && opts.prompt_tokens <= 0) opts.prompt = "Hello, world!";
+    if (opts.prompt.empty() && !opts.prompt_file.empty()) {
+        std::ifstream prompt_stream(
+            opts.prompt_file, std::ios::in | std::ios::binary);
+        if (!prompt_stream) {
+            std::fprintf(
+                stderr, "bench: cannot open --prompt-file: %s\n",
+                opts.prompt_file.c_str());
+            return 1;
+        }
+        std::ostringstream contents;
+        contents << prompt_stream.rdbuf();
+        opts.prompt = contents.str();
+    }
+    if (opts.prompt.empty() && opts.prompt_tokens <= 0)
+        opts.prompt = "Hello, world!";
 
     Tokenizer tokenizer;
     LLMEngine engine;

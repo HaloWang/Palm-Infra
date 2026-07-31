@@ -77,10 +77,11 @@ public:
     /// shared weight buffer with the correct device_offset (from t.data).
     void wrap_weight(Tensor& t);
 
-    /// Second pass for INT4 g128 weights (call after quant metadata is set):
-    /// decode the CPU Q4B8G128Block layout into a Metal-friendly raw nibble +
-    /// scale device buffer and repoint t at it. No-op for non-INT4 weights.
-    void wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128 = false);
+    /// Second pass for packed INT4 weights (call after quant metadata is set):
+    /// decode ordinary BG32/BG128 linear weights into a Metal-friendly raw
+    /// nibble + scale device buffer. Aggregate expert tensors stay in their
+    /// package-native layout and are consumed directly by MoE kernels.
+    void wrap_weight_int4(Tensor& t, bool keep_native_experts = false);
 
     /// Allocate a device-resident buffer of nbytes and point t at it (used for
     /// KV cache and boundary buffers). Sets t.device_data / t.device_offset and

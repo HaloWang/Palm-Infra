@@ -75,7 +75,9 @@ int main(int argc, char** argv) {
         cfg.package_path = qwen35_package;
         cfg.n_ctx = 64;
         if (tmp.load(cfg) && !tmp.config().tokenizer_path.empty()) {
-            tokenizer.load(tmp.config().tokenizer_path);
+            tokenizer.load(tmp.config().tokenizer_path,
+                           tmp.config().chat_template_path,
+                           tmp.package_metadata().at("architecture"));
         }
     }
     CHECK(tokenizer.vocab_size() > 0, "tokenizer load (from package)");
@@ -124,10 +126,17 @@ int main(int argc, char** argv) {
               "release_prefill_buffers releases reusable prefill workspace");
 
         const std::string old_tokenizer_path = eng.config().tokenizer_path;
+        const std::string old_chat_template_path =
+            eng.config().chat_template_path;
         struct stat tokenizer_stat{};
         CHECK(!old_tokenizer_path.empty() &&
                   stat(old_tokenizer_path.c_str(), &tokenizer_stat) == 0,
               "loaded package tokenizer temp file exists");
+        struct stat chat_template_stat{};
+        CHECK(!old_chat_template_path.empty() &&
+                  stat(old_chat_template_path.c_str(),
+                       &chat_template_stat) == 0,
+              "loaded package chat-template temp file exists");
 
         EngineConfig missing_cfg = cfg;
         missing_cfg.package_path = "/tmp/mollm_missing_reload_test.mollm";
@@ -138,6 +147,9 @@ int main(int argc, char** argv) {
               "failed reload leaves engine empty");
         CHECK(stat(old_tokenizer_path.c_str(), &tokenizer_stat) != 0,
               "reload removes prior package temp files");
+        CHECK(stat(old_chat_template_path.c_str(),
+                   &chat_template_stat) != 0,
+              "reload removes prior package chat-template temp file");
         CHECK(eng.load(cfg), "engine reloads package after failed reload");
         int reloaded_token = eng.prefill({ids[0]});
         CHECK(reloaded_token >= 0,

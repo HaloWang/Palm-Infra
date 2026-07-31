@@ -74,6 +74,51 @@ int main() {
         ran_any = true;
     }
 
+    // Some HF BPE tokenizers isolate Unicode numbers in chunks of at most
+    // three before their main split regex. BPE merges must not cross those
+    // chunk boundaries: "28448" is "284" + "48", not five digits.
+    {
+        const char* path = "/tmp/mollm_digit_triples_tokenizer_test.json";
+        {
+            std::ofstream f(path);
+            f << R"({
+                "model": {
+                    "vocab": {
+                        "2": 0, "8": 1, "4": 2,
+                        "28": 3, "284": 4, "48": 5
+                    },
+                    "merges": [
+                        ["2", "8"], ["28", "4"], ["4", "8"]
+                    ]
+                },
+                "added_tokens": [],
+                "pre_tokenizer": {
+                    "type": "Sequence",
+                    "pretokenizers": [
+                        {
+                            "type": "Split",
+                            "pattern": {"Regex": "\\p{N}{1,3}"},
+                            "behavior": "Isolated",
+                            "invert": false
+                        },
+                        {
+                            "type": "Split",
+                            "pattern": {"Regex": "[一-龥぀-ゟ゠-ヿ]+"},
+                            "behavior": "Isolated",
+                            "invert": false
+                        }
+                    ]
+                }
+            })";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path), "digit-triples HF tokenizer loads");
+        check_ids(tok.encode("28448"), {4, 5},
+                  "digit triples preserve isolated BPE boundaries");
+        std::remove(path);
+        ran_any = true;
+    }
+
     // DeepSeek-V4 uses full-width-bar special tokens and an explicit BOS.
     {
         const char* path = "/tmp/mollm_deepseek_v4_tokenizer_test.json";
@@ -101,6 +146,173 @@ int main() {
             {2, 10, 0, 11, 12, 3, 1, 10, 4, 11, 12},
             "DeepSeek-V4 multi-turn chat preserves assistant prefix");
         std::remove(path);
+        ran_any = true;
+    }
+
+    // Some role-based tokenizers use explicit role names separated from
+    // content by a full-width `im middle` token. This is distinct from the
+    // otherwise similar DeepSeek-V4 marker set.
+    {
+        const char* path = "/tmp/mollm_role_middle_tokenizer_test.json";
+        {
+            std::ofstream f(path);
+            f << R"({
+                "model": {
+                    "vocab": {"a": 0, "b": 1},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 20, "content": "<｜begin▁of▁sentence｜>"},
+                    {"id": 21, "content": "<｜User｜>"},
+                    {"id": 22, "content": "<｜Assistant｜>"},
+                    {"id": 23, "content": "<｜System｜>"},
+                    {"id": 24, "content": "<｜im▁middle｜>"},
+                    {"id": 25, "content": "<｜im▁end｜>"},
+                    {"id": 26, "content": "<think>"},
+                    {"id": 27, "content": "</think>"},
+                    {"id": 28, "content": "user"},
+                    {"id": 29, "content": "assistant"},
+                    {"id": 30, "content": "system"},
+                    {"id": 31, "content": "\n"}
+                ]
+            })";
+        }
+        Tokenizer tok;
+        CHECK(tok.load(path), "role-middle tokenizer loads");
+        CHECK(tok.bos_id() == 20, "role-middle BOS is detected");
+        CHECK(tok.eos_id() == 25, "role-middle EOS is detected");
+        check_ids(
+            tok.apply_chat("a"),
+            {20, 21, 28, 24, 0, 25, 22, 29, 24, 26, 31},
+            "role-middle single-turn chat template");
+        check_ids(
+            tok.apply_chat({
+                {"system", "b"},
+                {"user", "a"},
+            }),
+            {20, 23, 30, 24, 1, 25,
+             21, 28, 24, 0, 25,
+             22, 29, 24, 26, 31},
+            "role-middle system chat template");
+        check_ids(
+            tok.apply_chat({
+                {"user", "a"},
+                {"assistant", "b"},
+                {"user", "a"},
+            }),
+            {20,
+             21, 28, 24, 0, 25,
+             22, 29, 24, 26, 31, 31, 27, 31, 31, 1, 25,
+             21, 28, 24, 0, 25,
+             22, 29, 24, 26, 31},
+            "role-middle multi-turn chat template");
+        std::remove(path);
+        ran_any = true;
+    }
+
+    // The packaged Jinja source disambiguates tokenizers that share the same
+    // ChatML vocabulary but differ in whether generation starts with thinking
+    // tags.
+    {
+        const char* tokenizer_path =
+            "/tmp/mollm_chatml_style_tokenizer_test.json";
+        const char* plain_path =
+            "/tmp/mollm_chatml_plain_template_test.jinja";
+        const char* optional_disable_path =
+            "/tmp/mollm_chatml_optional_disable_template_test.jinja";
+        const char* thinking_path =
+            "/tmp/mollm_chatml_thinking_template_test.jinja";
+        {
+            std::ofstream f(tokenizer_path);
+            f << R"({
+                "model": {
+                    "vocab": {"a": 0},
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 1, "content": "user"},
+                    {"id": 2, "content": "assistant"},
+                    {"id": 3, "content": "\n"},
+                    {"id": 10, "content": "<|im_start|>"},
+                    {"id": 11, "content": "<|im_end|>"},
+                    {"id": 12, "content": "<think>"},
+                    {"id": 13, "content": "</think>"}
+                ]
+            })";
+        }
+        {
+            std::ofstream f(plain_path);
+            f << "{{ '<|im_start|>assistant\\n' }}";
+        }
+        {
+            std::ofstream f(thinking_path);
+            f << "{{ '<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n' }}";
+        }
+        {
+            std::ofstream f(optional_disable_path);
+            f << "{{ '<|im_start|>assistant\\n' }}"
+                 "{% if enable_thinking is defined and enable_thinking is false %}"
+                 "{{ '<think>\\n\\n</think>\\n\\n' }}{% endif %}";
+        }
+
+        Tokenizer tok;
+        CHECK(tok.load(tokenizer_path, plain_path),
+              "plain ChatML template loads");
+        check_ids(tok.apply_chat("a"),
+                  {10, 1, 3, 0, 11, 3, 10, 2, 3},
+                  "plain ChatML does not add thinking tags");
+        CHECK(tok.load(tokenizer_path, optional_disable_path),
+              "optional-disable ChatML template loads");
+        check_ids(tok.apply_chat("a"),
+                  {10, 1, 3, 0, 11, 3, 10, 2, 3},
+                  "default Qwen3 chat does not disable thinking");
+        CHECK(tok.load(tokenizer_path, thinking_path),
+              "thinking ChatML template loads");
+        check_ids(tok.apply_chat("a"),
+                  {10, 1, 3, 0, 11, 3, 10, 2, 3,
+                   12, 3, 3, 13, 3, 3},
+                  "thinking ChatML adds empty thinking block");
+
+        std::remove(tokenizer_path);
+        std::remove(plain_path);
+        std::remove(optional_disable_path);
+        std::remove(thinking_path);
+        ran_any = true;
+    }
+
+    // A role-token template is not equivalent to Llama-3's header template,
+    // even when both tokenizers use the same BOS token.
+    {
+        const char* tokenizer_path =
+            "/tmp/mollm_role_tokens_tokenizer_test.json";
+        const char* template_path =
+            "/tmp/mollm_role_tokens_template_test.jinja";
+        {
+            std::ofstream f(tokenizer_path);
+            f << R"({
+                "model": {"vocab": {"a": 0}, "merges": []},
+                "added_tokens": [
+                    {"id": 20, "content": "<|begin_of_text|>"},
+                    {"id": 21, "content": "<|User|>"},
+                    {"id": 22, "content": "<|Assistant|>"},
+                    {"id": 23, "content": "<|end_of_text|>"}
+                ]
+            })";
+        }
+        {
+            std::ofstream f(template_path);
+            f << "{{ bos_token }}{{ '<|User|>' + content }}"
+                 "{{ '<|Assistant|>' }}";
+        }
+
+        Tokenizer tok;
+        CHECK(tok.load(tokenizer_path, template_path),
+              "role-token template loads");
+        check_ids(tok.apply_chat("a"), {20, 21, 0, 22},
+                  "role-token chat does not use Llama headers");
+
+        std::remove(tokenizer_path);
+        std::remove(template_path);
         ran_any = true;
     }
 

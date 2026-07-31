@@ -88,6 +88,7 @@ void prepare_execution(ExecContext& ctx) {
             node.op_type == OpType::GATED_DELTANET_CONV_DECODE ||
             node.op_type == OpType::SHORTCONV ||
             node.op_type == OpType::RMS_NORM_ROPE ||
+            node.op_type == OpType::QK_RMS_NORM_ROPE ||
             node.op_type == OpType::ADD_RMS_NORM ||
             node.op_type == OpType::DSV4_COMPRESSOR ||
             node.op_type == OpType::DSV4_INDEXER ||
@@ -301,6 +302,10 @@ void execute_graph(ExecContext& ctx) {
             // RESHAPE borrows iff its input is contiguous — known statically.
             borrowed = device_resident ? src.is_contiguous()
                                        : t.shares_storage_with(src);
+        } else if (node.op_type == OpType::CONTIGUOUS &&
+                   !node.inputs.empty()) {
+            const Tensor& src = tensors[node.inputs[0]];
+            borrowed = device_resident && src.is_contiguous();
         }
         borrowed_view[node.id] = borrowed ? 1 : 0;
     }
@@ -456,6 +461,18 @@ void execute_graph(ExecContext& ctx) {
                     src.device_offset + (size_t)offset * src.stride[dim];
                 out.shape[dim] = size;
                 inline_zero_copy_view = true;
+            } else if (node.op_type == OpType::CONTIGUOUS &&
+                       src.is_contiguous()) {
+                const int64_t shape[4] = {
+                    out.shape[0], out.shape[1],
+                    out.shape[2], out.shape[3],
+                };
+                out = src;
+                for (int d = 0; d < 4; ++d) out.shape[d] = shape[d];
+                out.compute_strides();
+                out.device_data = src.device_data;
+                out.device_offset = src.device_offset;
+                inline_zero_copy_view = true;
             }
         }
 
@@ -467,6 +484,11 @@ void execute_graph(ExecContext& ctx) {
                 needs_allocation = false;
             } else if (node.op_type == OpType::RESHAPE) {
                 needs_allocation = !(inputs.size() >= 1 && inputs[0] && inputs[0]->is_contiguous());
+            } else if (node.op_type == OpType::CONTIGUOUS) {
+                needs_allocation =
+                    !(device_resident && !has_dynamic &&
+                      inputs.size() >= 1 && inputs[0] &&
+                      inputs[0]->is_contiguous());
             }
             if (nbytes > 0) {
                 if (needs_allocation) {
@@ -640,6 +662,12 @@ void execute_graph(ExecContext& ctx) {
                 const Tensor& src = tensors[nodes[rel_id].inputs[0]];
                 rel_borrowed[r] = (device_resident ? src.is_contiguous()
                                                    : t.shares_storage_with(src)) ? 1 : 0;
+            } else if (op == OpType::CONTIGUOUS &&
+                       !nodes[rel_id].inputs.empty()) {
+                const Tensor& src =
+                    tensors[nodes[rel_id].inputs[0]];
+                rel_borrowed[r] =
+                    device_resident && src.is_contiguous() ? 1 : 0;
             }
         }
 

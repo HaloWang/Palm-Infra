@@ -73,6 +73,7 @@ enum class OpType : uint32_t {
     LAYER_NORM = 21,
     ADD_RMS_NORM = 22,  // residual += update; out = rms_norm(residual)
     RMS_NORM_ROPE = 23, // Q/K RMSNorm + materialize + RoPE
+    QK_RMS_NORM_ROPE = 24, // fused Q+K RMSNorm/materialize/RoPE
 
     // activations
     SILU = 30,
@@ -118,7 +119,6 @@ enum class OpType : uint32_t {
     GATED_DELTANET_PREFILL = 111,
     GATED_DELTANET_CONV_DECODE = 112,
     MOE                 = 120,
-    // MOE_COMBINE        = 121,
     HC_PRE               = 130,
     HC_POST              = 131,
     HC_HEAD              = 132,
@@ -144,6 +144,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::LAYER_NORM: return "LAYER_NORM";
     case OpType::ADD_RMS_NORM: return "ADD_RMS_NORM";
     case OpType::RMS_NORM_ROPE: return "RMS_NORM_ROPE";
+    case OpType::QK_RMS_NORM_ROPE: return "QK_RMS_NORM_ROPE";
     case OpType::SILU: return "SILU";
     case OpType::GELU: return "GELU";
     case OpType::TANH: return "TANH";

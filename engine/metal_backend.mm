@@ -28,11 +28,16 @@
 #define MOLLM_METALLIB_PATH ""
 #endif
 
-// CPU-side INT4 BG128 packed block (mirror of the one in kernels/matmul.cpp),
-// used to decode int4 weights into a Metal-friendly raw layout at load time.
+// CPU-side packed INT4 blocks, mirrored from kernels/matmul_internal.h. Dense
+// weights are decoded into a Metal-friendly raw layout at load time; aggregate
+// experts remain native and are read directly by specialized MoE kernels.
 struct alignas(16) Q4B8G128Block {
     float   scales[8];
     uint8_t q[4][8][16];
+};
+struct alignas(16) Q4B8G32Block {
+    float   scales[8];
+    uint8_t q[8][16];
 };
 
 // ===========================================================================
@@ -668,13 +673,18 @@ struct MetalBackend::Impl {
         return ps;
     }
 
-    // Specialized-pipeline cache keyed by name + function-constant tuple. Used by
-    // the flash-attention prefill kernel to bake dk/dv in at compile time.
-    // Falls back to nil on failure; caller then uses the plain name-keyed pipeline.
+    // Specialized-pipeline cache keyed by name + function-constant tuple. The
+    // flash-attention prefill kernel bakes DK, DV, its SIMD-group split, and
+    // query tile into the generated pipeline. A failed specialization returns
+    // nil so the caller can use the generic prefill kernel.
     std::unordered_map<std::string, id<MTLComputePipelineState>> spec_pipelines;
-    id<MTLComputePipelineState> pipeline_fa2(int dk, int dv) {
+    id<MTLComputePipelineState> pipeline_fa2(
+            int dk, int dv, int nsg, int qt) {
         char keyc[64];
-        snprintf(keyc, sizeof(keyc), "fa2:dk%d:dv%d", dk, dv);
+        snprintf(
+            keyc, sizeof(keyc),
+            "fa2:dk%d:dv%d:nsg%d:qt%d",
+            dk, dv, nsg, qt);
         std::string key(keyc);
         auto it = spec_pipelines.find(key);
         if (it != spec_pipelines.end()) return it->second;
@@ -682,6 +692,10 @@ struct MetalBackend::Impl {
         MTLFunctionConstantValues* cv = [[MTLFunctionConstantValues alloc] init];
         [cv setConstantValue:&dk type:MTLDataTypeInt atIndex:0];  // FC_SDPA_DK
         [cv setConstantValue:&dv type:MTLDataTypeInt atIndex:1];  // FC_SDPA_DV
+        [cv setConstantValue:&nsg
+                       type:MTLDataTypeInt atIndex:9];
+        [cv setConstantValue:&qt
+                       type:MTLDataTypeInt atIndex:11];
         NSError* err = nil;
         id<MTLFunction> fn = [library newFunctionWithName:@"sdpa_prefill_fa2_f32"
                                           constantValues:cv error:&err];
@@ -743,6 +757,103 @@ struct MetalBackend::Impl {
                     nr0, err ? err.localizedDescription.UTF8String : "?");
         spec_pipelines[key] = ps;
         return ps;
+    }
+
+    id<MTLComputePipelineState> pipeline_w4a16(
+            bool use_m128, bool specialize_g128) {
+        const char* function_name =
+            use_m128
+                ? "gemm_tensor_w4_f32a_i4b_f32c"
+                : "gemm_tensor_w4_f32a_i4b_f32c_m64";
+        const std::string key =
+            std::string("w4a16:") +
+            (specialize_g128 ? "g128:" : "generic:") +
+            (use_m128 ? "m128" : "m64");
+        auto it = spec_pipelines.find(key);
+        if (it != spec_pipelines.end())
+            return it->second;
+
+        MTLFunctionConstantValues* cv =
+            [[MTLFunctionConstantValues alloc] init];
+        bool enabled = specialize_g128;
+        [cv setConstantValue:&enabled
+                       type:MTLDataTypeBool
+                    atIndex:10];
+        NSError* err = nil;
+        id<MTLFunction> fn =
+            [library
+                newFunctionWithName:
+                    [NSString stringWithUTF8String:function_name]
+                          constantValues:cv
+                                   error:&err];
+        id<MTLComputePipelineState> ps =
+            fn ? [device
+                     newComputePipelineStateWithFunction:fn
+                                                   error:&err]
+               : nil;
+        if (!ps)
+            fprintf(
+                stderr,
+                "MetalBackend: W4A16 G128 pipeline failed: %s\n",
+                err ? err.localizedDescription.UTF8String : "?");
+        spec_pipelines[key] = ps;
+        return ps;
+    }
+
+    id<MTLComputePipelineState> pipeline_moe_select_parallel(
+            bool sigmoid, bool grouped) {
+        const std::string key =
+            std::string("moe_select_parallel:") +
+            (sigmoid ? "sigmoid" : "softmax") +
+            (grouped ? ":grouped" : ":ungrouped");
+        auto it = spec_pipelines.find(key);
+        if (it != spec_pipelines.end()) return it->second;
+
+        MTLFunctionConstantValues* cv =
+            [[MTLFunctionConstantValues alloc] init];
+        [cv setConstantValue:&sigmoid
+                       type:MTLDataTypeBool
+                    atIndex:7];
+        [cv setConstantValue:&grouped
+                       type:MTLDataTypeBool
+                    atIndex:8];
+        NSError* err = nil;
+        id<MTLFunction> fn =
+            [library newFunctionWithName:@"moe_select_parallel"
+                          constantValues:cv error:&err];
+        id<MTLComputePipelineState> ps = fn
+            ? [device newComputePipelineStateWithFunction:fn error:&err]
+            : nil;
+        if (!ps)
+            fprintf(stderr,
+                    "MetalBackend: parallel %s MoE selector pipeline "
+                    "failed: %s\n",
+                    grouped ? "grouped sigmoid"
+                            : sigmoid ? "sigmoid" : "softmax",
+                    err ? err.localizedDescription.UTF8String : "?");
+        spec_pipelines[key] = ps;
+        return ps;
+    }
+
+    id<MTLComputePipelineState> pipeline_grouped_moe(
+            int group_size, bool paired_gate_up,
+            bool large_route_tile) {
+        const char* layout =
+            group_size == 32 ? "bg32" : "bg128";
+        if (paired_gate_up) {
+            const std::string name =
+                std::string("gemm_grouped_experts_") + layout +
+                (large_route_tile
+                     ? "_gate_up_r32"
+                     : "_gate_up_r16");
+            return pipeline(name.c_str());
+        }
+        const std::string name =
+            std::string("gemm_grouped_experts_") + layout +
+            (large_route_tile
+                 ? "_down_r32"
+                 : "_down_r16");
+        return pipeline(name.c_str());
     }
 
 };
@@ -1184,18 +1295,23 @@ void MetalBackend::wrap_weight(Tensor& t) {
     t.device_offset = (size_t)(ptr - base);
 }
 
-void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
-    // INT4 weights ship in the CPU-only Q4B8G128Block layout (scales+nibbles
-    // interleaved per 128-K block). The Metal W4A8 kernels want a simple raw
+void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
+    const bool bg32 =
+        t.prec == Precision::INT4 && t.is_q4_g32_packed && t.q4_g32_data;
+    const bool bg128 =
+        t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data;
+    if (!bg32 && !bg128) return;
+
+    // Packed weights interleave scales and nibbles per K block. Ordinary Metal
+    // matmul kernels want a simple raw
     // [N,K/2] nibble array + [N,gpr] fp32 scales, so decode once at load time
     // into a dedicated device buffer: [ nibbles (N*K/2) | scales (N*gpr f32) ].
     // The package stores signed int4 in two's-complement nibble form. XOR the
     // sign bit while copying to make the Metal-only buffer offset-binary
     // (q + 8); this lets hot kernels decode with a subtract instead of a
-    // per-vector sign-bit XOR. CPU/native-BG128 storage remains unchanged.
+    // per-vector sign-bit XOR. CPU/native packed storage remains unchanged.
     // device_offset stays 0 (nibbles at start); scales live at byte N*(K/2),
     // which the W4 dispatch binds directly (co-located, no weight_base math).
-    if (!(t.prec == Precision::INT4 && t.is_q4_g128_packed && t.q4_g128_data)) return;
     // Ordinary linear weights are [N,K,1,1]. Fused MoE expert weights retain
     // their logical 3-D shape [E,N_per_expert,K], but the packed storage is the
     // same flat sequence of rows. Flatten every dimension before the final K
@@ -1206,19 +1322,20 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
     int64_t rows64 = 1;
     for (int d = 0; d < last; ++d) rows64 *= t.shape[d];
     const int N = (int)rows64;
-    // Expert tensors dominate MoE package size. Keep their native BG128 blocks
+    // Expert tensors dominate MoE package size. Keep their native packed blocks
     // zero-copy; the selected-expert tensor kernel decodes blocks while staging.
     // Materializing a second raw-W4 copy here adds ~9GB and causes UMA paging.
     // Aggregate packages serialize experts flattened as [E*N,K], so the
-    // loader passes keep_native_bg128 based on the explicit weight role.
-    if (keep_native_bg128 || last >= 2) {
+    // loader passes keep_native_experts based on the explicit weight role.
+    if (keep_native_experts || last >= 2) {
         wrap_weight(t);
         return;
     }
-    const int gpr = (int)t.groups_per_row;         // K/128
+    const int gpr = (int)t.groups_per_row;
     const size_t nib_bytes = (size_t)N * (K / 2);
     const size_t sc_bytes  = (size_t)N * gpr * sizeof(float);
-    auto cached = impl_->decoded_q4_weights.find(t.q4_g128_data);
+    const void* packed_data = bg32 ? t.q4_g32_data : t.q4_g128_data;
+    auto cached = impl_->decoded_q4_weights.find(packed_data);
     if (cached != impl_->decoded_q4_weights.end()) {
         t.device_data = (__bridge void*)cached->second;
         t.device_offset = 0;
@@ -1233,35 +1350,51 @@ void MetalBackend::wrap_weight_int4_g128(Tensor& t, bool keep_native_bg128) {
             impl_->persistent.push_back(b);
         uint8_t* nib = (uint8_t*)[b contents];
         float*   sc  = (float*)(nib + nib_bytes);
-        const auto* blocks = reinterpret_cast<const Q4B8G128Block*>(t.q4_g128_data);
-        // Block (n/8, g) holds 8 channels x 4 K-sub-blocks(32K) x 16 bytes.
-        // channel c (n=n_tile+c), k-sub qgi, byte b -> raw k = g*128+qgi*32+2b
-        // (low nibble) and +1 (high). Copy the 16 raw bytes straight through
-        // (same nibble order as raw [N,K/2]); copy per-channel per-group scale.
+        constexpr uint64_t sign_bits = 0x8888888888888888ull;
         for (int n = 0; n < N; n++) {
             int nt = (n / 8), c = n % 8;
             uint8_t* nrow = nib + (size_t)n * (K / 2);
             for (int g = 0; g < gpr; g++) {
-                const Q4B8G128Block& blk = blocks[(size_t)nt * gpr + g];
-                sc[(size_t)n * gpr + g] = blk.scales[c];
-                for (int qgi = 0; qgi < 4; qgi++) {
+                if (bg32) {
+                    const auto* blocks =
+                        reinterpret_cast<const Q4B8G32Block*>(packed_data);
+                    const Q4B8G32Block& block =
+                        blocks[(size_t)nt * gpr + g];
+                    sc[(size_t)n * gpr + g] = block.scales[c];
                     uint8_t* dst =
-                        nrow + (size_t)(g * 128 + qgi * 32) / 2;
+                        nrow + (size_t)(g * 32) / 2;
                     const uint64_t* src64 =
-                        reinterpret_cast<const uint64_t*>(blk.q[qgi][c]);
+                        reinterpret_cast<const uint64_t*>(block.q[c]);
                     uint64_t* dst64 = reinterpret_cast<uint64_t*>(dst);
-                    constexpr uint64_t sign_bits = 0x8888888888888888ull;
                     dst64[0] = src64[0] ^ sign_bits;
                     dst64[1] = src64[1] ^ sign_bits;
+                } else {
+                    const auto* blocks =
+                        reinterpret_cast<const Q4B8G128Block*>(packed_data);
+                    const Q4B8G128Block& block =
+                        blocks[(size_t)nt * gpr + g];
+                    sc[(size_t)n * gpr + g] = block.scales[c];
+                    for (int qgi = 0; qgi < 4; qgi++) {
+                        uint8_t* dst =
+                            nrow +
+                            (size_t)(g * 128 + qgi * 32) / 2;
+                        const uint64_t* src64 =
+                            reinterpret_cast<const uint64_t*>(
+                                block.q[qgi][c]);
+                        uint64_t* dst64 =
+                            reinterpret_cast<uint64_t*>(dst);
+                        dst64[0] = src64[0] ^ sign_bits;
+                        dst64[1] = src64[1] ^ sign_bits;
+                    }
                 }
             }
         }
         t.device_data = (__bridge void*)b;
         t.device_offset = 0;
-        impl_->decoded_q4_weights[t.q4_g128_data] = b;
+        impl_->decoded_q4_weights[packed_data] = b;
         // Keep t.scales pointing at the package's CPU layout. Metal binds the
         // co-located decoded scales by byte offset, while hybrid/CPU kernels
-        // still need the original BG128 tensor metadata.
+        // still need the original packed tensor metadata.
     }
 }
 
@@ -1425,6 +1558,19 @@ void MetalBackend::end_graph() {
 void MetalBackend::dispatch(const GraphNode& node,
                             const std::vector<const Tensor*>& inputs,
                             Tensor* output, ThreadPool* thread_pool) {
+    // Hybrid CPU/Metal operators may synchronize for a host read in the
+    // middle of a graph, which intentionally closes the current command
+    // buffer. Resume GPU encoding lazily for the next device operation.
+    if (!impl_->cmd) {
+        impl_->cmd = [impl_->queue commandBuffer];
+        impl_->cmd.label = @"mollm graph continuation";
+        impl_->enc = [impl_->cmd computeCommandEncoder];
+        impl_->enc.label = @"mollm compute continuation";
+        impl_->ops_in_cmd = 0;
+    } else if (!impl_->enc) {
+        impl_->enc = [impl_->cmd computeCommandEncoder];
+        impl_->enc.label = @"mollm compute continuation";
+    }
     id<MTLComputeCommandEncoder> enc = impl_->enc;
     const OpParams& params = node.params;
     const OpType op = node.op_type;
@@ -1527,9 +1673,8 @@ void MetalBackend::dispatch(const GraphNode& node,
 
     case OpType::CONTIGUOUS: {
         const Tensor& src = *inputs[0];
-        // Always materialize via kernel — don't add a zero-copy alias here: the
-        // executor doesn't treat CONTIGUOUS as view-like, so an alias dangles once
-        // src is deferred-freed, corrupting results under whole-graph execution.
+        // Dense inputs are handled as zero-copy aliases by the executor. Only
+        // genuinely strided layouts reach this materialization kernel.
         TensorDesc d{};
         for (int i=0;i<4;i++){ d.shape[i]=(int)src.shape[i]; d.stride[i]=estride(src,i);}        
         d.offset = eoffset(src);
@@ -1835,6 +1980,12 @@ void MetalBackend::dispatch(const GraphNode& node,
                     fast || (!accurate && p.activation == 0);
                 if (w4a16) {
                     profile_label = "MATMUL_W4A16_GEMM";
+                    if (impl_->profile) {
+                        profile_label +=
+                            "[M=" + std::to_string(p.M) +
+                            ",N=" + std::to_string(p.N) +
+                            ",K=" + std::to_string(p.K) + "]";
+                    }
                     MatmulW8Params w{};
                     w.M = p.M; w.N = p.N; w.K = p.K;
                     w.a_offset = 0; w.c_offset = eoffset(C);
@@ -1849,9 +2000,12 @@ void MetalBackend::dispatch(const GraphNode& node,
                     const bool use_m128 =
                         std::min(p.N, p.K) >= 2560 &&
                         std::max(p.N, p.K) >= 4096;
-                    id<MTLComputePipelineState> ps = impl_->pipeline(
-                        use_m128 ? "gemm_tensor_w4_f32a_i4b_f32c"
-                                 : "gemm_tensor_w4_f32a_i4b_f32c_m64");
+                    const bool specialize_g128 =
+                        w.group_size == 128 &&
+                        p.K % 128 == 0;
+                    id<MTLComputePipelineState> ps =
+                        impl_->pipeline_w4a16(
+                            use_m128, specialize_g128);
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:buf_of(&A)
                            offset:A.device_offset atIndex:0];
@@ -1859,13 +2013,14 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
                     [enc setBuffer:buf_of(&B) offset:scales_boff atIndex:4];
-                    [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t)
+                    [enc setThreadgroupMemoryLength:
+                             64 * 128 * sizeof(uint16_t)
                                             atIndex:0];
                     MTLSize tgc =
                         MTLSizeMake(
                             ((NSUInteger)p.M + (use_m128 ? 127 : 63)) /
                                 (use_m128 ? 128 : 64),
-                                    ((NSUInteger)p.N + 63)/64, 1);
+                            ((NSUInteger)p.N + 63) / 64, 1);
                     [enc dispatchThreadgroups:tgc
                         threadsPerThreadgroup:MTLSizeMake(128,1,1)];
                     if (w.activation != 0 && w.act_n_len != 0) {
@@ -1920,7 +2075,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:sa   offset:0 atIndex:4];
                     [enc setBytes:&q length:sizeof(q) atIndex:3];
                     if (block32 || block64) {
-                        constexpr NSUInteger nsg = 4;
+                        constexpr NSUInteger nsg = 2;
                         const NSUInteger block_groups =
                             ((NSUInteger)a_blocks + nsg - 1) / nsg;
                         [enc dispatchThreadgroups:
@@ -1995,8 +2150,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                             ? (p.K <= 1024
                                    ? 2*tile_m*tile_n*sizeof(int32_t) +
                                          tile_n*64
-                                   : tile_m*tile_n*sizeof(int32_t) +
-                                         tile_n*64 +
+                                   : tile_n*64/2 +
                                          (tile_n + tile_m)*sizeof(float))
                             : 2*tile_m*tile_n*sizeof(int32_t) +
                                   (block32 ? tile_n*32 : 0);
@@ -2138,7 +2292,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.rope_dim = params.i32.size()>0 ? params.i32[0] : p.dim0;
         p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
         p.x_offset = eoffset(X);
-        p.w_offset = eoffset(W);
+        // Bind package weights at their full 64-bit byte offset. Encoding the
+        // package-relative offset in the uint shader parameter wraps for
+        // FP32 constants beyond 16 GiB.
+        p.w_offset = 0;
         p.cos_offset = eoffset(COS);
         p.sin_offset = eoffset(SIN);
         p.out_offset = eoffset(O);
@@ -2149,13 +2306,71 @@ void MetalBackend::dispatch(const GraphNode& node,
             impl_->pipeline("rms_norm_rope_f32");
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&X) offset:0 atIndex:0];
-        [enc setBuffer:buf_of(&W) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&W) offset:W.device_offset atIndex:1];
         [enc setBuffer:buf_of(&O) offset:0 atIndex:2];
         [enc setBytes:&p length:sizeof(p) atIndex:3];
         [enc setBuffer:buf_of(&COS) offset:0 atIndex:4];
         [enc setBuffer:buf_of(&SIN) offset:0 atIndex:5];
+        const NSUInteger rope_threads =
+            p.seq_len > 1 &&
+                    p.dim0 == 128 &&
+                    p.rope_dim == 128
+                ? 32
+                : (NSUInteger)std::max(
+                      32, (p.rope_dim + 1) / 2);
         NSUInteger tg = std::min<NSUInteger>(
-            256, ps.maxTotalThreadsPerThreadgroup);
+            256, ((rope_threads + 31) / 32) * 32);
+        tg = std::min(tg, ps.maxTotalThreadsPerThreadgroup);
+        [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
+            threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
+        break;
+    }
+
+    case OpType::QK_RMS_NORM_ROPE: {
+        const Tensor& query = *inputs[0];
+        const Tensor& key = *inputs[1];
+        const Tensor& query_weight = *inputs[2];
+        const Tensor& key_weight = *inputs[3];
+        const Tensor& cos = *inputs[4];
+        const Tensor& sin = *inputs[5];
+        Tensor& out = *output;
+        QkRmsNormRopeParams p{};
+        p.dim0 = (int)out.shape[0];
+        p.seq_len = (int)out.shape[1];
+        p.query_heads =
+            params.i32.size()>2 ? params.i32[2] : (int)out.shape[2];
+        p.rows = p.seq_len * (int)out.shape[2];
+        p.rope_dim = params.i32.size()>0 ? params.i32[0] : p.dim0;
+        p.interleave = params.i32.size()>1 ? params.i32[1] : 1;
+        p.query_x_offset = eoffset(query);
+        p.key_x_offset = eoffset(key);
+        p.query_w_offset = 0;
+        p.key_w_offset = 0;
+        p.cos_offset = eoffset(cos);
+        p.sin_offset = eoffset(sin);
+        p.out_offset = eoffset(out);
+        p.query_x_row_stride = estride(query, 1);
+        p.key_x_row_stride = estride(key, 1);
+        p.out_row_stride = estride(out, 1);
+        p.eps = params.f32.size()>0 ? params.f32[0] : 1e-6f;
+        id<MTLComputePipelineState> ps =
+            impl_->pipeline("qk_rms_norm_rope_f32");
+        [enc setComputePipelineState:ps];
+        [enc setBuffer:buf_of(&query) offset:0 atIndex:0];
+        [enc setBuffer:buf_of(&key) offset:0 atIndex:1];
+        [enc setBuffer:buf_of(&query_weight)
+               offset:query_weight.device_offset atIndex:2];
+        [enc setBuffer:buf_of(&key_weight)
+               offset:key_weight.device_offset atIndex:3];
+        [enc setBuffer:buf_of(&out) offset:0 atIndex:4];
+        [enc setBytes:&p length:sizeof(p) atIndex:5];
+        [enc setBuffer:buf_of(&cos) offset:0 atIndex:6];
+        [enc setBuffer:buf_of(&sin) offset:0 atIndex:7];
+        const NSUInteger rope_threads =
+            (NSUInteger)std::max(32, (p.rope_dim + 1) / 2);
+        NSUInteger tg = std::min<NSUInteger>(
+            256, ((rope_threads + 31) / 32) * 32);
+        tg = std::min(tg, ps.maxTotalThreadsPerThreadgroup);
         [enc dispatchThreadgroups:MTLSizeMake((NSUInteger)p.rows,1,1)
             threadsPerThreadgroup:MTLSizeMake(tg,1,1)];
         break;
@@ -2821,7 +3036,6 @@ void MetalBackend::dispatch(const GraphNode& node,
 
         int src_seqlen = (int)Q.shape[1];
         int cur_seqlen = (int)K_cur.shape[1];
-
         // Cache metadata lives in the Shared buffer's host-visible header.
         int past = 0, max_seq = 0;
         if (kv_cache == 2 && K_cache && K_cache->data) {
@@ -2829,8 +3043,41 @@ void MetalBackend::dispatch(const GraphNode& node,
             past    = (int)meta[0];  // current_seq_len
             max_seq = (int)meta[1];  // max_seq_len
         }
-        int dst_seqlen = past + cur_seqlen;
+        std::string sdpa_profile_suffix;
+        if (impl_->profile) {
+            sdpa_profile_suffix =
+                "[S=" + std::to_string(src_seqlen) +
+                ",P=" + std::to_string(past) +
+                ",H=" + std::to_string(num_heads) +
+                ",HKV=" + std::to_string(num_kv) +
+                ",DK=" + std::to_string(head_dim) +
+                ",DV=" + std::to_string(v_head_dim) + "]";
+            profile_label += sdpa_profile_suffix;
+        }
 
+        auto profile_sdpa_stage = [&](const char* label) {
+            if (!impl_->profile) return;
+            if (impl_->enc) {
+                [impl_->enc endEncoding];
+                impl_->enc = nil;
+            }
+            if (impl_->cmd) {
+                [impl_->cmd commit];
+                [impl_->cmd waitUntilCompleted];
+                const double gpu_ms =
+                    (impl_->cmd.GPUEndTime -
+                     impl_->cmd.GPUStartTime) * 1000.0;
+                auto& stat =
+                    impl_->op_stats[std::string(label) + sdpa_profile_suffix];
+                stat.gpu_ms += gpu_ms;
+                stat.calls += 1;
+            }
+            impl_->cmd = [impl_->queue commandBuffer];
+            impl_->enc = [impl_->cmd computeCommandEncoder];
+            enc = impl_->enc;
+        };
+
+        int dst_seqlen = past + cur_seqlen;
         // Cache data begins 64 bytes past the buffer base (CacheMetadata header).
         // FP16 cache: element offset = (device_offset + 64) / 2.
         const size_t CACHE_HDR = 64;
@@ -2838,37 +3085,45 @@ void MetalBackend::dispatch(const GraphNode& node,
         uint v_cache_eoff = (uint)((V_cache ? V_cache->device_offset : 0) + CACHE_HDR) / 2;
 
         // 1) Append K_cur/V_cur (FP32) into the FP16 cache at position past+s.
+        SdpaAppendKvParams ap{};
+        if (kv_cache == 2 && K_cache && V_cache) {
+            ap.num_kv_heads = num_kv;
+            ap.cur_seqlen = cur_seqlen;
+            ap.past_seqlen = past;
+            ap.max_seq_len = max_seq;
+            ap.k_dim = head_dim;
+            ap.v_dim = v_head_dim;
+            ap.k_cur_offset = eoffset(K_cur);
+            ap.k_stride_head = estride(K_cur, 2);
+            ap.k_stride_pos = estride(K_cur, 1);
+            ap.k_cache_offset = k_cache_eoff;
+            ap.v_cur_offset = eoffset(V_cur);
+            ap.v_stride_head = estride(V_cur, 2);
+            ap.v_stride_pos = estride(V_cur, 1);
+            ap.v_cache_offset = v_cache_eoff;
+        }
         if (kv_cache == 2 && K_cache && V_cache) {
             id<MTLComputePipelineState> aps =
-                impl_->pipeline("sdpa_append_f32_to_f16");
-            auto append = [&](const Tensor& cur, const Tensor& cache,
-                              int width, uint cache_eoff) {
-                SdpaAppendParams ap{};
-                ap.num_kv_heads = num_kv;
-                ap.cur_seqlen = cur_seqlen;
-                ap.past_seqlen = past;
-                ap.head_dim = width;
-                ap.max_seq_len = max_seq;
-                ap.cur_offset = eoffset(cur);
-                ap.cur_stride_head = estride(cur, 2);
-                ap.cur_stride_pos = estride(cur, 1);
-                ap.cache_offset = cache_eoff;
-                [enc setComputePipelineState:aps];
-                [enc setBuffer:buf_of(&cur) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&cache) offset:0 atIndex:2];
-                [enc setBytes:&ap length:sizeof(ap) atIndex:3];
-                NSUInteger tx=8,ty=8,tz=4;
-                MTLSize tgs=MTLSizeMake(tx,ty,tz);
-                MTLSize tgc=MTLSizeMake(((NSUInteger)width+tx-1)/tx,
-                                        ((NSUInteger)cur_seqlen+ty-1)/ty,
-                                        ((NSUInteger)num_kv+tz-1)/tz);
-                [enc dispatchThreadgroups:tgc threadsPerThreadgroup:tgs];
-            };
-            append(K_cur, *K_cache, head_dim, k_cache_eoff);
-            append(V_cur, *V_cache, v_head_dim, v_cache_eoff);
+                impl_->pipeline("sdpa_append_kv_f32_to_f16");
+            [enc setComputePipelineState:aps];
+            [enc setBuffer:buf_of(&K_cur) offset:0 atIndex:0];
+            [enc setBuffer:buf_of(&V_cur) offset:0 atIndex:1];
+            [enc setBuffer:buf_of(K_cache) offset:0 atIndex:2];
+            [enc setBytes:&ap length:sizeof(ap) atIndex:3];
+            [enc setBuffer:buf_of(V_cache) offset:0 atIndex:4];
+            const NSUInteger tx = cur_seqlen == 1 ? 32 : 8;
+            const NSUInteger ty = cur_seqlen == 1 ? 1 : 8;
+            const NSUInteger tz = 4;
+            [enc dispatchThreadgroups:
+                     MTLSizeMake(
+                         ((NSUInteger)std::max(head_dim, v_head_dim) + tx - 1) / tx,
+                         ((NSUInteger)cur_seqlen + ty - 1) / ty,
+                         ((NSUInteger)num_kv + tz - 1) / tz)
+                threadsPerThreadgroup:MTLSizeMake(tx, ty, tz)];
             // Attention immediately reads the cache regions written by the two
-            // append dispatches in this same compute encoder.
+            // cache writes in this same compute encoder.
             [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            profile_sdpa_stage("SDPA.append");
         }
 
         // 2) Attention compute.
@@ -2899,9 +3154,16 @@ void MetalBackend::dispatch(const GraphNode& node,
         // Prefill SDPA routing:
         //   default -> sdpa_prefill_fa2_f32 (flash attention: query-split,
         //              direct-global K/V MMA, threadgroup-O elementwise rescale).
-        // fa2 requires dk/dv %8, <=256 (C=64 & PV8 divisible by NSG=4 always hold).
+        // FA2 requires DK/DV % 8 and <= 256. C=64 and PV is padded to
+        // 64, so both 8x8 QK and PV stripes divide evenly across NSG=8.
         constexpr bool use_simple = false;
-        const int FA2_NSG = 4, FA2_Q = 8;
+        const int FA2_NSG = 8;
+        const int FA2_Q =
+            src_seqlen >= 16 &&
+                    head_dim <= 192 &&
+                    v_head_dim <= 128
+                ? 16
+                : 8;
         // fa2 declares function constants without defaults, so it can ONLY be built
         // via the specialized (pipeline_fa2) path — never the plain name-keyed
         // pipeline. Probe the specialized pipeline directly as the guard.
@@ -2909,22 +3171,30 @@ void MetalBackend::dispatch(const GraphNode& node,
         bool fa2_pre = !decode_path && !use_simple
             && (head_dim % 8 == 0) && (v_head_dim % 8 == 0)
             && head_dim <= 256 && v_head_dim <= 256;
-        if (fa2_pre) fa2_ps = impl_->pipeline_fa2(head_dim, v_head_dim);
+        if (fa2_pre)
+            fa2_ps = impl_->pipeline_fa2(
+                head_dim, v_head_dim, FA2_NSG, FA2_Q);
         bool fa2_ok = (fa2_ps != nil);
 
         const bool decode_192_128 = decode_path && head_dim == 192 && v_head_dim == 128
             && std::getenv("MOLLM_METAL_SDPA_DECODE_GENERIC") == nullptr;
         const bool decode_192_128_multi = decode_192_128 && dst_seqlen >= 768;
+        const bool decode_128_128 = decode_path
+            && head_dim == 128 && v_head_dim == 128
+            && std::getenv("MOLLM_METAL_SDPA_DECODE_GENERIC") == nullptr;
         const bool decode_256_256 = decode_path
             && head_dim == 256 && v_head_dim == 256
             && std::getenv("MOLLM_METAL_SDPA_DECODE_GENERIC") == nullptr;
         const char* kname = decode_192_128_multi ? "sdpa_decode_192_128_partial_f32"
                            : decode_192_128 ? "sdpa_decode_192_128_f32"
+                           : decode_128_128 ? "sdpa_decode_128_128_f32"
                            : decode_256_256 ? "sdpa_decode_256_256_f32"
                            : decode_path ? "sdpa_decode_f32"
                            : "sdpa_prefill_f32";
-        // fa2 uses its dk/dv-specialized pipeline; all other paths use name-keyed.
-        id<MTLComputePipelineState> ps = fa2_ok ? fa2_ps : impl_->pipeline(kname);
+        // FA2 uses its DK/DV/NSG-specialized pipeline; all other paths use
+        // name-keyed pipelines.
+        id<MTLComputePipelineState> ps =
+            fa2_ok ? fa2_ps : impl_->pipeline(kname);
         [enc setComputePipelineState:ps];
         [enc setBuffer:buf_of(&Q) offset:0 atIndex:0];
         [enc setBuffer:(K_cache?buf_of(K_cache):buf_of(&K_cur)) offset:0 atIndex:1];
@@ -2961,9 +3231,10 @@ void MetalBackend::dispatch(const GraphNode& node,
         } else if (fa2_ok) {
             // Flash attention: one threadgroup (NSG simdgroups, 32*NSG threads) per
             // (query-tile=Q, head). Threadgroup memory:
-            //   sq[Q*DK] half + so[Q*PV] float + ss[Q*SH] float, SH=2*C, PV=PAD(DV,64).
+            //   sq[Q*DK] half + so[Q*PV] float + ss[Q*SH] float,
+            //   C=64, SH=C+40 (bank-conflict padding), and PV=PAD(DV,64).
             const int PV = ((v_head_dim + 63) / 64) * 64;
-            const int SH = 2 * 64;
+            const int SH = 64 + 40;
             size_t tg_bytes = (size_t)FA2_Q * head_dim * 2   // sq (half)
                             + (size_t)FA2_Q * PV * 4         // so (float)
                             + (size_t)FA2_Q * SH * 4;        // ss (float)
@@ -3058,6 +3329,14 @@ void MetalBackend::dispatch(const GraphNode& node,
         bool has_shared = params.i32.size()>7 ? params.i32[7] != 0 : true;
         int n_group = params.i32.size()>8 ? params.i32[8] : 1;
         int topk_group = params.i32.size()>9 ? params.i32[9] : 1;
+        int router_bias_input =
+            params.i32.size()>11 ? params.i32[11]
+                                 : (has_shared ? 8 : -1);
+        const Tensor* router_bias =
+            router_bias_input >= 0 &&
+                    static_cast<size_t>(router_bias_input) < inputs.size()
+                ? inputs[router_bias_input]
+                : nullptr;
         float routed_scale = params.f32.size()>0 ? params.f32[0] : 1.0f;
         const auto* ssd_gate = inputs.size() > 2
             ? static_cast<const MoeSsdTensorSource*>(inputs[2]->moe_ssd_source)
@@ -3065,12 +3344,11 @@ void MetalBackend::dispatch(const GraphNode& node,
         const auto* ssd_down = inputs.size() > 3
             ? static_cast<const MoeSsdTensorSource*>(inputs[3]->moe_ssd_source)
             : nullptr;
-        // Youtu-v2/Qwen3 W4 routed experts: keep the whole operation on GPU.
-        // The decoded expert buffers are flat row-major despite their logical
-        // 3-D Tensor shape (see wrap_weight_int4_g128).
-        // Decode uses selected-expert tensor MMA by default on Metal 4 GPUs.
-        // Prefill stays on the CPU hybrid path until expert-grouped M tiles are
-        // available.
+        // Qwen-style W4 routed experts stay on the GPU. Resident package
+        // weights use native BG128 blocks: short prefill uses independent
+        // selected-route kernels, while long prefill groups routes by expert
+        // to reuse each weight tile. SSD experts use the same block layout in
+        // cache slots for decode.
         const bool ssd_w4 =
             ssd_gate && ssd_down && ssd_gate->cache == ssd_down->cache &&
             ssd_gate->spec.precision == Precision::INT4 &&
@@ -3078,7 +3356,7 @@ void MetalBackend::dispatch(const GraphNode& node,
         if (ssd_w4 && inputs[0]->shape[1] == 1) {
             impl_->ssd_moe_layers[ssd_gate->spec.layer] = {
                 inputs[1],
-                inputs.size() > 8 ? inputs[8] : nullptr,
+                router_bias,
                 ssd_gate,
                 ssd_down,
                 hidden_size,
@@ -3094,16 +3372,22 @@ void MetalBackend::dispatch(const GraphNode& node,
         }
         const bool supported_router =
             router_score_func == 0 ||
-            (router_score_func == 1 && inputs.size() > 8);
+            (router_score_func == 1 && router_bias);
+        const int moe_seq = (int)inputs[0]->shape[1];
+        const bool resident_w4_prefill =
+            moe_seq > 1 && !ssd_w4 && !has_shared;
         bool gpu_w4 = impl_->has_tensor && supported_router &&
             inputs[1]->prec == Precision::FP16 && inputs[2]->prec == Precision::INT4 &&
             inputs[3]->prec == Precision::INT4 && top_k <= 16 && n_group <= 16 &&
-            inputs[0]->shape[1] == 1 && (ssd_w4 || !has_shared);
+            (moe_seq == 1 || resident_w4_prefill) &&
+            (ssd_w4 || !has_shared);
         if (gpu_w4) {
             const Tensor& x = *inputs[0]; const Tensor& router = *inputs[1];
             const Tensor& gu = *inputs[2]; const Tensor& down = *inputs[3];
-            const Tensor* bias = inputs.size() > 8 ? inputs[8] : nullptr;
+            const Tensor* bias = router_bias;
             int seq = (int)x.shape[1];
+            if (impl_->profile)
+                profile_label += "[S=" + std::to_string(seq) + "]";
             size_t idx_bytes=(size_t)seq*top_k*sizeof(int);
             size_t tw_bytes=(size_t)seq*top_k*sizeof(float);
             size_t logits_bytes=(size_t)seq*num_experts*sizeof(float);
@@ -3115,6 +3399,29 @@ void MetalBackend::dispatch(const GraphNode& node,
             id<MTLBuffer> tw=(__bridge id<MTLBuffer>)tw_h;
             id<MTLBuffer> logits=(__bridge id<MTLBuffer>)logits_h;
             id<MTLBuffer> merged=(__bridge id<MTLBuffer>)merged_h;
+            auto profile_resident_moe_stage = [&](const char* label) {
+                if (!impl_->profile || ssd_w4) return;
+                if (impl_->enc) {
+                    [impl_->enc endEncoding];
+                    impl_->enc = nil;
+                }
+                if (impl_->cmd) {
+                    [impl_->cmd commit];
+                    [impl_->cmd waitUntilCompleted];
+                    const double gpu_ms =
+                        (impl_->cmd.GPUEndTime -
+                         impl_->cmd.GPUStartTime) * 1000.0;
+                    const std::string stage_label =
+                        std::string(label) +
+                        "[S=" + std::to_string(seq) + "]";
+                    auto& stat = impl_->op_stats[stage_label];
+                    stat.gpu_ms += gpu_ms;
+                    stat.calls += 1;
+                }
+                impl_->cmd = [impl_->queue commandBuffer];
+                impl_->enc = [impl_->cmd computeCommandEncoder];
+                enc = impl_->enc;
+            };
             const Impl::SsdMoeLayerInfo* predicted_layer = nullptr;
             void* predicted_idx_h = nullptr;
             void* predicted_tw_h = nullptr;
@@ -3156,6 +3463,26 @@ void MetalBackend::dispatch(const GraphNode& node,
             mp.down_groups_per_row=(int)down.groups_per_row;
             size_t gu_rows=(size_t)num_experts*2*intermediate;
             size_t down_rows=(size_t)num_experts*hidden_size;
+            auto native_bg128 = [](const Tensor& w,
+                                   int rows_per_expert) {
+                return w.is_q4_g128_packed && w.q4_g128_data &&
+                       w.group_size == 128 &&
+                       rows_per_expert % 8 == 0;
+            };
+            auto native_bg32 = [](const Tensor& w,
+                                  int rows_per_expert) {
+                return w.is_q4_g32_packed && w.q4_g32_data &&
+                       w.group_size == 32 &&
+                       rows_per_expert % 8 == 0;
+            };
+            const bool native_gu =
+                native_bg128(gu, 2 * intermediate);
+            const int native_gu_group =
+                native_gu
+                    ? 128
+                    : (native_bg32(gu, 2 * intermediate) ? 32 : 0);
+            void* resident_qx_h = nullptr;
+            void* resident_sx_h = nullptr;
 
             if (ssd_w4) {
                 // Direct MTLIO submission needs host-visible route IDs. On
@@ -3228,47 +3555,205 @@ void MetalBackend::dispatch(const GraphNode& node,
             }
 
             if (!ssd_w4) {
-                MatmulParams router_mp{};
-                router_mp.M = seq;
-                router_mp.N = num_experts;
-                router_mp.K = hidden_size;
-                router_mp.a_offset = eoffset(x);
-                router_mp.b_offset = 0;
-                router_mp.c_offset = 0;
-                router_mp.a_row_stride = estride(x, 1);
-                router_mp.b_row_stride = hidden_size;
-                router_mp.c_row_stride = num_experts;
-                router_mp.activation = 0;
-                router_mp.act_n_begin = 0;
-                router_mp.act_n_len = -1;
-                [enc setComputePipelineState:
-                         impl_->pipeline("gemv_f32a_f16b_f32c")];
-                [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                [enc setBuffer:buf_of(&router)
-                        offset:router.device_offset
-                       atIndex:1];
-                [enc setBuffer:logits offset:0 atIndex:2];
-                [enc setBytes:&router_mp
-                       length:sizeof(router_mp)
-                      atIndex:3];
-                [enc dispatchThreadgroups:
-                         MTLSizeMake((num_experts + 7) / 8, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                [enc setComputePipelineState:impl_->pipeline(
-                    router_score_func == 0 ? "moe_select_softmax"
-                                           : "moe_select_sigmoid")];
+                const int router_nsg =
+                    std::min(
+                        gemv_nsg_cap(),
+                        (hidden_size + 127) / 128);
+                const bool fuse_router_quant =
+                    native_gu && seq == 1 && router_nsg == 8;
+                if (fuse_router_quant) {
+                    const size_t qx_bytes =
+                        (size_t)seq * hidden_size;
+                    const size_t sx_bytes =
+                        (size_t)seq * gu.groups_per_row *
+                        sizeof(float);
+                    resident_qx_h = impl_->pool->acquire(qx_bytes);
+                    resident_sx_h = impl_->pool->acquire(sx_bytes);
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_router_quantize_bg128")];
+                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&router)
+                            offset:router.device_offset atIndex:1];
+                    [enc setBuffer:logits offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:
+                             (__bridge id<MTLBuffer>)resident_qx_h
+                            offset:0 atIndex:4];
+                    [enc setBuffer:
+                             (__bridge id<MTLBuffer>)resident_sx_h
+                            offset:0 atIndex:5];
+                    [enc setThreadgroupMemoryLength:
+                             2 * 32 * sizeof(float) atIndex:0];
+                    const NSUInteger router_groups =
+                        ((NSUInteger)num_experts + 1) / 2;
+                    const NSUInteger quant_groups =
+                        ((NSUInteger)gu.groups_per_row + 1) / 2;
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 router_groups + quant_groups, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(32, 8, 1)];
+                } else if (seq == 1) {
+                    MatmulParams router_mp{};
+                    router_mp.M = seq;
+                    router_mp.N = num_experts;
+                    router_mp.K = hidden_size;
+                    router_mp.a_offset = eoffset(x);
+                    router_mp.b_offset = 0;
+                    router_mp.c_offset = 0;
+                    router_mp.a_row_stride = estride(x, 1);
+                    router_mp.b_row_stride = hidden_size;
+                    router_mp.c_row_stride = num_experts;
+                    router_mp.activation = 0;
+                    router_mp.act_n_begin = 0;
+                    router_mp.act_n_len = -1;
+                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&router)
+                            offset:router.device_offset atIndex:1];
+                    [enc setBuffer:logits offset:0 atIndex:2];
+                    [enc setBytes:&router_mp
+                           length:sizeof(router_mp) atIndex:3];
+                    constexpr int router_rows_per_tg = 2;
+                    id<MTLComputePipelineState> router_ps =
+                        impl_->pipeline_gemv2(router_rows_per_tg);
+                    [enc setComputePipelineState:router_ps];
+                    [enc setThreadgroupMemoryLength:
+                             router_rows_per_tg * 32 * sizeof(float)
+                                            atIndex:0];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (num_experts +
+                                  router_rows_per_tg - 1) /
+                                     router_rows_per_tg,
+                                 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(
+                                 32, std::max(1, router_nsg), 1)];
+                } else {
+                    // Multi-token resident MoE stays entirely on the GPU.
+                    // The decode-specialized router GEMV only consumes the
+                    // first activation row, so use the same tensor GEMM path
+                    // as an ordinary FP16 projection for prefill.
+                    MatmulParams router_mp{};
+                    router_mp.M = seq;
+                    router_mp.N = num_experts;
+                    router_mp.K = hidden_size;
+                    router_mp.a_offset = eoffset(x);
+                    router_mp.b_offset = 0;
+                    router_mp.c_offset = 0;
+                    router_mp.a_row_stride = estride(x, 1);
+                    router_mp.b_row_stride = hidden_size;
+                    router_mp.c_row_stride = num_experts;
+                    router_mp.activation = 0;
+                    router_mp.act_n_begin = 0;
+                    router_mp.act_n_len = -1;
+
+                    const size_t activation_bytes =
+                        (size_t)seq * (size_t)hidden_size *
+                        sizeof(uint16_t);
+                    void* activation_h =
+                        impl_->pool->acquire(activation_bytes);
+                    id<MTLBuffer> activation =
+                        (__bridge id<MTLBuffer>)activation_h;
+                    impl_->pending_free.push_back(
+                        {activation_h, activation_bytes});
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "matmul_cast_f32_to_f16")];
+                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+                    [enc setBuffer:activation offset:0 atIndex:2];
+                    [enc setBytes:&router_mp
+                           length:sizeof(router_mp) atIndex:3];
+                    grid1d(
+                        (seq * hidden_size + 3) / 4);
+                    [enc memoryBarrierWithScope:
+                             MTLBarrierScopeBuffers];
+
+                    MatmulParams tensor_mp = router_mp;
+                    tensor_mp.a_offset = 0;
+                    tensor_mp.a_row_stride = hidden_size;
+                    const bool small_router =
+                        num_experts <= 128;
+                    const NSUInteger router_tile_m =
+                        small_router ? 64 : 128;
+                    const NSUInteger router_tile_n =
+                        small_router ? 32 : 64;
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 small_router
+                                     ? "gemm_tensor_router_f16a_f16b_f32c"
+                                     : "gemm_tensor_direct_f16a_f16b_f32c")];
+                    [enc setBuffer:activation offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&router)
+                            offset:router.device_offset atIndex:1];
+                    [enc setBuffer:logits offset:0 atIndex:2];
+                    [enc setBytes:&tensor_mp
+                           length:sizeof(tensor_mp) atIndex:3];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 ((NSUInteger)seq +
+                                  router_tile_m - 1) /
+                                     router_tile_m,
+                                 ((NSUInteger)num_experts +
+                                  router_tile_n - 1) /
+                                     router_tile_n,
+                                 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(128, 1, 1)];
+                }
+                profile_resident_moe_stage(
+                    fuse_router_quant
+                        ? "MOE.router_quant"
+                        : "MOE.router");
+                const bool parallel_select =
+                    num_experts <= 256 &&
+                    top_k <= 16 &&
+                    (router_score_func == 0 ||
+                     (router_score_func == 1 &&
+                      n_group <= 16 &&
+                      topk_group <= n_group));
+                id<MTLComputePipelineState> select_pipeline =
+                    parallel_select
+                        ? impl_->pipeline_moe_select_parallel(
+                              router_score_func == 1,
+                              router_score_func == 1 &&
+                                  n_group > 1)
+                        : impl_->pipeline(
+                              router_score_func == 0
+                                  ? "moe_select_softmax"
+                                  : "moe_select_sigmoid");
+                [enc setComputePipelineState:select_pipeline];
                 [enc setBuffer:logits offset:0 atIndex:0];
                 [enc setBuffer:idx offset:0 atIndex:1];
                 [enc setBuffer:tw offset:0 atIndex:2];
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 if (bias) {
                     [enc setBuffer:buf_of(bias)
-                            offset:bias->device_offset
-                           atIndex:4];
+                            offset:bias->device_offset atIndex:4];
+                } else if (parallel_select) {
+                    // The softmax specialization does not read this binding,
+                    // but Metal validation still requires every declared
+                    // argument to be present.
+                    [enc setBuffer:logits offset:0 atIndex:4];
                 }
-                [enc dispatchThreadgroups:
-                         MTLSizeMake(((NSUInteger)seq + 63) / 64, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                if (parallel_select) {
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (NSUInteger)seq, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(
+                                 num_experts <= 128 ? 128 : 256,
+                                 1, 1)];
+                } else {
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 ((NSUInteger)seq + 63) / 64, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(64, 1, 1)];
+                }
+                profile_resident_moe_stage("MOE.select");
             }
 
 #ifdef MOLLM_METAL_TENSOR
@@ -3607,14 +4092,19 @@ void MetalBackend::dispatch(const GraphNode& node,
                     selected, hidden_size);
 
                 [enc setComputePipelineState:
-                         impl_->pipeline("moe_combine_selected")];
+                         impl_->pipeline(
+                             "moe_combine_selected")];
                 [enc setBuffer:selected offset:0 atIndex:0];
-                [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+                [enc setBuffer:buf_of(output)
+                        offset:0 atIndex:2];
                 [enc setBytes:&mp length:sizeof(mp) atIndex:3];
                 [enc setBuffer:tw offset:0 atIndex:4];
                 [enc dispatchThreadgroups:
-                         MTLSizeMake((hidden_size + 63) / 64, (seq + 3) / 4, 1)
-                    threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+                         MTLSizeMake(
+                             (hidden_size + 63) / 64,
+                             (seq + 3) / 4, 1)
+                    threadsPerThreadgroup:
+                         MTLSizeMake(64, 4, 1)];
 
                 if (has_shared) {
                     [enc endEncoding];
@@ -3651,7 +4141,6 @@ void MetalBackend::dispatch(const GraphNode& node,
                     impl_->pending_free.push_back(
                         {shared_output_h, shared_output_bytes});
                 }
-
                 impl_->pending_free.push_back({qx_h, qx_bytes});
                 impl_->pending_free.push_back({sx_h, sx_bytes});
                 impl_->pending_free.push_back({qi_h, qi_bytes});
@@ -3671,29 +4160,246 @@ void MetalBackend::dispatch(const GraphNode& node,
 
             if (impl_->has_tensor) {
                 int selections=seq*top_k;
-                size_t qx_bytes=(size_t)seq*hidden_size, sx_bytes=(size_t)seq*sizeof(float);
+                const bool native_down =
+                    native_bg128(down, hidden_size);
+                const int native_down_group =
+                    native_down
+                        ? 128
+                        : (native_bg32(down, hidden_size) ? 32 : 0);
+                const bool grouped_prefill =
+                    seq >= 64 && native_gu_group != 0 &&
+                    native_gu_group == native_down_group;
+                size_t qx_bytes=(size_t)seq*hidden_size;
+                size_t sx_bytes=(size_t)seq *
+                    (native_gu_group ? gu.groups_per_row : 1) *
+                    sizeof(float);
                 size_t qi_bytes=(size_t)selections*intermediate;
-                size_t si_bytes=(size_t)selections*sizeof(float);
-                size_t selected_bytes=(size_t)selections*hidden_size*sizeof(float);
-                void* qx_h=impl_->pool->acquire(qx_bytes),*sx_h=impl_->pool->acquire(sx_bytes);
+                size_t si_bytes=(size_t)selections *
+                    (native_down_group ? down.groups_per_row : 1) *
+                    sizeof(float);
+                size_t selected_bytes =
+                    (size_t)selections * hidden_size * sizeof(float);
+                void* qx_h=resident_qx_h
+                    ? resident_qx_h
+                    : impl_->pool->acquire(qx_bytes);
+                void* sx_h=resident_sx_h
+                    ? resident_sx_h
+                    : impl_->pool->acquire(sx_bytes);
                 void* qi_h=impl_->pool->acquire(qi_bytes),*si_h=impl_->pool->acquire(si_bytes);
-                void* selected_h=impl_->pool->acquire(selected_bytes);
+                void* selected_h =
+                    impl_->pool->acquire(selected_bytes);
                 id<MTLBuffer> qx=(__bridge id<MTLBuffer>)qx_h;
                 id<MTLBuffer> sx=(__bridge id<MTLBuffer>)sx_h;
                 id<MTLBuffer> qi=(__bridge id<MTLBuffer>)qi_h;
                 id<MTLBuffer> si=(__bridge id<MTLBuffer>)si_h;
-                id<MTLBuffer> selected=(__bridge id<MTLBuffer>)selected_h;
-                auto quantize = [&](id<MTLBuffer> src, uint src_off, int rows, int K,
-                                    int row_stride, id<MTLBuffer> dst, id<MTLBuffer> scales) {
+                id<MTLBuffer> selected =
+                    (__bridge id<MTLBuffer>)selected_h;
+                void* expert_counts_h = nullptr;
+                void* expert_routes_h = nullptr;
+                void* grouped_jobs_h = nullptr;
+                void* grouped_job_count_h = nullptr;
+                void* grouped_dispatch_h = nullptr;
+                id<MTLBuffer> expert_counts = nil;
+                id<MTLBuffer> expert_routes = nil;
+                id<MTLBuffer> grouped_jobs = nil;
+                id<MTLBuffer> grouped_job_count = nil;
+                id<MTLBuffer> grouped_dispatch = nil;
+                size_t expert_counts_bytes = 0;
+                size_t expert_routes_bytes = 0;
+                size_t grouped_jobs_queue_bytes = 0;
+                size_t grouped_jobs_bytes = 0;
+                size_t grouped_job_count_bytes = 0;
+                size_t grouped_dispatch_bytes = 0;
+                if (grouped_prefill) {
+                    expert_counts_bytes =
+                        (size_t)num_experts * sizeof(uint32_t);
+                    expert_routes_bytes =
+                        (size_t)num_experts * (size_t)seq *
+                        sizeof(int32_t);
+                    grouped_jobs_queue_bytes =
+                        (size_t)selections * 2 * sizeof(uint32_t);
+                    grouped_jobs_bytes =
+                        2 * grouped_jobs_queue_bytes;
+                    grouped_job_count_bytes =
+                        2 * sizeof(uint32_t);
+                    grouped_dispatch_bytes =
+                        12 * sizeof(uint32_t);
+                    expert_counts_h =
+                        impl_->pool->acquire(expert_counts_bytes);
+                    expert_routes_h =
+                        impl_->pool->acquire(expert_routes_bytes);
+                    grouped_jobs_h =
+                        impl_->pool->acquire(grouped_jobs_bytes);
+                    grouped_job_count_h =
+                        impl_->pool->acquire(grouped_job_count_bytes);
+                    grouped_dispatch_h =
+                        impl_->pool->acquire(grouped_dispatch_bytes);
+                    expert_counts =
+                        (__bridge id<MTLBuffer>)expert_counts_h;
+                    expert_routes =
+                        (__bridge id<MTLBuffer>)expert_routes_h;
+                    grouped_jobs =
+                        (__bridge id<MTLBuffer>)grouped_jobs_h;
+                    grouped_job_count =
+                        (__bridge id<MTLBuffer>)grouped_job_count_h;
+                    grouped_dispatch =
+                        (__bridge id<MTLBuffer>)grouped_dispatch_h;
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_reset_expert_counts")];
+                    [enc setBuffer:expert_counts
+                            offset:0 atIndex:0];
+                    [enc setBuffer:grouped_job_count
+                            offset:0 atIndex:1];
+                    [enc setBytes:&mp
+                           length:sizeof(mp) atIndex:3];
+                    grid1d(num_experts);
+                    [enc memoryBarrierWithScope:
+                             MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_build_expert_routes")];
+                    [enc setBuffer:idx offset:0 atIndex:0];
+                    [enc setBuffer:expert_counts
+                            offset:0 atIndex:1];
+                    [enc setBuffer:expert_routes
+                            offset:0 atIndex:2];
+                    [enc setBytes:&mp
+                           length:sizeof(mp) atIndex:3];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (NSUInteger)num_experts, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(128, 1, 1)];
+                    [enc memoryBarrierWithScope:
+                             MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_build_grouped_jobs")];
+                    [enc setBuffer:expert_counts
+                            offset:0 atIndex:0];
+                    [enc setBuffer:grouped_jobs
+                            offset:0 atIndex:1];
+                    [enc setBuffer:grouped_job_count
+                            offset:0 atIndex:2];
+                    [enc setBytes:&mp
+                           length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:grouped_jobs
+                            offset:grouped_jobs_queue_bytes
+                           atIndex:4];
+                    grid1d(num_experts);
+                    [enc memoryBarrierWithScope:
+                             MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_finalize_grouped_dispatch")];
+                    [enc setBuffer:grouped_job_count
+                            offset:0 atIndex:0];
+                    [enc setBuffer:grouped_dispatch
+                            offset:0 atIndex:1];
+                    [enc setBytes:&mp
+                           length:sizeof(mp) atIndex:3];
+                    grid1d(1);
+                    [enc memoryBarrierWithScope:
+                             MTLBarrierScopeBuffers];
+                    if (impl_->profile) {
+                        profile_resident_moe_stage(
+                            "MOE.group_routes");
+                        const auto* counts =
+                            static_cast<const uint32_t*>(
+                                MetalBufferPool::contents(
+                                    expert_counts_h));
+                        const auto* jobs =
+                            static_cast<const uint32_t*>(
+                                MetalBufferPool::contents(
+                                    grouped_job_count_h));
+                        uint64_t routes = 0;
+                        uint32_t nonempty = 0;
+                        uint32_t max_routes = 0;
+                        uint32_t theoretical_jobs16 = 0;
+                        uint32_t theoretical_jobs32 = 0;
+                        for (int expert = 0;
+                             expert < num_experts; ++expert) {
+                            routes += counts[expert];
+                            nonempty += counts[expert] != 0;
+                            theoretical_jobs16 +=
+                                (counts[expert] + 15) / 16;
+                            theoretical_jobs32 +=
+                                (counts[expert] + 31) / 32;
+                            max_routes =
+                                std::max(max_routes, counts[expert]);
+                        }
+                        const bool use_large =
+                            jobs[0] != 0 &&
+                            jobs[1] * 5u <= jobs[0] * 3u;
+                        const uint64_t capacity =
+                            use_large
+                                ? (uint64_t)jobs[1] *
+                                      MOLLM_GROUPED_MOE_ROUTE_TILE_LARGE
+                                : (uint64_t)jobs[0] *
+                                      MOLLM_GROUPED_MOE_ROUTE_TILE_SMALL;
+                        fprintf(
+                            stderr,
+                            "[metal-moe] S=%d routes=%llu "
+                            "nonempty=%u jobs16=%u jobs32=%u "
+                            "all16=%u all32=%u "
+                            "tile=%u "
+                            "capacity=%llu util=%.1f%% "
+                            "max_routes=%u\n",
+                            seq,
+                            (unsigned long long)routes,
+                            nonempty, jobs[0], jobs[1],
+                            theoretical_jobs16,
+                            theoretical_jobs32,
+                            use_large ? 32u : 16u,
+                            (unsigned long long)capacity,
+                            capacity
+                                ? 100.0 * (double)routes /
+                                      (double)capacity
+                                : 0.0,
+                            max_routes);
+                    }
+                }
+                auto quantize = [&](id<MTLBuffer> src, uint src_off,
+                                    int rows, int K, int row_stride,
+                                    int block_size, id<MTLBuffer> dst,
+                                    id<MTLBuffer> scales) {
                     QuantActParams q{};q.M=rows;q.K=K;q.a_offset=src_off;q.a_row_stride=row_stride;
-                    [enc setComputePipelineState:impl_->pipeline("quantize_act_i8")];
+                    q.block_size = block_size;
+                    [enc setComputePipelineState:impl_->pipeline(
+                        block_size == 32
+                            ? "quantize_act_i8_block32"
+                            : block_size
+                                ? "quantize_act_i8_blocks"
+                                : "quantize_act_i8")];
                     [enc setBuffer:src offset:0 atIndex:0];[enc setBuffer:dst offset:0 atIndex:2];
                     [enc setBytes:&q length:sizeof(q) atIndex:3];[enc setBuffer:scales offset:0 atIndex:4];
-                    [enc setThreadgroupMemoryLength:8*sizeof(float) atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(rows,1,1)
-                        threadsPerThreadgroup:MTLSizeMake(32,8,1)];
+                    constexpr NSUInteger nsg = 4;
+                    if (block_size != 32)
+                        [enc setThreadgroupMemoryLength:
+                                 nsg*sizeof(float) atIndex:0];
+                    const NSUInteger blocks =
+                        block_size
+                            ? (K + block_size - 1) / block_size
+                            : 1;
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (NSUInteger)rows *
+                                     (block_size == 32
+                                          ? (blocks + nsg - 1) / nsg
+                                          : blocks),
+                                 1,1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(32,nsg,1)];
                 };
-                quantize(buf_of(&x),(uint)eoffset(x),seq,hidden_size,estride(x,1),qx,sx);
+                if (!resident_qx_h) {
+                    quantize(buf_of(&x),(uint)eoffset(x),seq,hidden_size,
+                             estride(x,1),native_gu_group,qx,sx);
+                }
                 auto selected_gemm = [&](id<MTLBuffer> a,id<MTLBuffer> sa,const Tensor& w,
                                          size_t rows_total,int N,int K,int rows_per_expert,
                                          int activation_rows,int repeat,id<MTLBuffer> dst,int dst_stride) {
@@ -3701,34 +4407,300 @@ void MetalBackend::dispatch(const GraphNode& node,
                     sp.c_offset=0;sp.c_row_stride=dst_stride;sp.group_size=(int)w.group_size;
                     sp.groups_per_row=(int)w.groups_per_row;sp.rows_per_expert=rows_per_expert;
                     sp.activation_rows=activation_rows;sp.activation_repeat=repeat;
-                    [enc setComputePipelineState:impl_->pipeline("gemm_selected_w4a8_i8a_i4b_f32c")];
-                    [enc setBuffer:a offset:0 atIndex:0];[enc setBuffer:buf_of(&w) offset:w.device_offset atIndex:1];
-                    [enc setBuffer:dst offset:0 atIndex:2];[enc setBytes:&sp length:sizeof(sp) atIndex:3];
-                    [enc setBuffer:sa offset:0 atIndex:4];
-                    [enc setBuffer:buf_of(&w) offset:w.device_offset+rows_total*(K/2) atIndex:5];
-                    [enc setBuffer:idx offset:0 atIndex:6];
-                    [enc setThreadgroupMemoryLength:2*64*64*sizeof(int32_t) atIndex:0];
-                    [enc dispatchThreadgroups:MTLSizeMake(1,(N+63)/64,selections)
-                        threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                    if (native_bg128(w, rows_per_expert)) {
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "gemv_selected_experts_bg128_"
+                                     "i8a_i4b_f32c")];
+                        [enc setBuffer:a offset:0 atIndex:0];
+                        [enc setBuffer:buf_of(&w)
+                                offset:w.device_offset atIndex:1];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+                        [enc setBuffer:sa offset:0 atIndex:4];
+                        [enc setBuffer:idx offset:0 atIndex:6];
+                        constexpr NSUInteger nsg = 4;
+                        const NSUInteger rows_per_tg = nsg * 8;
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(
+                                     (N + rows_per_tg - 1) / rows_per_tg,
+                                     1, selections)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32,nsg,1)];
+                    } else if (native_bg32(
+                                   w, rows_per_expert)) {
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "gemv_selected_experts_bg32_"
+                                     "i8a_i4b_f32c")];
+                        [enc setBuffer:a offset:0 atIndex:0];
+                        [enc setBuffer:buf_of(&w)
+                                offset:w.device_offset atIndex:1];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+                        [enc setBuffer:sa offset:0 atIndex:4];
+                        [enc setBuffer:idx offset:0 atIndex:6];
+                        constexpr NSUInteger nsg = 2;
+                        const NSUInteger rows_per_tg = nsg * 8;
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(
+                                     (N + rows_per_tg - 1) / rows_per_tg,
+                                     1, selections)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32,nsg,1)];
+                    } else {
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "gemm_selected_w4a8_i8a_i4b_f32c")];
+                        [enc setBuffer:a offset:0 atIndex:0];
+                        [enc setBuffer:buf_of(&w)
+                                offset:w.device_offset atIndex:1];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+                        [enc setBuffer:sa offset:0 atIndex:4];
+                        [enc setBuffer:buf_of(&w)
+                                offset:w.device_offset+rows_total*(K/2)
+                               atIndex:5];
+                        [enc setBuffer:idx offset:0 atIndex:6];
+                        [enc setThreadgroupMemoryLength:
+                                 2*64*64*sizeof(int32_t) atIndex:0];
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(1,(N+63)/64,selections)
+                                    threadsPerThreadgroup:MTLSizeMake(128,1,1)];
+                    }
                 };
-                selected_gemm(qx,sx,gu,gu_rows,2*intermediate,hidden_size,
-                              2*intermediate,seq,top_k,merged,2*intermediate);
-                [enc setComputePipelineState:impl_->pipeline("moe_swiglu_selected")];
-                [enc setBuffer:merged offset:0 atIndex:0];[enc setBytes:&mp length:sizeof(mp) atIndex:3];
-                NSUInteger sw_n=(NSUInteger)selections*intermediate;
-                [enc dispatchThreadgroups:MTLSizeMake((sw_n+255)/256,1,1)
-                    threadsPerThreadgroup:MTLSizeMake(256,1,1)];
-                quantize(merged,0,selections,intermediate,2*intermediate,qi,si);
-                selected_gemm(qi,si,down,down_rows,hidden_size,intermediate,
-                              hidden_size,selections,1,selected,hidden_size);
-                [enc setComputePipelineState:impl_->pipeline("moe_combine_selected")];
-                [enc setBuffer:selected offset:0 atIndex:0];[enc setBuffer:buf_of(output) offset:0 atIndex:2];
-                [enc setBytes:&mp length:sizeof(mp) atIndex:3];[enc setBuffer:tw offset:0 atIndex:4];
-                [enc dispatchThreadgroups:MTLSizeMake((hidden_size+63)/64,(seq+3)/4,1)
-                    threadsPerThreadgroup:MTLSizeMake(64,4,1)];
+                auto grouped_gemm = [&](
+                    id<MTLBuffer> activation,
+                    id<MTLBuffer> activation_scales,
+                    const Tensor& weight,
+                    int output_rows,
+                    int inner,
+                    int rows_per_expert,
+                    bool activation_by_token,
+                    bool paired_gate_up,
+                    bool large_route_tile,
+                    id<MTLBuffer> destination,
+                    int destination_stride) {
+                    GroupedW4A8Params gp{};
+                    gp.experts = num_experts;
+                    gp.max_routes = seq;
+                    gp.top_k = top_k;
+                    gp.N = output_rows;
+                    gp.K = inner;
+                    gp.c_row_stride = destination_stride;
+                    gp.groups_per_row =
+                        (int)weight.groups_per_row;
+                    gp.rows_per_expert = rows_per_expert;
+                    gp.activation_by_token =
+                        activation_by_token ? 1 : 0;
+                    [enc setBuffer:activation
+                            offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(&weight)
+                            offset:weight.device_offset atIndex:1];
+                    [enc setBuffer:destination
+                            offset:0 atIndex:2];
+                    [enc setBytes:&gp
+                           length:sizeof(gp) atIndex:3];
+                    [enc setBuffer:activation_scales
+                            offset:0 atIndex:4];
+                    [enc setBuffer:expert_counts
+                            offset:0 atIndex:5];
+                    [enc setBuffer:expert_routes
+                            offset:0 atIndex:6];
+                    const NSUInteger projections =
+                        paired_gate_up ? 2 : 1;
+                    const NSUInteger output_tile =
+                        paired_gate_up
+                            ? MOLLM_GROUPED_MOE_GATE_UP_OUTPUT_TILE
+                            : MOLLM_GROUPED_MOE_DOWN_OUTPUT_TILE;
+                    const NSUInteger packed_weight_bytes =
+                        projections *
+                        (weight.group_size / 32) *
+                        output_tile * 32 / 2;
+                    const NSUInteger route_tile =
+                        large_route_tile
+                            ? MOLLM_GROUPED_MOE_ROUTE_TILE_LARGE
+                            : MOLLM_GROUPED_MOE_ROUTE_TILE_SMALL;
+                    const NSUInteger staging_bytes =
+                        packed_weight_bytes +
+                        4 * route_tile * 32 +
+                        (projections * output_tile + route_tile) *
+                            sizeof(float);
+                    const NSUInteger paired_accumulator_bytes =
+                        paired_gate_up
+                            ? projections * output_tile *
+                                  route_tile * sizeof(float)
+                            : 0;
+                    const NSUInteger total_threadgroup_bytes =
+                        std::max(
+                            staging_bytes,
+                            paired_accumulator_bytes);
+                    [enc setComputePipelineState:
+                             impl_->pipeline_grouped_moe(
+                                 (int)weight.group_size,
+                                 paired_gate_up,
+                                 large_route_tile)];
+                    [enc setBuffer:grouped_jobs
+                            offset:large_route_tile
+                                ? grouped_jobs_queue_bytes
+                                : 0
+                           atIndex:7];
+                    [enc setThreadgroupMemoryLength:
+                             total_threadgroup_bytes atIndex:0];
+                    const NSUInteger indirect_record =
+                        paired_gate_up
+                            ? (large_route_tile ? 1 : 0)
+                            : (large_route_tile ? 3 : 2);
+                    const NSUInteger indirect_offset =
+                        indirect_record * 3 * sizeof(uint32_t);
+                    [enc dispatchThreadgroupsWithIndirectBuffer:
+                             grouped_dispatch
+                        indirectBufferOffset:indirect_offset
+                        threadsPerThreadgroup:
+                             MTLSizeMake(
+                                 32 * MOLLM_GROUPED_MOE_SIMDGROUPS,
+                                 1, 1)];
+                };
+                if (grouped_prefill) {
+                    grouped_gemm(
+                        qx, sx, gu, intermediate,
+                        hidden_size, 2 * intermediate, true, true, false,
+                        merged, intermediate);
+                    grouped_gemm(
+                        qx, sx, gu, intermediate,
+                        hidden_size, 2 * intermediate, true, true, true,
+                        merged, intermediate);
+                } else {
+                    selected_gemm(
+                        qx,sx,gu,gu_rows,2*intermediate,
+                        hidden_size,2*intermediate,seq,top_k,
+                        merged,2*intermediate);
+                }
+                profile_resident_moe_stage("MOE.gate_up");
+                if (native_down) {
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 grouped_prefill
+                                     ? "moe_quantize_selected_blocks"
+                                     : "moe_swiglu_quantize_blocks")];
+                    [enc setBuffer:merged offset:0 atIndex:0];
+                    [enc setBuffer:qi offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:si offset:0 atIndex:4];
+                    [enc setThreadgroupMemoryLength:
+                             grouped_prefill
+                                 ? 0
+                                 : 4 * sizeof(float)
+                                            atIndex:0];
+                    const NSUInteger blocks =
+                        ((NSUInteger)intermediate + 127) / 128;
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (NSUInteger)selections * blocks,
+                                 1, 1)
+                        threadsPerThreadgroup:
+                             grouped_prefill
+                                 ? MTLSizeMake(32,1,1)
+                                 : MTLSizeMake(32,4,1)];
+                } else if (!grouped_prefill) {
+                    if (native_down_group == 32) {
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "moe_swiglu_quantize_block32")];
+                        [enc setBuffer:merged offset:0 atIndex:0];
+                        [enc setBuffer:qi offset:0 atIndex:2];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                        [enc setBuffer:si offset:0 atIndex:4];
+                        constexpr NSUInteger nsg = 4;
+                        const NSUInteger blocks =
+                            ((NSUInteger)intermediate + 31) / 32;
+                        const NSUInteger block_groups =
+                            (blocks + nsg - 1) / nsg;
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(
+                                     (NSUInteger)selections *
+                                         block_groups,
+                                     1,1)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32,nsg,1)];
+                    } else {
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "moe_swiglu_selected")];
+                        [enc setBuffer:merged offset:0 atIndex:0];
+                        [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                        const NSUInteger sw_n =
+                            (NSUInteger)selections * intermediate;
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake((sw_n+255)/256,1,1)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(256,1,1)];
+                        quantize(merged,0,selections,intermediate,
+                                 2*intermediate,
+                                 native_down_group,qi,si);
+                    }
+                } else {
+                    quantize(merged,0,selections,intermediate,
+                             intermediate,native_down_group,qi,si);
+                }
+                profile_resident_moe_stage("MOE.swiglu_quant");
+                if (grouped_prefill) {
+                    grouped_gemm(
+                        qi, si, down, hidden_size,
+                        intermediate, hidden_size, false, false, false,
+                        selected, hidden_size);
+                    grouped_gemm(
+                        qi, si, down, hidden_size,
+                        intermediate, hidden_size, false, false, true,
+                        selected, hidden_size);
+                } else {
+                    selected_gemm(
+                        qi,si,down,down_rows,hidden_size,intermediate,
+                        hidden_size,selections,1,selected,hidden_size);
+                }
+                profile_resident_moe_stage("MOE.down");
+                [enc setComputePipelineState:
+                         impl_->pipeline(
+                             "moe_combine_selected")];
+                [enc setBuffer:selected offset:0 atIndex:0];
+                [enc setBuffer:buf_of(output)
+                        offset:0 atIndex:2];
+                [enc setBytes:&mp
+                       length:sizeof(mp) atIndex:3];
+                [enc setBuffer:tw offset:0 atIndex:4];
+                if (seq == 1) {
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (hidden_size + 255) / 256,
+                                 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(256, 1, 1)];
+                } else {
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (hidden_size + 63) / 64,
+                                 (seq + 3) / 4, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(64, 4, 1)];
+                }
                 impl_->pending_free.push_back({qx_h,qx_bytes});impl_->pending_free.push_back({sx_h,sx_bytes});
                 impl_->pending_free.push_back({qi_h,qi_bytes});impl_->pending_free.push_back({si_h,si_bytes});
-                impl_->pending_free.push_back({selected_h,selected_bytes});
+                impl_->pending_free.push_back(
+                    {selected_h,selected_bytes});
+                if (grouped_prefill) {
+                    impl_->pending_free.push_back(
+                        {expert_counts_h, expert_counts_bytes});
+                    impl_->pending_free.push_back(
+                        {expert_routes_h, expert_routes_bytes});
+                    impl_->pending_free.push_back(
+                        {grouped_jobs_h, grouped_jobs_bytes});
+                    impl_->pending_free.push_back(
+                        {grouped_job_count_h,
+                         grouped_job_count_bytes});
+                    impl_->pending_free.push_back(
+                        {grouped_dispatch_h,
+                         grouped_dispatch_bytes});
+                }
                 impl_->pending_free.push_back({idx_h,idx_bytes});impl_->pending_free.push_back({tw_h,tw_bytes});
                 impl_->pending_free.push_back({logits_h,logits_bytes});impl_->pending_free.push_back({merged_h,merged_bytes});
                 break;

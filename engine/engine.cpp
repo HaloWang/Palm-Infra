@@ -89,6 +89,10 @@ std::vector<uint8_t> find_borrowed_views(const Graph& graph) {
         if (node.op_type == OpType::RESHAPE && !node.inputs.empty()) {
             is_borrowed =
                 tensors[node.id].shares_storage_with(tensors[node.inputs[0]]);
+        } else if (node.op_type == OpType::CONTIGUOUS &&
+                   !node.inputs.empty()) {
+            is_borrowed =
+                tensors[node.id].shares_storage_with(tensors[node.inputs[0]]);
         }
         borrowed[node.id] = is_borrowed ? 1 : 0;
     }
@@ -626,7 +630,7 @@ void LLMEngine::prepare_metal_prefill_weights() {
         t.data = cpu_data;
         const bool aggregate_expert =
             node.params.str[0].find("_experts_") != std::string::npos;
-        metal->wrap_weight_int4_g128(t, aggregate_expert);
+        metal->wrap_weight_int4(t, aggregate_expert);
     }
 #endif
 }

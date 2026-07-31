@@ -28,6 +28,7 @@ struct Options {
     std::string token_loss_path;
     bool prepend_bos = false;
     bool tokenize_only = false;
+    bool apply_chat_template = false;
     bool decode_token_by_token = false;
     bool metal_ssd_full = false;
     Device device = Device::CPU;
@@ -68,6 +69,7 @@ void print_usage(const char* argv0) {
     std::printf("  --prepend-bos         Prepend tokenizer BOS before scoring\n");
     std::printf("  --decode-token-by-token  Score through decode_hidden after the first token\n");
     std::printf("  --tokenize-only       Print token ids and exit before running the model\n");
+    std::printf("  --apply-chat-template Wrap text as one user turn before tokenization\n");
 }
 
 bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
@@ -166,6 +168,8 @@ bool parse_args(int argc, char** argv, Options& opts, std::string& error) {
             opts.decode_token_by_token = true;
         } else if (arg == "--tokenize-only") {
             opts.tokenize_only = true;
+        } else if (arg == "--apply-chat-template") {
+            opts.apply_chat_template = true;
         } else {
             error = std::string("unknown argument: ") + arg;
             return false;
@@ -245,12 +249,28 @@ int main(int argc, char** argv) {
     }
 
     Tokenizer tokenizer;
-    if (!tokenizer.load(engine.config().tokenizer_path)) {
+    const auto architecture_it =
+        engine.package_metadata().find("architecture");
+    const std::string architecture =
+        architecture_it != engine.package_metadata().end()
+            ? architecture_it->second
+            : std::string();
+    if (!tokenizer.load(engine.config().tokenizer_path,
+                        engine.config().chat_template_path, architecture)) {
         std::fprintf(stderr, "ppl: failed to load tokenizer\n");
         return 1;
     }
+    const auto rwkv_template =
+        engine.package_metadata().find("rwkv_chat_template");
+    if (rwkv_template != engine.package_metadata().end() &&
+        rwkv_template->second == "rwkv_legacy") {
+        tokenizer.set_rwkv_legacy_chat_template(true);
+    }
 
-    std::vector<int> token_ids = tokenizer.encode(text);
+    std::vector<int> token_ids =
+        opts.apply_chat_template
+            ? tokenizer.apply_chat(text)
+            : tokenizer.encode(text);
     if (opts.prepend_bos && tokenizer.bos_id() >= 0) {
         token_ids.insert(token_ids.begin(), tokenizer.bos_id());
     }

@@ -123,6 +123,27 @@ struct SelectedW4A8Params {
     int activation_repeat;
 };
 
+// Expert-grouped resident MoE GEMM. Routes are stored in fixed per-expert
+// segments of max_routes entries; each entry is the original [token, top-k]
+// selection index so outputs can be written directly in canonical order.
+#define MOLLM_GROUPED_MOE_GATE_UP_OUTPUT_TILE 32
+#define MOLLM_GROUPED_MOE_DOWN_OUTPUT_TILE 64
+#define MOLLM_GROUPED_MOE_ROUTE_TILE_SMALL 16
+#define MOLLM_GROUPED_MOE_ROUTE_TILE_LARGE 32
+#define MOLLM_GROUPED_MOE_SIMDGROUPS 2
+
+struct GroupedW4A8Params {
+    int experts;
+    int max_routes;
+    int top_k;
+    int N;
+    int K;
+    int c_row_stride;
+    int groups_per_row;
+    int rows_per_expert;
+    int activation_by_token;
+};
+
 // Per-token activation quantization: A_f32[M,K] -> A_i8[M,K] + scale_a[M].
 // scale_a[m] = absmax(row m)/127; a_i8[m,k] = round(a[m,k]/scale_a[m]).
 struct QuantActParams {
@@ -159,6 +180,26 @@ struct RmsNormRopeParams {
     uint  sin_offset;
     uint  out_offset;
     int   x_row_stride;
+    int   out_row_stride;
+    float eps;
+};
+
+struct QkRmsNormRopeParams {
+    int   dim0;
+    int   rows;
+    int   seq_len;
+    int   query_heads;
+    int   rope_dim;
+    int   interleave;
+    uint  query_x_offset;
+    uint  key_x_offset;
+    uint  query_w_offset;
+    uint  key_w_offset;
+    uint  cos_offset;
+    uint  sin_offset;
+    uint  out_offset;
+    int   query_x_row_stride;
+    int   key_x_row_stride;
     int   out_row_stride;
     float eps;
 };
@@ -275,7 +316,8 @@ struct Rwkv7Params {
     uint out_offset;
 };
 
-// Fused routed-expert MoE using decoded row-major W4-G128 expert weights.
+// Fused routed-expert MoE using W4-G128 expert weights. Resident and SSD
+// selected-expert kernels may consume the package-native BG128 block layout.
 // Route buffers are [seq,top_k]; merged is [seq,top_k,2*intermediate].
 struct MoeW4Params {
     int hidden;
@@ -361,16 +403,21 @@ struct ShortConvParams {
 // KV-cache append: copy K_cur/V_cur (FP32) rows into the FP16 cache at
 // position (past + s), per kv-head. cache element offset already accounts for
 // the 64-byte CacheMetadata header (added on the host as a byte offset).
-struct SdpaAppendParams {
+struct SdpaAppendKvParams {
     int  num_kv_heads;
     int  cur_seqlen;
     int  past_seqlen;
-    int  head_dim;       // width of the row being copied (head_dim or v_head_dim)
-    int  max_seq_len;    // cache capacity (stride between kv-heads = head_dim*max_seq_len)
-    uint cur_offset;     // element offset into K_cur/V_cur buffer
-    int  cur_stride_head;// elements between kv-heads in K_cur/V_cur (stride[2])
-    int  cur_stride_pos; // elements between positions in K_cur/V_cur (stride[1])
-    uint cache_offset;   // element offset into cache buffer (past the metadata header)
+    int  max_seq_len;
+    int  k_dim;
+    int  v_dim;
+    uint k_cur_offset;
+    int  k_stride_head;
+    int  k_stride_pos;
+    uint k_cache_offset;
+    uint v_cur_offset;
+    int  v_stride_head;
+    int  v_stride_pos;
+    uint v_cache_offset;
 };
 
 // SDPA compute: one threadgroup per (head, query position). Loops over all

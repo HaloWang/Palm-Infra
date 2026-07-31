@@ -118,9 +118,11 @@ struct EngineConfig {
 
     SamplingParams sampling;
 
-    // Output-only: set by load() when package contains a tokenizer.
-    // Callers (e.g. CLI) read this to load the Tokenizer after engine.load().
+    // Output-only: set by load() from embedded package assets.
+    // Callers use both paths so chat formatting follows the package's actual
+    // template instead of guessing from its special-token vocabulary.
     std::string tokenizer_path;
+    std::string chat_template_path;
 
     // When true, load the decode graph as the prefill graph too (so prefill()
     // runs the seq=1 graph). Used by test_e2e; enabled automatically for the
@@ -384,7 +386,7 @@ private:
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
     bool load_package(const std::string& path, std::string& pf_path,
                       std::string& dc_path, std::string& vi_path,
-                      std::string& tok_path);
+                      std::string& tok_path, std::string& jinja_path);
     size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import struct
 import tempfile
@@ -263,6 +264,8 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
     dense_until = int(cfg.get("first_k_dense_replace", 0))
     n_shared = int(cfg.get("n_shared_experts", 0) or 0)
     weight_map = _weight_map(model_dir)
+    qkv_parts: dict[int, dict[str, np.ndarray]] = {}
+    dense_gate_up_parts: dict[int, dict[str, np.ndarray]] = {}
 
     def save(name: str, data: np.ndarray, quantizable: bool = False,
              raw_name: str = ""):
@@ -294,8 +297,58 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
             save(wname.replace(".", "_"), _as_fp16(dtype_str, wdata),
                  quantizable=False, raw_name=wname)
             continue
+        qkv_match = re.match(
+            r"^model\.layers\.(\d+)\.self_attn\."
+            r"(q_proj|k_proj|v_proj)\.weight$",
+            wname)
+        if qkv_match:
+            layer_idx = int(qkv_match.group(1))
+            kind = qkv_match.group(2)
+            parts = qkv_parts.setdefault(layer_idx, {})
+            parts[kind] = _as_fp16(dtype_str, wdata)
+            if len(parts) == 3:
+                merged = np.concatenate(
+                    [parts["q_proj"], parts["k_proj"], parts["v_proj"]],
+                    axis=0)
+                save(
+                    f"model_layers_{layer_idx}_self_attn_qkv_proj_weight",
+                    merged, quantizable=True,
+                    raw_name=(
+                        f"model.layers.{layer_idx}."
+                        "self_attn.qkv_proj.weight"))
+                del qkv_parts[layer_idx]
+            continue
+        dense_match = re.match(
+            r"^model\.layers\.(\d+)\.mlp\."
+            r"(gate_proj|up_proj)\.weight$",
+            wname)
+        if dense_match and int(dense_match.group(1)) < dense_until:
+            layer_idx = int(dense_match.group(1))
+            kind = dense_match.group(2)
+            parts = dense_gate_up_parts.setdefault(layer_idx, {})
+            parts[kind] = _as_fp16(dtype_str, wdata)
+            if len(parts) == 2:
+                merged = np.concatenate(
+                    [parts["gate_proj"], parts["up_proj"]], axis=0)
+                save(
+                    f"model_layers_{layer_idx}_mlp_gate_up_proj_weight",
+                    merged, quantizable=True,
+                    raw_name=(
+                        f"model.layers.{layer_idx}."
+                        "mlp.gate_up_proj.weight"))
+                del dense_gate_up_parts[layer_idx]
+            continue
         d = _as_fp16(dtype_str, wdata)
         save(wname.replace(".", "_"), d, quantizable=True, raw_name=wname)
+
+    if qkv_parts:
+        raise KeyError(
+            "incomplete Q/K/V projection sets for layers: "
+            + ", ".join(str(i) for i in sorted(qkv_parts)))
+    if dense_gate_up_parts:
+        raise KeyError(
+            "incomplete dense gate/up projection sets for layers: "
+            + ", ".join(str(i) for i in sorted(dense_gate_up_parts)))
 
     for layer_idx in range(dense_until, num_layers):
         print(f"  Exporting MoE experts layer {layer_idx}/{num_layers - 1}...")
@@ -399,11 +452,37 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                      prec=Precision.FP16)
         caches.append((ck, cv))
 
+    input_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_layers_{i}_input_layernorm_weight.weights"),
+            (hidden_size,), Precision.FP32)
+        for i in range(num_layers)
+    ]
+    post_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_layers_{i}_post_attention_layernorm_weight.weights"),
+            (hidden_size,), Precision.FP32)
+        for i in range(num_layers)
+    ]
+    final_norm_weight = g.weight(
+        os.path.join(weights_dir, "final_norm.weights"),
+        (hidden_size,), Precision.FP32)
+
     x = hidden
+    x_normed = g.rms_norm(x, input_norm_weights[0], eps=eps)
     for i in range(num_layers):
         ck, cv = caches[i]
-        x = _build_layer(
-            g, x, i, weights_dir, cos, sin, mask, ck, cv, eps, seq_len,
+        next_norm_weight = (
+            input_norm_weights[i + 1]
+            if i + 1 < num_layers else final_norm_weight
+        )
+        x, x_normed = _build_layer(
+            g, x, x_normed, post_norm_weights[i], next_norm_weight,
+            i, weights_dir, cos, sin, mask, ck, cv, eps, seq_len,
             num_heads, num_kv_heads, head_dim, hidden_size, intermediate,
             moe_intermediate, num_experts, top_k, dense_until,
             shared_intermediate, n_shared, _has_router_bias(cfg),
@@ -416,15 +495,15 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
             rope_interleave,
             is_prefill=is_prefill)
 
-    w_norm = g.weight(os.path.join(weights_dir, "final_norm.weights"),
-                      (hidden_size,), Precision.FP32)
-    x = g.rms_norm(x, w_norm, eps=eps)
+    x = x_normed
 
     print(f"  Total: {len(g._nodes)} nodes")
     return g
 
 
-def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
+def _build_layer(g: GraphBuilder, x: int, x_normed: int,
+                 post_norm_weight: int, next_norm_weight: int,
+                 layer_idx: int, weights_dir: str,
                  cos: int, sin: int, mask: int, ck_in: int, cv_in: int,
                  eps: float, seq_len: int, num_heads: int, num_kv_heads: int,
                  head_dim: int, hidden_size: int, intermediate: int,
@@ -436,31 +515,26 @@ def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
                  rope_interleave: bool, is_prefill: bool = False) -> int:
     pfx = f"model_layers_{layer_idx}"
 
-    w_ln = g.weight(os.path.join(weights_dir, f"{pfx}_input_layernorm_weight.weights"),
-                    (hidden_size,), Precision.FP32)
-    x_normed = g.rms_norm(x, w_ln, eps=eps)
-
     attn_out = _build_attention(
         g, x_normed, layer_idx, weights_dir, cos, sin, mask, ck_in, cv_in,
         eps, seq_len, num_heads, num_kv_heads, head_dim, hidden_size,
         attn_norm_kind, rope_interleave, is_prefill=is_prefill)
-    x = g.add(x, attn_out)
-
-    w_ln2 = g.weight(os.path.join(weights_dir, f"{pfx}_post_attention_layernorm_weight.weights"),
-                     (hidden_size,), Precision.FP32)
-    x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
+    x_normed2 = g.add_rms_norm(
+        x, attn_out, post_norm_weight, eps=eps)
 
     mlp_pfx = f"{pfx}_mlp"
     if layer_idx < dense_until:
-        w_gate = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_gate_proj_weight.weights"),
-                          (intermediate, hidden_size), Precision.FP16)
-        w_up = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_up_proj_weight.weights"),
-                        (intermediate, hidden_size), Precision.FP16)
+        w_gate_up = g.weight(
+            os.path.join(
+                weights_dir, f"{mlp_pfx}_gate_up_proj_weight.weights"),
+            (2 * intermediate, hidden_size), Precision.FP16)
         w_down = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_down_proj_weight.weights"),
                           (hidden_size, intermediate), Precision.FP16)
-        gate = g.silu(g.matmul(x_normed2, w_gate))
-        up = g.matmul(x_normed2, w_up)
-        return g.add(x, g.matmul(g.mul(gate, up), w_down))
+        mlp_hidden = g.swiglu(g.matmul(x_normed2, w_gate_up))
+        mlp_out = g.matmul(mlp_hidden, w_down)
+        next_x_normed = g.add_rms_norm(
+            x, mlp_out, next_norm_weight, eps=eps)
+        return x, next_x_normed
 
     w_router = g.weight(os.path.join(weights_dir, f"{mlp_pfx}_gate_weight.weights"),
                         (num_experts, hidden_size), Precision.FP16)
@@ -507,7 +581,9 @@ def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling_factor=routed_scaling_factor)
-    return g.add(x, mlp_out)
+    next_x_normed = g.add_rms_norm(
+        x, mlp_out, next_norm_weight, eps=eps)
+    return x, next_x_normed
 
 
 def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
@@ -521,16 +597,13 @@ def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     _S = SEQ_SYMBOL.bind(seq_len) if is_prefill else seq_len
     pfx = f"model_layers_{layer_idx}_self_attn"
 
-    w_q = g.weight(os.path.join(weights_dir, f"{pfx}_q_proj_weight.weights"),
-                   (num_heads * head_dim, hidden_size), Precision.FP16)
-    w_k = g.weight(os.path.join(weights_dir, f"{pfx}_k_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-    w_v = g.weight(os.path.join(weights_dir, f"{pfx}_v_proj_weight.weights"),
-                   (num_kv_heads * head_dim, hidden_size), Precision.FP16)
-
-    query = g.matmul(x, w_q)
-    k = g.matmul(x, w_k)
-    v = g.matmul(x, w_v)
+    q_dim = num_heads * head_dim
+    kv_dim = num_kv_heads * head_dim
+    w_qkv = g.weight(
+        os.path.join(weights_dir, f"{pfx}_qkv_proj_weight.weights"),
+        (q_dim + 2 * kv_dim, hidden_size), Precision.FP16)
+    qkv = g.matmul(x, w_qkv)
+    query, k, v = g.slice(qkv, [q_dim, kv_dim, kv_dim], dim=0)
 
     q_norm_name, k_norm_name = _norm_suffixes({
         "_attn_norm_kind": attn_norm_kind,
@@ -544,23 +617,16 @@ def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     query = g.reshape(query, (head_dim, num_heads, _S))
     query = g.permute(query, (0, 2, 1, 3))
     query = g.reshape(query, (head_dim, num_heads * _S))
-    query = g.rms_norm(query, w_qn, eps=eps)
-    query = g.reshape(query, (head_dim, _S, num_heads))
-    query = g.contiguous(query)
-
     k = g.reshape(k, (head_dim, num_kv_heads, _S))
     k = g.permute(k, (0, 2, 1, 3))
     k = g.reshape(k, (head_dim, num_kv_heads * _S))
-    k = g.rms_norm(k, w_kn, eps=eps)
-    k = g.reshape(k, (head_dim, _S, num_kv_heads))
-    k = g.contiguous(k)
+    qk = g.qk_rms_norm_rope(
+        query, k, w_qn, w_kn, cos, sin, _S, num_heads, num_kv_heads,
+        rope_dim=head_dim, interleave=rope_interleave, eps=eps)
+    query, k = g.slice(qk, [num_heads, num_kv_heads], dim=2)
 
     v = g.reshape(v, (head_dim, num_kv_heads, _S))
     v = g.permute(v, (0, 2, 1, 3))
-    v = g.contiguous(v)
-
-    query = g.rope(query, cos, sin, rope_dim=head_dim, interleave=rope_interleave)
-    k = g.rope(k, cos, sin, rope_dim=head_dim, interleave=rope_interleave)
 
     attn, _, _ = g.sdpa(
         query, k, v, mask, ck_in, cv_in,

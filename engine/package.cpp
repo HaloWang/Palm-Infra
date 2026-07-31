@@ -305,7 +305,8 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
 
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& dc_path, std::string& vi_path,
-                             std::string& tok_path) {
+                             std::string& tok_path,
+                             std::string& jinja_path) {
     ScopedFd package_file(open(path.c_str(), O_RDONLY));
     if (package_file.get() < 0) {
         fprintf(stderr, "Engine: failed to open package %s\n", path.c_str());
@@ -613,6 +614,9 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                  temp_files_) &&
             extract_temp_section(package_file.get(), nullptr, ph.tok_off,
                                  ph.tok_len, "tokenizer", tok_path,
+                                 temp_files_) &&
+            extract_temp_section(package_file.get(), nullptr, ph.jin_off,
+                                 ph.jin_len, "chat template", jinja_path,
                                  temp_files_);
         if (!ok)
             return false;
@@ -642,7 +646,9 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         !extract_temp_section(-1, base, ph.vi_off, ph.vi_len, "vision graph",
                               vi_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.tok_off, ph.tok_len, "tokenizer",
-                              tok_path, temp_files_)) {
+                              tok_path, temp_files_) ||
+        !extract_temp_section(-1, base, ph.jin_off, ph.jin_len,
+                              "chat template", jinja_path, temp_files_)) {
         return false;
     }
 

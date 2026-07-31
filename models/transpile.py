@@ -46,6 +46,7 @@ class OpType(IntEnum):
     LAYER_NORM     = 21
     ADD_RMS_NORM   = 22
     RMS_NORM_ROPE  = 23
+    QK_RMS_NORM_ROPE = 24
     SILU           = 30
     GELU           = 31
     TANH           = 32
@@ -284,10 +285,11 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.SHORTCONV,
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
               OpType.RWKV_L2_NORM, OpType.RWKV_POST,
-              OpType.MOE, OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD):
+              OpType.MOE,
+              OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
 
-    if op == OpType.RMS_NORM_ROPE:
+    if op in (OpType.RMS_NORM_ROPE, OpType.QK_RMS_NORM_ROPE):
         return node.dim_expr
 
     if op in (OpType.ADD, OpType.MUL, OpType.SIGMOID_MUL):
@@ -543,6 +545,36 @@ class GraphBuilder:
             OpType.RMS_NORM_ROPE, [x, weight, cos, sin],
             (dim, seq_static, heads), prec=self._nodes[x].out_prec,
             i32=[rope_dim, 1 if interleave else 0], f32=[eps])
+        if dynamic_seq:
+            self._nodes[nid].dim_expr = (
+                DimExpr.const(), DimExpr.seq(),
+                DimExpr.const(), DimExpr.const())
+        return nid
+
+    def qk_rms_norm_rope(self, query: int, key: int,
+                         query_weight: int, key_weight: int,
+                         cos: int, sin: int, seq_len,
+                         query_heads: int, key_heads: int,
+                         rope_dim: int = 64, interleave: bool = True,
+                         eps: float = 1e-6) -> int:
+        """Normalize and rotate Q and K in one parallel backend dispatch.
+
+        The combined output is laid out as [head_dim, seq, q_heads+k_heads].
+        Callers can recover Q and K with zero-copy slices along dim 2.
+        """
+        query_dim = self._nodes[query].out_shape[0]
+        key_dim = self._nodes[key].out_shape[0]
+        assert query_dim == key_dim, (
+            f"Q/K head dim mismatch: {query_dim} vs {key_dim}")
+        dynamic_seq = isinstance(seq_len, _SeqSymbol)
+        seq_static = seq_len.build_value if dynamic_seq else seq_len
+        nid = self._add(
+            OpType.QK_RMS_NORM_ROPE,
+            [query, key, query_weight, key_weight, cos, sin],
+            (query_dim, seq_static, query_heads + key_heads),
+            prec=self._nodes[query].out_prec,
+            i32=[rope_dim, 1 if interleave else 0, query_heads],
+            f32=[eps])
         if dynamic_seq:
             self._nodes[nid].dim_expr = (
                 DimExpr.const(), DimExpr.seq(),
@@ -1792,6 +1824,35 @@ def save_package(output_path: str,
         if jinja_path and os.path.exists(jinja_path):
             with open(jinja_path, 'rb') as jf:
                 jinja_bytes = jf.read()
+        elif tokenizer_path:
+            # Some Hugging Face checkpoints store the template only inside
+            # tokenizer_config.json. Preserve it in the package so the runtime
+            # never has to infer formatting from an ambiguous special-token
+            # vocabulary.
+            tokenizer_config_path = os.path.join(
+                os.path.dirname(tokenizer_path), "tokenizer_config.json")
+            if os.path.exists(tokenizer_config_path):
+                with open(tokenizer_config_path, encoding="utf-8") as cf:
+                    tokenizer_config = json.load(cf)
+                chat_template = tokenizer_config.get("chat_template", "")
+                if isinstance(chat_template, dict):
+                    chat_template = (
+                        chat_template.get("default")
+                        or next(iter(chat_template.values()), ""))
+                elif isinstance(chat_template, list):
+                    default = next(
+                        (item.get("template", "")
+                         for item in chat_template
+                         if isinstance(item, dict)
+                         and item.get("name") == "default"),
+                        "")
+                    chat_template = default or next(
+                        (item.get("template", "")
+                         for item in chat_template
+                         if isinstance(item, dict)),
+                        "")
+                if isinstance(chat_template, str):
+                    jinja_bytes = chat_template.encode("utf-8")
 
         # Step 6: write package
         hs = PACKAGE_HEADER_SIZE

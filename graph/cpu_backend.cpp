@@ -96,6 +96,49 @@ void CPUBackend::dispatch(const GraphNode& node,
         }
         break;
 
+    case OpType::QK_RMS_NORM_ROPE:
+        if (inputs.size() >= 6 && output) {
+            const int dim = (int)output->shape[0];
+            const int seq = (int)output->shape[1];
+            const int total_heads = (int)output->shape[2];
+            const int query_heads =
+                graph_params::get_i32(params, 2, total_heads);
+            const int key_heads = total_heads - query_heads;
+            if (query_heads <= 0 || key_heads <= 0) {
+                reject();
+                break;
+            }
+
+            auto run = [&](const Tensor& x, const Tensor& weight,
+                           int heads, Tensor& out) {
+                std::vector<float> normalized(
+                    (size_t)dim * (size_t)seq * (size_t)heads);
+                Tensor tmp = Tensor::create(
+                    Precision::FP32, MemoryType::EXTERNAL,
+                    dim, seq, heads, 1, normalized.data());
+                kernel_rms_norm(
+                    x, weight,
+                    graph_params::get_f32(params, 0, 1e-6f), tmp);
+                kernel_rope(
+                    tmp, *inputs[4], *inputs[5],
+                    graph_params::get_i32(params, 0, dim),
+                    graph_params::get_i32(params, 1, 1) != 0, out);
+            };
+
+            Tensor query_out = *output;
+            query_out.shape[2] = query_heads;
+            Tensor key_out = *output;
+            key_out.shape[2] = key_heads;
+            const size_t key_offset =
+                (size_t)query_heads * output->stride[2];
+            key_out.data =
+                static_cast<char*>(output->data) + key_offset;
+            key_out.device_offset = output->device_offset + key_offset;
+            run(*inputs[0], *inputs[2], query_heads, query_out);
+            run(*inputs[1], *inputs[3], key_heads, key_out);
+        }
+        break;
+
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
         std::vector<Tensor*> sdpa_outs = { output };
