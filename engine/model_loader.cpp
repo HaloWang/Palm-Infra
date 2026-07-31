@@ -1121,14 +1121,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // Resident DeepSeek-V4 graphs are fully device-resident on CUDA.
-        // Metal and CUDA SSD-streamed experts still use a CPU graph. Metal
-        // may delegate routed MXFP4 experts through its SSD cache; CUDA expert
-        // streaming needs a separate device-cache policy.
-        const bool unsupported_accelerator =
-            cfg_.device == Device::METAL ||
-            (cfg_.device == Device::CUDA &&
-             cfg_.moe_ssd_cache_bytes != 0);
+        // Resident and SSD-streamed DeepSeek-V4 graphs run on CUDA. Metal
+        // uses a CPU graph, but may delegate routed MXFP4 experts through its
+        // dedicated SSD cache.
+        const bool unsupported_accelerator = cfg_.device == Device::METAL;
         if (unsupported_accelerator) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
@@ -1186,9 +1182,18 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                             "load directly into Shared Metal buffers\n");
                 }
             } else {
-                fprintf(stderr,
-                        "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "
-                        "prefill and uses CPU decode; experts remain mmap-backed\n");
+                if (cfg_.device == Device::CUDA) {
+                    fprintf(
+                        stderr,
+                        "Engine: CUDA SSD expert streaming enabled; selected "
+                        "MXFP4 experts use compact device scratch\n");
+                } else {
+                    fprintf(
+                        stderr,
+                        "Engine: Metal/SSD hybrid adaptively selects "
+                        "CPU/Metal prefill and uses CPU decode; experts remain "
+                        "mmap-backed\n");
+                }
             }
         } else {
             if (!accelerator_backend_->register_weight_region(
