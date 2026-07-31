@@ -301,6 +301,7 @@ public:
 private:
     void prepare_accelerator_prefill_weights();
     bool decode_uses_metal_expert_cache() const;
+    void release_vision_buffers();
 
     EngineConfig cfg_;
     Sampler sampler_;

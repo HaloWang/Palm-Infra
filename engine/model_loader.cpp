@@ -1047,6 +1047,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             exec_ctx_prefill_.backend = accelerator_backend_.get();
             exec_ctx_decode_.backend = accelerator_backend_.get();
             exec_ctx_mtp_.backend = accelerator_backend_.get();
+            exec_ctx_vision_.backend = accelerator_backend_.get();
         }
 #else
         fprintf(stderr,

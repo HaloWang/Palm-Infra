@@ -893,6 +893,12 @@ bool LLMEngine::decode_uses_metal_expert_cache() const {
             exec_ctx_decode_.moe_backend == accelerator_backend_.get());
 }
 
+void LLMEngine::release_vision_buffers() {
+    release_graph_temporaries(graph_vision_, exec_ctx_vision_.backend);
+    graph_vision_.runtime.pool.clear();
+    invalidate_workspace_key(exec_ctx_vision_);
+}
+
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
     mollm_trace::ScopedEvent trace_prefill("inference", "prefill");
     int n = (int)token_ids.size();
