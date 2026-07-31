@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "graph/execute.h"
 #include "engine/backend.h"
+#include "engine/accelerator_backend.h"
 #include "engine/sampler.h"
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
@@ -73,6 +74,7 @@ enum class WeightLoadingMode {
 enum class Device {
     CPU,
     METAL,
+    CUDA,
 };
 
 #if defined(__APPLE__)
@@ -87,7 +89,7 @@ struct EngineConfig {
     static constexpr int kAbsoluteImageMaxPixels = 1024 * 1024;
 
     std::string package_path;         // .mollm single-file package (required)
-    Device device = Device::CPU;      // compute backend (METAL requires MOLLM_METAL)
+    Device device = Device::CPU;      // optional GPU backends require their CMake option
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
@@ -297,7 +299,7 @@ public:
                                        bool all_positions = false);
 
 private:
-    void prepare_metal_prefill_weights();
+    void prepare_accelerator_prefill_weights();
     bool decode_uses_metal_expert_cache() const;
 
     EngineConfig cfg_;
@@ -312,9 +314,9 @@ private:
     ExecContext exec_ctx_mtp_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
-    // Owned Metal backend (as base Backend* so the header needs no ObjC/Metal
-    // include). Non-null iff Metal is active; Backend has a virtual destructor.
-    std::unique_ptr<Backend> metal_backend_;
+    // Active graph-resident accelerator. The engine is deliberately unaware
+    // of Metal/CUDA resource types.
+    std::unique_ptr<AcceleratorBackend> accelerator_backend_;
     int past_len_ = 0;
     int mtp_past_len_ = 0;
     MtpStats mtp_stats_;
@@ -416,14 +418,14 @@ private:
 
     /// Run lm_head on the last hidden state.
     int run_lmhead(const Tensor& hidden, int n_tokens = 1,
-                   bool finish_metal_graph = false);
+                   bool finish_accelerator_graph = false);
 
     /// Feed inputs, run graph, extract output.
     Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
                      const Tensor& hidden, const Tensor& mask,
                      const Tensor& cos, const Tensor& sin,
                      const Tensor* token_ids = nullptr,
-                     bool defer_metal_end = false,
+                     bool defer_accelerator_end = false,
                      const Tensor* target_hidden = nullptr,
                      int graph_position = -1,
                      int stop_after_node_index = -1);
