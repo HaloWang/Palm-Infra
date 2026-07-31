@@ -2,6 +2,7 @@
 
 #include "kernels/matmul.h"
 #include "kernels/matmul_profile.h"
+#include "kernels/quant_layouts.h"
 
 #include <algorithm>
 #include <cstdint>
