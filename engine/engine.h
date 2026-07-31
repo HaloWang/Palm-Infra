@@ -473,8 +473,10 @@ private:
     size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.
-    void allocate_caches(Graph& g, ExecContext& exec_ctx,
+    bool allocate_caches(Graph& g, ExecContext& exec_ctx,
                          std::vector<CachePair>& caches, int n_ctx);
+    Backend* persistent_backend() const;
+    bool set_cache_lengths(std::vector<CachePair>& caches, uint64_t length);
 
     /// Process a single chunk of tokens (≤ graph_seq_len).
     /// Called by prefill() in a loop for chunked prefill.
