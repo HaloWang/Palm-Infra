@@ -220,6 +220,17 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
         print_kv_ssd_phase("decode", decode_ssd, m.decode_tokens,
                            "decode_token");
         const auto& ssd = decode_ssd;
+        if (engine.config().moe_device_cache_bytes != 0) {
+            const auto device = engine.moe_device_cache_stats();
+            std::printf("moe_device_cache_mb=%.1f moe_device_hits=%llu moe_device_misses=%llu moe_device_evictions=%llu moe_device_h2d_mb=%.1f moe_device_d2d_mb=%.1f moe_device_resident_mb=%.1f\n",
+                        device.capacity_bytes / 1e6,
+                        (unsigned long long)device.hits,
+                        (unsigned long long)device.misses,
+                        (unsigned long long)device.evictions,
+                        device.host_to_device_bytes / 1e6,
+                        device.device_to_device_bytes / 1e6,
+                        device.resident_bytes / 1e6);
+        }
         std::printf("moe_ssd_decode_cross_layer_tasks=%llu moe_ssd_decode_cross_layer_dropped=%llu moe_ssd_decode_cross_layer_experts=%llu moe_ssd_decode_cross_layer_used=%llu moe_ssd_decode_cross_layer_rejected=%llu\n",
                     (unsigned long long)ssd.cross_layer_tasks,
                     (unsigned long long)ssd.cross_layer_dropped,
@@ -387,6 +398,16 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         human_row("moe_ssd_cache_mb", engine.config().moe_ssd_cache_bytes / 1e6, "MB");
         human_row_int("moe_ssd_io_workers", engine.config().moe_ssd_io_workers, "");
         human_row("moe_ssd_resident_mb", decode_ssd.resident_bytes / 1e6, "MB");
+        if (engine.config().moe_device_cache_bytes != 0) {
+            const auto device = engine.moe_device_cache_stats();
+            human_row("moe_device_cache_mb", device.capacity_bytes / 1e6, "MB");
+            human_row_int("moe_device_hits", (long long)device.hits, "");
+            human_row_int("moe_device_misses", (long long)device.misses, "");
+            human_row_int("moe_device_evictions", (long long)device.evictions, "");
+            human_row("moe_device_h2d_mb", device.host_to_device_bytes / 1e6, "MB");
+            human_row("moe_device_d2d_mb", device.device_to_device_bytes / 1e6, "MB");
+            human_row("moe_device_resident_mb", device.resident_bytes / 1e6, "MB");
+        }
     }
     if (engine.config().mtp_draft_tokens > 0) {
         const auto& mtp = engine.mtp_stats();
