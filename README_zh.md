@@ -39,7 +39,7 @@ DeepSeek-V4-Flash 的原生 FP8/MXFP4 权重。
 | Qwen3 dense text models | FP16、W8、W4 |
 | Qwen3-30B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.6-35B-A3B MoE | 仅文本 W4 路径 |
-| Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
+| Qwen3.5-122B-A10B MoE | CPU 与实验性 CUDA W4，支持 SSD expert offload |
 | Tencent Hy-MT2-30B-A3B | 仅文本 W4 MoE；支持 CPU 与 Metal |
 | Tencent Hy3-295B-A21B | 仅文本 W4 MoE，支持 CPU SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
