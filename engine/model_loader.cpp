@@ -1121,10 +1121,12 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // DeepSeek-V4 hyper-connection and sparse-attention operators remain
-        // CPU kernels. With SSD offload, however, decode can delegate only the
-        // routed MXFP4 experts to Metal while keeping host intermediates and
-        // the shared expert on CPU.
+        // DeepSeek-V4's CUDA path now covers resident FP8/MXFP4 weights,
+        // Hyper-Connection, MoE, and its grouped output projection. The
+        // compressor, indexer, and sparse-attention stages remain CPU-only, so
+        // keep the complete graph on CPU until those stateful stages are
+        // native. Metal SSD may still delegate routed MXFP4 experts while
+        // retaining host intermediates and the shared expert on CPU.
         if (cfg_.device != Device::CPU) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
