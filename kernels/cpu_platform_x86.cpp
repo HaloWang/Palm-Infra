@@ -26,8 +26,8 @@ using Int4Fn = void (*)(const Tensor&, const Tensor&, Tensor&, int, int, int,
 using Int8Fn = void (*)(const float*, const int8_t*, const float*, float*, int,
                         int, int, int, int, int, int, int, int, int, int);
 using Int4VnniFn = void (*)(const int8_t*, const float*, const int16_t*,
-                            const Tensor&, Tensor&, int, int, int, int, int,
-                            int);
+                            const void*, const Tensor&, Tensor&, int, int, int,
+                            int, int, int);
 using QuantizeVnniFn = void (*)(const float*, int8_t*, float*, int16_t*, int,
                                 int, int, int);
 
@@ -142,8 +142,18 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
 
     const auto int4_vnni = dispatch().int4_vnni;
     const auto quantize_vnni = dispatch().quantize_vnni;
+    const void* vnni_data = nullptr;
+    if (B.prepared_weight && (B.prepared_weight_row_offset % 8) == 0) {
+        const void* base = B.prepared_weight->data(
+            WeightLayout::X86_VNNI_Q4_G32);
+        if (base) {
+            vnni_data = static_cast<const uint8_t*>(base) +
+                (B.prepared_weight_row_offset / 8) *
+                    pack_b_q4_vnni_bytes(8, K);
+        }
+    }
     const bool use_vnni =
-        int4_vnni && quantize_vnni && is_bg32 && B.q4_vnni_data && M >= 4 &&
+        int4_vnni && quantize_vnni && is_bg32 && vnni_data && M >= 4 &&
         K % 32 == 0;
     if (use_vnni) {
         struct VnniScratch {
@@ -170,12 +180,12 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
             thread_pool->parallel_for(
                 0, M, 4, [&](int, int begin, int end) {
                     int4_vnni(quantized_a, activation_scales,
-                              activation_sums, B, C, K, ldc, begin, end, 0,
-                              N);
+                              activation_sums, vnni_data, B, C, K, ldc,
+                              begin, end, 0, N);
                 });
         } else {
-            int4_vnni(quantized_a, activation_scales, activation_sums, B, C,
-                      K, ldc, 0, M, 0, N);
+            int4_vnni(quantized_a, activation_scales, activation_sums,
+                      vnni_data, B, C, K, ldc, 0, M, 0, N);
         }
         return true;
     }

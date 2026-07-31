@@ -222,7 +222,9 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     view.q4_repack_data = nullptr;
     view.q4_g32_data = nullptr;
     view.q4_g128_data = nullptr;
-    view.q4_vnni_data = nullptr;
+    view.prepared_weight = src.prepared_weight;
+    view.prepared_weight_row_offset =
+        src.prepared_weight_row_offset + static_cast<size_t>(row0);
 
     if (src.prec == Precision::FP32 || src.prec == Precision::FP16) {
         size_t elem = precision_size(src.prec);
@@ -292,11 +294,6 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
                 static_cast<const char*>(src.q4_g32_data) +
                 (size_t)(row0 / 8) * pack_b_q4dot_g32_bytes(8, K);
             view.q4_g32_data = p;
-            if (src.q4_vnni_data) {
-                view.q4_vnni_data =
-                    static_cast<const char*>(src.q4_vnni_data) +
-                    (size_t)(row0 / 8) * pack_b_q4_vnni_bytes(8, K);
-            }
             if (src.is_q4_g32_packed) {
                 view.data = const_cast<char*>(p);
                 view.is_q4_g32_packed = true;

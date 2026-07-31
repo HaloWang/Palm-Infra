@@ -1430,9 +1430,13 @@ int main() {
               "INT4 Q8-dot GEMM BG32 reference");
 
         uint8_t* q4_vnni = nullptr;
+        PreparedWeight prepared;
         if (mollm::cpu::capabilities().x86_avx512_vnni) {
             q4_vnni = pack_b_q4_vnni_full(q4_g32, N, K);
-            B.q4_vnni_data = q4_vnni;
+            const size_t vnni_bytes = pack_b_q4_vnni_bytes(N, K);
+            prepared.layout(WeightLayout::X86_VNNI_Q4_G32)
+                .assign(q4_vnni, q4_vnni + vnni_bytes);
+            B.prepared_weight = &prepared;
             kernel_matmul_fp32(A, B, C);
             CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
                   "INT4 Q8-dot GEMM BG32 x86 VNNI reference");

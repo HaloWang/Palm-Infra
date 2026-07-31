@@ -112,6 +112,7 @@ set(PUBLIC_GRAPH_HEADERS
 set(PUBLIC_KERNEL_HEADERS
     kernels/cpu_platform.h
     kernels/moe_ssd.h
+    kernels/prepared_weight.h
     kernels/tensor.h
     kernels/threading.h
 )

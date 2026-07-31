@@ -249,7 +249,8 @@ void maybe_pack_int4_g32_weight(Tensor& weight, const std::string& key,
 
 void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
                             const void* weight_data,
-                            PackedWeightMap& packed_weights) {
+                            PackedWeightMap& packed_weights,
+                            PreparedWeightMap& prepared_weights) {
     if (mollm::cpu::capabilities().x86_avx512_vnni &&
         is_2d_linear_weight(weight) && weight.prec == Precision::INT4 &&
         weight.is_q4_g32_packed && weight_data && weight.group_size == 32 &&
@@ -258,19 +259,18 @@ void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
         key.find("_experts_") == std::string::npos) {
         const int N = static_cast<int>(weight.shape[0]);
         const int K = static_cast<int>(weight.shape[1]);
-        const std::string vnni_key = key + "#int4_vnni";
-        auto it = packed_weights.find(vnni_key);
-        if (it == packed_weights.end()) {
+        PreparedWeight& prepared = prepared_weights[key];
+        auto& vnni = prepared.layout(WeightLayout::X86_VNNI_Q4_G32);
+        if (vnni.empty()) {
             uint8_t* packed = pack_b_q4_vnni_full(weight_data, N, K);
             if (packed) {
                 const size_t bytes = pack_b_q4_vnni_bytes(N, K);
-                std::vector<uint8_t> buffer(packed, packed + bytes);
+                vnni.assign(packed, packed + bytes);
                 delete[] packed;
-                it = packed_weights.emplace(vnni_key, std::move(buffer)).first;
             }
         }
-        if (it != packed_weights.end())
-            weight.q4_vnni_data = it->second.data();
+        if (!vnni.empty())
+            weight.prepared_weight = &prepared;
     }
 #if HAS_NEON && defined(__ARM_FEATURE_DOTPROD)
     if (!is_2d_linear_weight(weight))
@@ -316,6 +316,7 @@ void maybe_pack_int4_weight(Tensor& weight, const std::string& key,
     (void)key;
     (void)weight_data;
     (void)packed_weights;
+    (void)prepared_weights;
 #endif
 }
 
@@ -331,14 +332,16 @@ bool matmul_int4_q4dot_kernel_available() {
 
 void prepare_matmul_weight(Tensor& weight, const std::string& key,
                            const void* weight_data,
-                           PackedWeightMap& packed_weights, bool pack_fp16,
-                           bool pack_fp8) {
+                           PackedWeightMap& packed_weights,
+                           PreparedWeightMap& prepared_weights,
+                           bool pack_fp16, bool pack_fp8) {
     if (pack_fp16)
         maybe_pack_fp16_weight(weight, key, weight_data, packed_weights);
     if (pack_fp8)
         maybe_pack_fp8_weight(weight, key, weight_data, packed_weights);
     maybe_pack_int8_weight(weight, key, weight_data, packed_weights);
-    maybe_pack_int4_weight(weight, key, weight_data, packed_weights);
+    maybe_pack_int4_weight(weight, key, weight_data, packed_weights,
+                           prepared_weights);
 }
 
 bool prepare_fp8_bf16_fp16_weight(
