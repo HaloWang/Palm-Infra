@@ -4,8 +4,39 @@ This page collects the CPU and Metal benchmark results used by the README.
 
 ## CPU
 
-These results compare mollm with llama.cpp on an Apple M5 Pro using four CPU
-threads. Unless a row says otherwise, the protocol is `pp256 + tg64`,
+### Linux x86_64 runtime ISA dispatch
+
+The x86 provider selects separately compiled scalar, AVX2, or AVX-512 kernels
+after runtime CPUID probing. `MOLLM_X86_ISA=scalar|avx2|avx512|auto` caps the
+selected tier; `MOLLM_X86_DISABLE_AVX2=1` remains a compatible scalar override.
+This keeps AVX instructions out of the baseline object code and allows all
+three paths to be tested from one binary.
+
+The table below uses an AMD Ryzen 9 9950X, eight threads, `M=1`, `K=2048`,
+`N=6144`, five warmups, 30 measured iterations, and average throughput.
+
+| Weight format | Scalar | AVX2 | AVX-512 |
+|---|---:|---:|---:|
+| FP32 | 34.5 GFLOP/s | **43.5 GFLOP/s** | 41.5 GFLOP/s |
+| FP16 | 4.3 GFLOP/s | **374.3 GFLOP/s** | 337.7 GFLOP/s |
+| W8G32 | 14.4 GFLOP/s | 265.7 GFLOP/s | **338.8 GFLOP/s** |
+| W4G32 | 13.7 GFLOP/s | 227.7 GFLOP/s | **265.6 GFLOP/s** |
+| W4G128 | 14.4 GFLOP/s | 272.7 GFLOP/s | **436.0 GFLOP/s** |
+
+Quantized M>1 kernels reuse each unpacked weight vector across four activation
+rows. At `M=32` and 16 threads this reaches 585.0/823.3 GFLOP/s for AVX2
+W4G32/W4G128 and 704.4/1091.8 GFLOP/s for AVX-512.
+
+A Qwen3.5-0.8B W4G32 `pp256 + tg64` run at 16 threads reaches
+195.52/82.26 tok/s with AVX2 and 203.28/88.19 tok/s with AVX-512. A separate
+greedy generation check produced byte-identical text across scalar, AVX2, and
+AVX-512. These are development measurements rather than a cross-runtime
+comparison.
+
+### Apple Silicon
+
+The results below compare mollm with llama.cpp on an Apple M5 Pro using four
+CPU threads. Unless a row says otherwise, the protocol is `pp256 + tg64`,
 `warmup=3`, five independent processes, and the median throughput. `pp` is
 prompt/prefill tokens per second; `tg` is generated/decode tokens per second.
 

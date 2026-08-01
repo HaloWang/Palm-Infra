@@ -1321,7 +1321,10 @@ def _find_cpp_quant_helper() -> str | None:
     candidates = []
     env = os.environ.get("MOLLM_QUANT_HELPER")
     if env:
-        candidates.append(Path(env))
+        path = Path(env)
+        if path.is_file() and os.access(path, os.X_OK):
+            _CPP_QUANT_HELPER = str(path)
+            return str(path)
     root = Path(__file__).resolve().parent.parent
     exe = "mollm-quantize"
     old_exe = "mollm_quantize_weight"
@@ -1341,10 +1344,30 @@ def _find_cpp_quant_helper() -> str | None:
         Path.cwd() / "build_i8mm" / old_exe,
         Path.cwd() / old_exe,
     ])
+    # Developer builds commonly use architecture- or experiment-specific
+    # names such as build-x86-avx2. Keep explicit paths first, then discover
+    # the same helper in other CMake build directories.
+    candidates.extend(sorted(root.glob(f"build*/{exe}")))
+    candidates.extend(sorted(root.glob(f"build*/Release/{exe}")))
     for path in candidates:
-        if path.is_file() and os.access(path, os.X_OK):
-            _CPP_QUANT_HELPER = str(path)
-            return str(path)
+        if not path.is_file() or not os.access(path, os.X_OK):
+            continue
+        try:
+            # A cross-compiled executable can still have the executable bit.
+            # Starting it without arguments is a cheap, side-effect-free way
+            # to reject binaries the current host cannot execute.
+            subprocess.run(
+                [str(path)],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        _CPP_QUANT_HELPER = str(path)
+        return str(path)
     _CPP_QUANT_HELPER = False
     return None
 

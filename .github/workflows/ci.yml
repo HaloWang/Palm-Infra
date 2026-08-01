@@ -30,9 +30,14 @@ jobs:
         run: cmake --build build -j 2
       - name: Test
         run: ctest --test-dir build --output-on-failure
+      - name: Test NEON runtime fallback
+        if: matrix.arm_i8mm == 'AUTO'
+        env:
+          MOLLM_ARM_ISA: neon
+        run: ctest --test-dir build --output-on-failure
 
   x86-build-and-test:
-    name: Linux x86_64 (scalar provider)
+    name: Linux x86_64 (runtime ISA dispatch)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -54,6 +59,14 @@ jobs:
       - name: Build
         run: cmake --build build -j 2
       - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Test AVX2 ceiling
+        env:
+          MOLLM_X86_ISA: avx2
+        run: ctest --test-dir build --output-on-failure
+      - name: Test scalar fallback
+        env:
+          MOLLM_X86_ISA: scalar
         run: ctest --test-dir build --output-on-failure
 
   linux-arm64-build-and-test:
@@ -88,4 +101,9 @@ jobs:
       - name: Build
         run: cmake --build build -j 2
       - name: Test
+        run: ctest --test-dir build --output-on-failure
+      - name: Test NEON runtime fallback
+        if: matrix.arm_i8mm == 'AUTO'
+        env:
+          MOLLM_ARM_ISA: neon
         run: ctest --test-dir build --output-on-failure

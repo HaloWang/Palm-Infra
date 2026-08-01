@@ -980,8 +980,14 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         return;
     }
 
-    if (mollm::cpu::matmul_int4_packed(A, B, C, lda, ldc)) {
-        timer.set_shape("int4_packed_scalar", M, N, K, group_size,
+    if (mollm::cpu::matmul_int4_packed(
+            A, B, C, lda, ldc, thread_pool)) {
+        timer.set_shape(mollm::cpu::capabilities().x86_avx512
+                            ? "int4_packed_avx512"
+                        : mollm::cpu::capabilities().x86_avx2
+                            ? "int4_packed_avx2"
+                            : "int4_packed_scalar",
+                        M, N, K, group_size,
                         groups_per_row, true, false, n_threads);
         if (act != Activation::NONE && act_n_len != 0)
             matmul_apply_activation(c_ptr, M, N, ldc, 0, M, act,
@@ -1009,8 +1015,10 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         can_use_q4_dot && b_q4_g32 && group_size == 32 && (K % 32 == 0);
     bool can_use_q4_bg128 =
         can_use_q4_dot && b_q4_g128 && group_size == 128 && (K % 128 == 0);
-#if defined(__ARM_FEATURE_MATMUL_INT8)
-    bool can_use_q4_i8mm = M > 1 && (can_use_q4_bg32 || can_use_q4_bg128);
+#if MOLLM_ARM_I8MM_KERNELS
+    bool can_use_q4_i8mm =
+        mollm::cpu::capabilities().arm_i8mm && M > 1 &&
+        (can_use_q4_bg32 || can_use_q4_bg128);
 #else
     bool can_use_q4_i8mm = false;
 #endif
@@ -1149,7 +1157,7 @@ void matmul_dispatch_int4(const Tensor& A, const Tensor& B, Tensor& C,
         const Q8A4Block* qA4_data = qA4.data();
 
         auto run_q4_gemm = [&](int m_begin, int m_end, int n_begin, int n_end) {
-#if defined(__ARM_FEATURE_MATMUL_INT8)
+#if MOLLM_ARM_I8MM_KERNELS
             if (can_use_q4_i8mm) {
                 if (can_use_q4_bg128) {
                     matmul_int4_i8mm_g128(

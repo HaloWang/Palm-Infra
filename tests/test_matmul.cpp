@@ -1042,6 +1042,7 @@ int main() {
         std::vector<Tensor> weights;
         std::vector<Tensor> outputs;
         PackedWeightMap packed;
+        PreparedWeightMap prepared;
         for (int i = 0; i < batch; ++i) {
             for (size_t j = 0; j < weight_data[i].size(); ++j) {
                 const uint32_t bits =
@@ -1064,7 +1065,7 @@ int main() {
                 inputs.back(), reference_weight, reference);
             prepare_matmul_weight(
                 weights.back(), "exact_bf16_" + std::to_string(i),
-                weight_data[i].data(), packed);
+                weight_data[i].data(), packed, prepared);
             const bool expects_bf16_sidecar =
                 mollm::cpu::capabilities().fp16_interleaved_weights;
             CHECK((weights.back().fp32_bf16_data != nullptr) ==
@@ -1117,8 +1118,9 @@ int main() {
             actual.data());
         kernel_matmul_fp32(a, weight, reference);
         PackedWeightMap packed;
+        PreparedWeightMap prepared;
         prepare_matmul_weight(
-            weight, "exact_bf16_gemm", weight_data.data(), packed);
+            weight, "exact_bf16_gemm", weight_data.data(), packed, prepared);
         ThreadPool pool(4);
         kernel_matmul_fp32(a, weight, output, &pool);
         CHECK(std::memcmp(
@@ -1586,6 +1588,19 @@ int main() {
         CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
               "INT4 Q8-dot GEMM BG32 reference");
 
+        uint8_t* q4_vnni = nullptr;
+        PreparedWeight prepared;
+        if (mollm::cpu::capabilities().x86_avx512_vnni) {
+            q4_vnni = pack_b_q4_vnni_full(q4_g32, N, K);
+            const size_t vnni_bytes = pack_b_q4_vnni_bytes(N, K);
+            prepared.layout(WeightLayout::X86_VNNI_Q4_G32)
+                .assign(q4_vnni, q4_vnni + vnni_bytes);
+            B.prepared_weight = &prepared;
+            kernel_matmul_fp32(A, B, C);
+            CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
+                  "INT4 Q8-dot GEMM BG32 x86 VNNI reference");
+        }
+
         Tensor B_direct = Tensor::create(Precision::INT4, MemoryType::EXTERNAL,
                                          N, K, 1, 1, q4_repack);
         B_direct.scales = scales.data();
@@ -1599,6 +1614,7 @@ int main() {
               "INT4 Q8-dot GEMM direct q4 layout matmul");
         delete[] q4_repack;
         delete[] q4_g32;
+        delete[] q4_vnni;
     }
 
     {

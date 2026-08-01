@@ -316,6 +316,10 @@ private:
 
     // Load-time matmul layouts (path/layout suffix → packed buffer).
     std::unordered_map<std::string, std::vector<uint8_t>> packed_weights_;
+    // Typed backend-specific layouts. Tensors borrow entries from this
+    // engine-lifetime store; new backends should register layouts here rather
+    // than add sidecar fields to Tensor.
+    PreparedWeightMap prepared_weights_;
 
     // Engine-owned contiguous copy returned by prefill_hidden/decode_hidden.
     // Valid until the next hidden-output call on this engine.

@@ -914,8 +914,11 @@ static void matmul_fp32_range(const float* A, const float* B, float* C, int M,
     matmul_fp32_neon_8x8_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin,
                                m_end);
 #else
-    matmul_fp32_scalar_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin,
-                             m_end);
+    if (!mollm::cpu::matmul_dense_fp32_range(
+            A, B, C, N, K, lda, K_weight, ldc, m_begin, m_end)) {
+        matmul_fp32_scalar_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin,
+                                 m_end);
+    }
 #endif
 }
 
@@ -928,6 +931,11 @@ static void matmul_fp16_range(const float* A, const __fp16* B, float* C, int M,
     matmul_fp16_neon_8x8_range(A, B, C, M, N, K, lda, K_weight, ldc, m_begin,
                                m_end);
 #else
+    if (mollm::cpu::matmul_dense_fp16_range(
+            A, B, C, N, K, lda, K_weight, ldc, m_begin, m_end,
+            interleaved)) {
+        return;
+    }
     // Scalar fallback: convert each FP16 to FP32 on the fly.
     for (int m = m_begin; m < m_end; m++) {
         float* c_row = C + m * ldc;
@@ -1411,7 +1419,7 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     // Decide sharding dimension adaptively, similar to ggml:
     //   If N >> M, shard by N (e.g. lm_head: M=1, N=vocab_size).
     //   Otherwise shard by M (the common case).
-    bool shard_by_n = HAS_NEON && (N > M * 8 && M == 1);
+    bool shard_by_n = N > M * 8 && M == 1;
 
     // Decide chunk size adaptively.
     // For GEMV-like shapes, use a larger chunk to reduce per-chunk overhead.

@@ -140,6 +140,7 @@ void LLMEngine::clear_model_state() {
     weight_map_.clear();
     shared_weights_.clear();
     packed_weights_.clear();
+    prepared_weights_.clear();
     package_weight_map_.clear();
     mmap_weight_exclusion_ranges_.clear();
 
@@ -322,6 +323,23 @@ size_t LLMEngine::lock_dense_package_weights() {
             else
                 other_sidecar_bytes += buffer.size();
         }
+        for (auto& [key, prepared] : prepared_weights_) {
+            (void)key;
+            if (!complete)
+                break;
+            for (auto& buffer : prepared.layouts) {
+                if (buffer.empty())
+                    continue;
+                if (mlock(buffer.data(), buffer.size()) != 0) {
+                    complete = false;
+                    break;
+                }
+                locked_dense_ranges_.push_back(
+                    {buffer.data(), buffer.size()});
+                locked_sidecar_bytes += buffer.size();
+                other_sidecar_bytes += buffer.size();
+            }
+        }
     }
     if (!complete) {
         const int err = errno;
@@ -410,6 +428,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.q4_repack_data = nullptr;
             t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
+            t.prepared_weight = nullptr;
+            t.prepared_weight_row_offset = 0;
 #ifdef MOLLM_METAL
             // Alias this weight into the registered device weight buffer NOW,
             // while t.data still points at the raw mmap region (before any CPU
@@ -574,7 +594,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 // graph separately and prepares the required sidecars there.
                 if (!metal_only_weight) {
                     prepare_matmul_weight(
-                        t, wref, data, packed_weights_, !lookup_table,
+                        t, wref, data, packed_weights_, prepared_weights_,
+                        !lookup_table,
                         native_fp8_weight_nodes.count(node.id) == 0);
                     if (native_fp8_weight_nodes.count(node.id) != 0)
                         prepare_fp8_bf16_fp16_weight(
@@ -638,7 +659,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             metal_backend_ && exec_ctx.backend == metal_backend_.get();
         if (!metal_only_weight) {
             prepare_matmul_weight(
-                t, wpath, t.data, packed_weights_, !lookup_table,
+                t, wpath, t.data, packed_weights_, prepared_weights_,
+                !lookup_table,
                 native_fp8_weight_nodes.count(node.id) == 0);
             if (native_fp8_weight_nodes.count(node.id) != 0)
                 prepare_fp8_bf16_fp16_weight(

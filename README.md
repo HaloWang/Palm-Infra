@@ -15,14 +15,20 @@ mobile-oriented LLM inference engine.
 |_| |_| |_|\___/|_|_|_| |_| |_|
 ```
 
-`mollm` is a small C++ LLM runtime for ARM CPUs, with experimental Apple Metal
-support. It converts supported Hugging Face model directories into one `.mollm`
-file containing the graph, weights, tokenizer, and chat template, then runs
-that package directly.
+`mollm` is a small C++ LLM runtime for ARM and x86 CPUs, with experimental
+Apple Metal support. It converts supported Hugging Face model directories into
+one `.mollm` file containing the graph, weights, tokenizer, and chat template,
+then runs that package directly.
 
 The current focus is fast local inference on Apple Silicon and other modern ARM
 CPUs. FP16 uses NEON FP16FML kernels; quantized CPU models use weight-only int8
-or int4 kernels optimized for ARM dot-product instructions.
+or int4 kernels optimized for ARM dot-product instructions. Linux x86_64 has
+separately compiled scalar, AVX2/FMA/F16C, and AVX-512 providers for FP32,
+FP16, W8, and packed W4G32/W4G128 matmul. Runtime CPUID dispatch selects the
+widest supported tier without exposing newer instructions to older CPUs.
+Set `MOLLM_X86_ISA=scalar|avx2|avx512|auto` to cap the selected tier for
+testing or machine-specific tuning. The legacy
+`MOLLM_X86_DISABLE_AVX2=1` scalar override remains supported.
 
 ## Now it runs a 122B model on a 48GB Mac (Or even 16GB)
 
@@ -185,7 +191,7 @@ Interactive chat commands:
 
 Requirements:
 
-- macOS/Apple Silicon or ARM Linux
+- macOS/Apple Silicon, ARM Linux, or Linux x86_64
 - CMake + Ninja or Make
 - Python 3
 - Python packages needed by conversion, especially `numpy` and `safetensors`
@@ -197,9 +203,13 @@ cmake -G Ninja -B build_i8mm -DCMAKE_BUILD_TYPE=Release
 cmake --build build_i8mm -j
 ```
 
-If your compiler/CPU supports ARM i8mm, the build system enables the faster int8
-GEMM path automatically. A plain `build/` directory also works; replace
-`build_i8mm` in the examples with your build directory.
+On ARM64, a compiler with i8mm support embeds the optimized kernels as separate
+objects. Runtime HWCAP/sysctl probing selects them only on a compatible CPU;
+the rest of the library remains on the NEON/DOTPROD baseline.
+`MOLLM_ARM_I8MM=OFF` omits the i8mm objects, while
+`MOLLM_ARM_ISA=neon` forces the runtime fallback for testing. A plain `build/`
+directory also works; replace `build_i8mm` in the examples with your build
+directory.
 
 ## Convert Models
 
