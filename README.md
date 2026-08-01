@@ -65,18 +65,18 @@ Current CPU-only results on an Apple M5 Pro:
 
 | Standard throughput | Expert RAM cache | Result |
 |---|---:|---:|
-| `pp256 + tg64` | 16 GiB | **9.35 pp / 4.74 tg** |
+| `pp256 + tg64` | 16 GiB | **9.52 pp / 5.71 tg** |
 
 This standard sample uses four CPU threads and `warmup=3`. It is one completed
 process run rather than the usual five-process median, so it is provisional.
 
 | Expert RAM cache | Decode | Peak RSS | Avg. SSD reads / generated token |
 |---:|---:|---:|---:|
-| **1 GiB** | 4.37 t/s | **19.09 GiB** | 3.73 GB/token |
-| **10 GiB** | **4.73 t/s** | **24.32 GiB** | 1.89 GB/token |
-| **16 GiB** | 4.67 t/s | 26.91 GiB | **1.55 GB/token** |
+| **1 GiB** | 4.95 t/s | **19.66 GiB** | 3.57 GB/token |
+| **10 GiB** | 5.57 t/s | 26.57 GiB | 1.77 GB/token |
+| **16 GiB** | **5.59 t/s** | 27.03 GiB | **1.49 GB/token** |
 
-This experimental sweep uses a 19-token real Chinese prompt, 64 generated
+This experimental sweep uses a 20-token real Chinese prompt, 64 generated
 tokens, greedy decoding, six CPU threads, `warmup=0`, and three independent
 processes per cache size. These real-prompt numbers are reported separately
 from the standard `pp256 + tg64` performance chart. SSD reads use the same

@@ -20,6 +20,7 @@
 //                      bit 2: INT4 data is BG32 layout [N/8,K/32] blocks:
 //                             float scales[8] + q4dot q[8][16B]
 //                      bit 3: FP8 E4M3 scales are E8M0 over 128x128 blocks
+//                      bit 4: storage-only expert-interleaved native payload
 //   8       4      ndim    — number of dimensions (1-4)
 //   12      4      precision — Precision enum value
 //   16      8      shape[0]
@@ -46,6 +47,11 @@ public:
     static constexpr uint32_t FLAG_INT4_BG128 = 1u << 1;
     static constexpr uint32_t FLAG_INT4_BG32 = 1u << 2;
     static constexpr uint32_t FLAG_FP8_BLOCK128 = 1u << 3;
+    // Storage-only native expert layout: each expert stores its data followed
+    // by its scales. The numerical representation is unchanged, but ordinary
+    // resident tensor loading must deinterleave it first. SSD MoE reads the
+    // per-expert slices directly from package metadata.
+    static constexpr uint32_t FLAG_EXPERT_INTERLEAVED = 1u << 4;
 
     struct Header {
         uint32_t magic;

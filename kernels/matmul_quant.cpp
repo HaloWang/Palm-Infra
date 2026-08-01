@@ -5,6 +5,7 @@
 #include <array>
 #include <chrono>
 #include <cmath>
+#include <cstring>
 #include <vector>
 
 #if HAS_NEON && defined(__aarch64__)
@@ -43,11 +44,104 @@ static inline void quantize_q8_block32_neon(const float* src, float& scale,
     q_lo = vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23));
     q_hi = vcombine_s8(vqmovn_s16(q45), vqmovn_s16(q67));
 }
+
+static inline uint32x4_t encode_fp8_e4m3fn_neon(float32x4_t values) {
+    const uint32x4_t original_bits = vreinterpretq_u32_f32(values);
+    const uint32x4_t sign = vandq_u32(
+        vshrq_n_u32(original_bits, 24), vdupq_n_u32(0x80));
+    const uint32x4_t magnitude_bits = vandq_u32(
+        original_bits, vdupq_n_u32(0x7fffffffu));
+    const uint32x4_t nan_mask = vandq_u32(
+        vceqq_u32(
+            vandq_u32(vshrq_n_u32(magnitude_bits, 23),
+                      vdupq_n_u32(0xff)),
+            vdupq_n_u32(0xff)),
+        vcgtq_u32(vandq_u32(magnitude_bits, vdupq_n_u32(0x7fffff)),
+                  vdupq_n_u32(0)));
+    const float32x4_t magnitude = vminq_f32(
+        vabsq_f32(values), vdupq_n_f32(448.0f));
+    const uint32x4_t bits = vreinterpretq_u32_f32(magnitude);
+
+    const uint32x4_t subnormal = vminq_u32(
+        vcvtnq_u32_f32(vmulq_n_f32(magnitude, 512.0f)),
+        vdupq_n_u32(8));
+
+    int32x4_t exponent = vsubq_s32(
+        vreinterpretq_s32_u32(
+            vandq_u32(vshrq_n_u32(bits, 23), vdupq_n_u32(0xff))),
+        vdupq_n_s32(127));
+    const uint32x4_t mantissa =
+        vandq_u32(bits, vdupq_n_u32(0x7fffff));
+    uint32x4_t significand = vaddq_u32(
+        vshrq_n_u32(mantissa, 20), vdupq_n_u32(8));
+    const uint32x4_t remainder =
+        vandq_u32(mantissa, vdupq_n_u32(0xfffff));
+    const uint32x4_t round_up = vorrq_u32(
+        vcgtq_u32(remainder, vdupq_n_u32(0x80000)),
+        vandq_u32(
+            vceqq_u32(remainder, vdupq_n_u32(0x80000)),
+            vcgtq_u32(vandq_u32(significand, vdupq_n_u32(1)),
+                      vdupq_n_u32(0))));
+    significand = vaddq_u32(
+        significand, vshrq_n_u32(round_up, 31));
+    const uint32x4_t carry =
+        vceqq_u32(significand, vdupq_n_u32(16));
+    exponent = vaddq_s32(
+        exponent,
+        vreinterpretq_s32_u32(vshrq_n_u32(carry, 31)));
+    significand = vbslq_u32(
+        carry, vdupq_n_u32(8), significand);
+    int32x4_t normal = vaddq_s32(
+        vshlq_n_s32(vaddq_s32(exponent, vdupq_n_s32(6)), 3),
+        vreinterpretq_s32_u32(significand));
+    normal = vmaxq_s32(vdupq_n_s32(0),
+                       vminq_s32(normal, vdupq_n_s32(126)));
+    uint32x4_t encoded = vbslq_u32(
+        vcltq_f32(magnitude, vdupq_n_f32(1.0f / 64.0f)),
+        subnormal, vreinterpretq_u32_s32(normal));
+    encoded = vorrq_u32(encoded, sign);
+    return vbslq_u32(nan_mask, vdupq_n_u32(0x7f), encoded);
+}
 #endif
 
 namespace {
 
 constexpr int kFp8ActivationBlock = 128;
+
+struct Fp8ActivationQ8Tables {
+    std::array<float, 127> decoded{};
+    std::array<std::array<int8_t, 256>, 127> quantized{};
+};
+
+const Fp8ActivationQ8Tables& fp8_activation_q8_tables() {
+    static const Fp8ActivationQ8Tables tables = [] {
+        Fp8ActivationQ8Tables result;
+        for (size_t code = 0; code < result.decoded.size(); ++code)
+            result.decoded[code] =
+                decode_fp8_e4m3fn(static_cast<uint8_t>(code));
+        for (size_t maximum = 0; maximum < result.quantized.size();
+             ++maximum) {
+            const float maximum_value = result.decoded[maximum];
+            const float inverse =
+                maximum_value > 0.0f ? 127.0f / maximum_value : 0.0f;
+            for (size_t byte = 0; byte < 256; ++byte) {
+                const uint8_t magnitude = std::min<uint8_t>(
+                    static_cast<uint8_t>(byte) & 0x7f, 126);
+                const float coefficient =
+                    (byte & 0x80) != 0
+                        ? -result.decoded[magnitude]
+                        : result.decoded[magnitude];
+                const int quantized = std::clamp(
+                    static_cast<int>(std::nearbyint(coefficient * inverse)),
+                    -127, 127);
+                result.quantized[maximum][byte] =
+                    static_cast<int8_t>(quantized);
+            }
+        }
+        return result;
+    }();
+    return tables;
+}
 
 float fp8_ue8m0_scale(const float* values, int count) {
     float maximum = 0.0f;
@@ -68,10 +162,25 @@ float fp8_ue8m0_scale(const float* values, int count) {
     // This is fast_round_scale(max(amax, 1e-4) / 448) from the reference
     // implementation. Its E8M0 output is a power of two.
     maximum = std::max(maximum, 1.0e-4f);
+
+    // Let maximum = significand * 2^E, with significand in [1, 2).
+    // Since 448 = 1.75 * 2^8, ceil(log2(maximum / 448)) is
+    // E - 8, plus one exactly when significand is greater than 1.75.
+    // Reading the IEEE fields computes the same power of two without a
+    // scalar log2/ceil/ldexp sequence for every 128-value activation block.
+    uint32_t bits = 0;
+    std::memcpy(&bits, &maximum, sizeof(bits));
+    const int unbiased = static_cast<int>((bits >> 23) & 0xffu) - 127;
+    const uint32_t mantissa = bits & 0x7fffffu;
     const int exponent = std::clamp(
-        static_cast<int>(std::ceil(std::log2(maximum / 448.0f))),
-        -127, 127);
-    return std::ldexp(1.0f, exponent);
+        unbiased - 8 + (mantissa > 0x600000u ? 1 : 0), -127, 127);
+    const uint32_t scale_bits =
+        exponent == -127
+            ? uint32_t{1} << 22
+            : static_cast<uint32_t>(exponent + 127) << 23;
+    float scale = 0.0f;
+    std::memcpy(&scale, &scale_bits, sizeof(scale));
+    return scale;
 }
 
 void quantize_fp8_q8_row(const float* input, int K, int8_t* output,
@@ -80,7 +189,8 @@ void quantize_fp8_q8_row(const float* input, int K, int8_t* output,
         (K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK;
     const int fp8_blocks =
         (K + kFp8ActivationBlock - 1) / kFp8ActivationBlock;
-    alignas(16) float coefficients[kFp8ActivationBlock];
+    const auto& tables = fp8_activation_q8_tables();
+    alignas(16) uint8_t encoded_values[kFp8ActivationBlock];
     for (int block = 0; block < fp8_blocks; ++block) {
         const int begin = block * kFp8ActivationBlock;
         const int end = std::min(begin + kFp8ActivationBlock, K);
@@ -88,24 +198,45 @@ void quantize_fp8_q8_row(const float* input, int K, int8_t* output,
         const float activation_scale =
             fp8_ue8m0_scale(input + begin, count);
         const float inverse_activation_scale = 1.0f / activation_scale;
-        static const std::array<float, 127> decode_table = [] {
-            std::array<float, 127> values{};
-            for (size_t i = 0; i < values.size(); ++i)
-                values[i] = decode_fp8_e4m3fn(static_cast<uint8_t>(i));
-            return values;
-        }();
-        for (int i = 0; i < count; ++i) {
+        int i = 0;
+#if HAS_NEON && defined(__aarch64__)
+        for (; i + 3 < count; i += 4) {
+            alignas(16) uint32_t encoded[4];
+            vst1q_u32(
+                encoded,
+                encode_fp8_e4m3fn_neon(
+                    vmulq_n_f32(
+                        vld1q_f32(input + begin + i),
+                        inverse_activation_scale)));
+            for (int lane = 0; lane < 4; ++lane) {
+                const uint8_t code =
+                    static_cast<uint8_t>(encoded[lane]);
+                encoded_values[i + lane] = code;
+                const uint8_t magnitude =
+                    std::min<uint8_t>(code & 0x7f, 126);
+                const float coefficient =
+                    (code & 0x80) != 0
+                        ? -tables.decoded[magnitude]
+                        : tables.decoded[magnitude];
+                if (fp8_dequant) {
+                    fp8_dequant[begin + i + lane] =
+                        coefficient * activation_scale;
+                }
+            }
+        }
+#endif
+        for (; i < count; ++i) {
             const float normalized = std::clamp(
                 input[begin + i] * inverse_activation_scale,
                 -448.0f, 448.0f);
             const uint8_t encoded = encode_fp8_e4m3fn(normalized);
+            encoded_values[i] = encoded;
             const uint8_t magnitude =
                 std::min<uint8_t>(encoded & 0x7f, 126);
             const float coefficient =
                 std::signbit(normalized)
-                    ? -decode_table[magnitude]
-                    : decode_table[magnitude];
-            coefficients[i] = coefficient;
+                    ? -tables.decoded[magnitude]
+                    : tables.decoded[magnitude];
             if (fp8_dequant) {
                 fp8_dequant[begin + i] =
                     coefficient * activation_scale;
@@ -119,47 +250,21 @@ void quantize_fp8_q8_row(const float* input, int K, int8_t* output,
              group_begin += MATMUL_Q8_BLOCK) {
             const int group_end =
                 std::min(group_begin + MATMUL_Q8_BLOCK, count);
-            float coefficient_maximum = 0.0f;
+            uint8_t maximum_code = 0;
             for (int i = group_begin; i < group_end; ++i) {
-                coefficient_maximum = std::max(
-                    coefficient_maximum, std::fabs(coefficients[i]));
+                maximum_code = std::max(
+                    maximum_code,
+                    std::min<uint8_t>(encoded_values[i] & 0x7f, 126));
             }
+            const float coefficient_maximum =
+                tables.decoded[maximum_code];
             const float coefficient_scale =
                 coefficient_maximum > 0.0f
                     ? coefficient_maximum / 127.0f
                     : 1.0f;
-            const float inverse_coefficient_scale =
-                coefficient_maximum > 0.0f
-                    ? 127.0f / coefficient_maximum
-                    : 0.0f;
-            int i = group_begin;
-#if HAS_NEON && defined(__aarch64__)
-            const float32x4_t inverse =
-                vdupq_n_f32(inverse_coefficient_scale);
-            for (; i + 15 < group_end; i += 16) {
-                const int32x4_t q0 = vcvtnq_s32_f32(
-                    vmulq_f32(vld1q_f32(coefficients + i), inverse));
-                const int32x4_t q1 = vcvtnq_s32_f32(
-                    vmulq_f32(vld1q_f32(coefficients + i + 4), inverse));
-                const int32x4_t q2 = vcvtnq_s32_f32(
-                    vmulq_f32(vld1q_f32(coefficients + i + 8), inverse));
-                const int32x4_t q3 = vcvtnq_s32_f32(
-                    vmulq_f32(vld1q_f32(coefficients + i + 12), inverse));
-                const int16x8_t q01 =
-                    vcombine_s16(vqmovn_s32(q0), vqmovn_s32(q1));
-                const int16x8_t q23 =
-                    vcombine_s16(vqmovn_s32(q2), vqmovn_s32(q3));
-                vst1q_s8(output + begin + i,
-                         vcombine_s8(vqmovn_s16(q01), vqmovn_s16(q23)));
-            }
-#endif
-            for (; i < group_end; ++i) {
-                const int quantized = std::clamp(
-                    static_cast<int>(std::nearbyint(
-                        coefficients[i] * inverse_coefficient_scale)),
-                    -127, 127);
-                output[begin + i] = static_cast<int8_t>(quantized);
-            }
+            const auto& quantized = tables.quantized[maximum_code];
+            for (int i = group_begin; i < group_end; ++i)
+                output[begin + i] = quantized[encoded_values[i]];
             const int q8_block =
                 (begin + group_begin) / MATMUL_Q8_BLOCK;
             if (q8_block < q8_blocks) {

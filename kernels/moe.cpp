@@ -460,6 +460,101 @@ extern "C" void mollm_print_moe_profile(const char* title) {
     }
 }
 
+bool kernel_moe_shared_expert(const Tensor& hidden,
+                              const Tensor& gate,
+                              const Tensor& up,
+                              const Tensor& down,
+                              const Tensor* scale_weight,
+                              Tensor& output,
+                              ThreadPool* thread_pool,
+                              int intermediate_size,
+                              bool emulate_bf16,
+                              float swiglu_limit) {
+    if (hidden.prec != Precision::FP32 || output.prec != Precision::FP32 ||
+        !hidden.data || !gate.data || !up.data || !down.data ||
+        !output.data || intermediate_size <= 0 ||
+        hidden.shape[1] != output.shape[1]) {
+        return false;
+    }
+    const int hidden_size = static_cast<int>(hidden.shape[0]);
+    const int seq_len = static_cast<int>(hidden.shape[1]);
+    if (output.shape[0] != hidden_size)
+        return false;
+
+    std::vector<float> gate_values(
+        static_cast<size_t>(seq_len) * intermediate_size);
+    std::vector<float> up_values(
+        static_cast<size_t>(seq_len) * intermediate_size);
+    std::vector<float> activated(
+        static_cast<size_t>(seq_len) * intermediate_size);
+    Tensor gate_weight = make_weight_view_2d(
+        gate, intermediate_size, hidden_size);
+    Tensor up_weight = make_weight_view_2d(
+        up, intermediate_size, hidden_size);
+    Tensor gate_output = make_fp32_tensor(
+        gate_values.data(), intermediate_size, seq_len);
+    Tensor up_output = make_fp32_tensor(
+        up_values.data(), intermediate_size, seq_len);
+
+    bool batched_gate_up = false;
+    if (seq_len == 1) {
+        std::vector<Tensor> shared_inputs = {hidden, hidden};
+        std::vector<Tensor> shared_weights = {gate_weight, up_weight};
+        std::vector<Tensor> shared_outputs = {gate_output, up_output};
+        batched_gate_up =
+            kernel_matmul_int4_gemv_batch(
+                shared_inputs, shared_weights, shared_outputs, thread_pool) ||
+            kernel_matmul_int8_gemv_batch(
+                shared_inputs, shared_weights, shared_outputs, thread_pool);
+    }
+    if (!batched_gate_up) {
+        kernel_matmul_fp32(hidden, gate_weight, gate_output, thread_pool);
+        kernel_matmul_fp32(hidden, up_weight, up_output, thread_pool);
+    }
+    if (emulate_bf16) {
+        mollm_round_to_bf16(gate_values.data(), gate_values.size());
+        mollm_round_to_bf16(up_values.data(), up_values.size());
+    }
+    apply_swiglu(
+        gate_values.data(), up_values.data(), activated.data(), seq_len,
+        intermediate_size, intermediate_size, intermediate_size,
+        intermediate_size, swiglu_limit);
+    if (emulate_bf16)
+        mollm_round_to_bf16(activated.data(), activated.size());
+
+    Tensor activated_tensor = make_fp32_tensor(
+        activated.data(), intermediate_size, seq_len);
+    Tensor down_weight = make_weight_view_2d(
+        down, hidden_size, intermediate_size);
+    kernel_matmul_fp32(
+        activated_tensor, down_weight, output, thread_pool);
+    if (emulate_bf16) {
+        mollm_round_to_bf16(
+            output.ptr<float>(), static_cast<size_t>(output.nelements()));
+    }
+
+    if (scale_weight) {
+        std::vector<float> scales(static_cast<size_t>(seq_len));
+        Tensor scale_output = make_fp32_tensor(scales.data(), 1, seq_len);
+        Tensor scale_matrix = make_weight_view_2d(
+            *scale_weight, 1, hidden_size);
+        kernel_matmul_fp32(
+            hidden, scale_matrix, scale_output, thread_pool);
+        if (emulate_bf16)
+            mollm_round_to_bf16(scales.data(), scales.size());
+        const int output_stride =
+            static_cast<int>(output.stride[1] / sizeof(float));
+        for (int token = 0; token < seq_len; ++token) {
+            const float multiplier = sigmoid_scalar(scales[token]);
+            float* row = output.ptr<float>() +
+                static_cast<size_t>(token) * output_stride;
+            for (int dim = 0; dim < hidden_size; ++dim)
+                row[dim] *= multiplier;
+        }
+    }
+    return true;
+}
+
 bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                       Tensor& output,
                       ThreadPool* thread_pool,
@@ -556,16 +651,18 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     routing.num_groups = n_group;
     routing.topk_groups = topk_group;
     routing.scaling_factor = routed_scaling_factor;
+    const bool exact_hash_route =
+        token_ids_input >= 0 && hash_table_input >= 0 &&
+        static_cast<size_t>(token_ids_input) < inputs.size() &&
+        static_cast<size_t>(hash_table_input) < inputs.size() &&
+        inputs[token_ids_input] && inputs[hash_table_input] &&
+        inputs[token_ids_input]->prec == Precision::INT32 &&
+        inputs[hash_table_input]->prec == Precision::INT32;
     if (profile) stage_start = moe_profile_now();
     {
         mollm_trace::ScopedEvent trace_topk("compute", "moe.topk", trace_layer_args);
         bool selected = false;
-        if (token_ids_input >= 0 && hash_table_input >= 0 &&
-            static_cast<size_t>(token_ids_input) < inputs.size() &&
-            static_cast<size_t>(hash_table_input) < inputs.size() &&
-            inputs[token_ids_input] && inputs[hash_table_input] &&
-            inputs[token_ids_input]->prec == Precision::INT32 &&
-            inputs[hash_table_input]->prec == Precision::INT32) {
+        if (exact_hash_route) {
             selected = mollm::detail::select_moe_hash_routes(
                 router_logits.data(), seq_len,
                 inputs[token_ids_input]->ptr<int32_t>(),
@@ -603,7 +700,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             std::vector<int> ranked_experts(
                 top_idx.begin(), top_idx.begin() + top_k);
             gate_up_source->cache->retain_for_next_forward(
-                gate_up_source, down_source, ranked_experts);
+                gate_up_source, down_source, ranked_experts,
+                !exact_hash_route);
         }
         // Queue all cache misses before shared-expert work. The I/O workers
         // can now fill them while this CPU thread executes the independent
@@ -623,91 +721,19 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     // and adds the shared expert last; preserving that FP32 summation order
     // avoids a small but systematic logits drift without sacrificing overlap.
     std::vector<float> shared_contribution;
-    std::vector<float> shared_scales;
     if (has_shared_expert) {
         mollm_trace::ScopedEvent trace_shared("compute", "moe.shared", trace_layer_args);
-        std::vector<float> shared_gate_out((size_t)seq_len * (size_t)shared_intermediate_size);
-        std::vector<float> shared_up_out((size_t)seq_len * (size_t)shared_intermediate_size);
-        std::vector<float> shared_inter((size_t)seq_len * (size_t)shared_intermediate_size);
         shared_contribution.resize(
             (size_t)seq_len * (size_t)hidden_size);
-        shared_scales.resize((size_t)seq_len);
-
-        Tensor shared_gate_b = make_weight_view_2d(*shared_gate, shared_intermediate_size, hidden_size);
-        Tensor shared_up_b = make_weight_view_2d(*shared_up, shared_intermediate_size, hidden_size);
-        Tensor shared_gate_t = make_fp32_tensor(shared_gate_out.data(), shared_intermediate_size, seq_len);
-        Tensor shared_up_t = make_fp32_tensor(shared_up_out.data(), shared_intermediate_size, seq_len);
-
-        if (profile) stage_start = moe_profile_now();
-        bool batched_gate_up = false;
-        if (seq_len == 1) {
-            std::vector<Tensor> shared_inputs = {hidden, hidden};
-            std::vector<Tensor> shared_weights = {
-                shared_gate_b, shared_up_b};
-            std::vector<Tensor> shared_outputs = {
-                shared_gate_t, shared_up_t};
-            batched_gate_up =
-                kernel_matmul_int4_gemv_batch(
-                    shared_inputs, shared_weights, shared_outputs,
-                    thread_pool) ||
-                kernel_matmul_int8_gemv_batch(
-                    shared_inputs, shared_weights, shared_outputs,
-                    thread_pool);
-        }
-        if (!batched_gate_up) {
-            kernel_matmul_fp32(
-                hidden, shared_gate_b, shared_gate_t, thread_pool);
-            kernel_matmul_fp32(
-                hidden, shared_up_b, shared_up_t, thread_pool);
-        }
-        if (use_bf16_activations) {
-            mollm_round_to_bf16(
-                shared_gate_out.data(), shared_gate_out.size());
-            mollm_round_to_bf16(
-                shared_up_out.data(), shared_up_out.size());
-        }
-        apply_swiglu(shared_gate_out.data(), shared_up_out.data(),
-                     shared_inter.data(), seq_len, shared_intermediate_size,
-                     shared_intermediate_size, shared_intermediate_size,
-                     shared_intermediate_size, swiglu_limit);
-        if (use_bf16_activations)
-            mollm_round_to_bf16(
-                shared_inter.data(), shared_inter.size());
-        if (profile) moe_profile_add(MoeProfileStage::SharedGateUp, stage_start);
-
-        Tensor shared_inter_t = make_fp32_tensor(shared_inter.data(), shared_intermediate_size, seq_len);
-        Tensor shared_down_b = make_weight_view_2d(*shared_down, hidden_size, shared_intermediate_size);
-        Tensor shared_down_t = make_fp32_tensor(
+        Tensor shared_output = make_fp32_tensor(
             shared_contribution.data(), hidden_size, seq_len);
-        std::vector<float> shared_gate_scale_out((size_t)seq_len);
-        Tensor shared_scale_b;
-        if (shared_expert_has_gate) {
-            shared_scale_b =
-                make_weight_view_2d(*shared_expert_gate, 1, hidden_size);
-        }
-        Tensor shared_scale_t = make_fp32_tensor(shared_gate_scale_out.data(), 1, seq_len);
-
         if (profile) stage_start = moe_profile_now();
-        kernel_matmul_fp32(shared_inter_t, shared_down_b, shared_down_t, thread_pool);
-        if (shared_expert_has_gate) {
-            kernel_matmul_fp32(
-                hidden, shared_scale_b, shared_scale_t, thread_pool);
-        } else {
-            std::fill(shared_gate_scale_out.begin(),
-                      shared_gate_scale_out.end(), 1.0f);
-        }
-        if (use_bf16_activations) {
-            mollm_round_to_bf16(
-                shared_contribution.data(), shared_contribution.size());
-            mollm_round_to_bf16(
-                shared_gate_scale_out.data(),
-                shared_gate_scale_out.size());
-        }
-        for (int t = 0; t < seq_len; t++) {
-            shared_scales[t] =
-                shared_expert_has_gate
-                    ? sigmoid_scalar(shared_gate_scale_out[t])
-                    : 1.0f;
+        if (!kernel_moe_shared_expert(
+                hidden, *shared_gate, *shared_up, *shared_down,
+                shared_expert_has_gate ? shared_expert_gate : nullptr,
+                shared_output, thread_pool, shared_intermediate_size,
+                use_bf16_activations, swiglu_limit)) {
+            return false;
         }
         if (profile) moe_profile_add(MoeProfileStage::SharedDown, stage_start);
     }
@@ -744,42 +770,38 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     // are deliberately excluded: their reads continue in parallel with this
     // work and fall through to the streaming path below. Results are scattered
     // later in expert-id order, preserving the original accumulation order.
-    std::vector<int> batched_experts;
     std::vector<int> batched_slots;
     std::vector<float> batch_down_out;
     const bool can_batch_ready_decode =
         use_ssd && seq_len == 1 && thread_pool &&
         thread_pool->num_threads() > 1 && selected_experts.size() > 1;
-    if (can_batch_ready_decode) {
+    if (can_batch_ready_decode)
         batched_slots.assign(num_experts, -1);
-        for (int expert : selected_experts) {
-            if (counts[expert] == 1 &&
-                gate_up_source->cache->is_ready(
-                    gate_up_source, down_source, expert)) {
-                batched_experts.push_back(expert);
-            }
-        }
-    }
-    if (batched_experts.size() > 1) {
-        const size_t batch = batched_experts.size();
+
+    auto process_ready_batch = [&](const std::vector<int>& experts) {
+        const size_t batch = experts.size();
+        const size_t output_base =
+            batch_down_out.size() / static_cast<size_t>(hidden_size);
         std::vector<Tensor> gate_up_weights(batch);
         std::vector<Tensor> down_weights(batch);
         for (size_t i = 0; i < batch; ++i) {
             if (!gate_up_source->cache->acquire(
-                    gate_up_source, down_source, batched_experts[i],
+                    gate_up_source, down_source, experts[i],
                     gate_up_weights[i], down_weights[i])) {
                 std::fprintf(stderr, "MOE: failed to page in expert %d\n",
-                             batched_experts[i]);
+                             experts[i]);
                 return false;
             }
-            batched_slots[batched_experts[i]] = (int)i;
+            batched_slots[experts[i]] =
+                static_cast<int>(output_base + i);
         }
 
         std::vector<float> batch_gate_up_out(
-            batch * (size_t)(2 * intermediate_size));
+            batch * static_cast<size_t>(2 * intermediate_size));
         std::vector<float> batch_inter(
-            batch * (size_t)intermediate_size);
-        batch_down_out.resize(batch * (size_t)hidden_size);
+            batch * static_cast<size_t>(intermediate_size));
+        batch_down_out.resize(
+            (output_base + batch) * static_cast<size_t>(hidden_size));
         Tensor hidden_one = make_fp32_tensor(
             const_cast<float*>(x_data), hidden_size, 1);
         std::vector<Tensor> gate_inputs(batch, hidden_one);
@@ -788,7 +810,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         for (size_t i = 0; i < batch; ++i) {
             gate_outputs.push_back(make_fp32_tensor(
                 batch_gate_up_out.data() +
-                    i * (size_t)(2 * intermediate_size),
+                    i * static_cast<size_t>(2 * intermediate_size),
                 2 * intermediate_size, 1));
         }
 
@@ -814,7 +836,7 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             }
             for (size_t i = 0; i < batch; ++i) {
                 float* gate_up = batch_gate_up_out.data() +
-                    i * (size_t)(2 * intermediate_size);
+                    i * static_cast<size_t>(2 * intermediate_size);
                 if (use_bf16_activations) {
                     mollm_round_to_bf16(
                         gate_up,
@@ -822,16 +844,17 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
                 }
                 apply_swiglu(
                     gate_up, gate_up + intermediate_size,
-                    batch_inter.data() + i * (size_t)intermediate_size,
+                    batch_inter.data() +
+                        i * static_cast<size_t>(intermediate_size),
                     1, intermediate_size, 2 * intermediate_size,
                     2 * intermediate_size, intermediate_size,
                     swiglu_limit);
                 if (use_bf16_activations) {
-                    const int route = offsets[batched_experts[i]];
+                    const int route = offsets[experts[i]];
                     const float route_weight = route_weights[route];
                     float* intermediate =
                         batch_inter.data() +
-                        i * (size_t)intermediate_size;
+                        i * static_cast<size_t>(intermediate_size);
                     for (int dim = 0; dim < intermediate_size; ++dim)
                         intermediate[dim] *= route_weight;
                     mollm_round_to_bf16(
@@ -849,10 +872,12 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         down_outputs.reserve(batch);
         for (size_t i = 0; i < batch; ++i) {
             down_inputs.push_back(make_fp32_tensor(
-                batch_inter.data() + i * (size_t)intermediate_size,
+                batch_inter.data() +
+                    i * static_cast<size_t>(intermediate_size),
                 intermediate_size, 1));
             down_outputs.push_back(make_fp32_tensor(
-                batch_down_out.data() + i * (size_t)hidden_size,
+                batch_down_out.data() +
+                    (output_base + i) * static_cast<size_t>(hidden_size),
                 hidden_size, 1));
         }
         if (profile) stage_start = moe_profile_now();
@@ -872,9 +897,34 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
         }
         if (profile)
             moe_profile_add(MoeProfileStage::RoutedDown, stage_start);
-        if (use_bf16_activations)
+        if (use_bf16_activations) {
             mollm_round_to_bf16(
-                batch_down_out.data(), batch_down_out.size());
+                batch_down_out.data() +
+                    output_base * static_cast<size_t>(hidden_size),
+                batch * static_cast<size_t>(hidden_size));
+        }
+        return true;
+    };
+
+    if (can_batch_ready_decode) {
+        // The first batch overlaps its compute with reads that were not ready
+        // after the shared expert. Re-scan after each non-trivial wave so those
+        // newly completed experts also share two thread-pool dispatches instead
+        // of falling back to two dispatches per expert.
+        for (;;) {
+            std::vector<int> ready;
+            for (int expert : selected_experts) {
+                if (counts[expert] == 1 && batched_slots[expert] < 0 &&
+                    gate_up_source->cache->is_ready(
+                        gate_up_source, down_source, expert)) {
+                    ready.push_back(expert);
+                }
+            }
+            if (ready.size() < 2)
+                break;
+            if (!process_ready_batch(ready))
+                return false;
+        }
     }
 
     auto advance_stream_window = [&](int expert) {
@@ -1053,9 +1103,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             const float* src =
                 shared_contribution.data() + (size_t)t * hidden_size;
             float* dst = out_data + (int64_t)t * ldo;
-            const float scale = shared_scales[t];
             for (int d = 0; d < hidden_size; ++d)
-                dst[d] += scale * src[d];
+                dst[d] += src[d];
         }
     }
     return true;

@@ -127,11 +127,22 @@ bool kernel_matmul_mxfp4_gemv_batch(const std::vector<Tensor>& inputs,
                                     const std::vector<Tensor>& weights,
                                     std::vector<Tensor>& outputs,
                                     ThreadPool* thread_pool);
+// Execute several M=1 FP32 GEMVs in one thread-pool dispatch. This preserves
+// each projection's FP32 accumulation order while amortizing worker barriers.
+bool kernel_matmul_fp32_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool);
 
 // Execute independent, same-shaped [A, weight] pairs into consecutive slices
 // of one output tensor. Decode can share a single worker-pool dispatch.
 void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
                          Tensor& output, ThreadPool* thread_pool);
+
+// Invalidate decode-local activation sidecars. Repeated FP8 linears fed by
+// the same Tensor can share an exact FP8->Q8 representation within one graph
+// execution, but never across executions where its storage may be overwritten.
+void matmul_reset_activation_cache();
 
 void kernel_gemv_sparse_a(const Tensor& A, const Tensor& B, Tensor& C,
                           ThreadPool* thread_pool = nullptr);

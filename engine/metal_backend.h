@@ -39,6 +39,9 @@ public:
     void dispatch(const GraphNode& node,
                   const std::vector<const Tensor*>& inputs,
                   Tensor* output, ThreadPool* thread_pool) override;
+    bool dispatch_host_moe(
+        const GraphNode& node, const std::vector<const Tensor*>& inputs,
+        Tensor* output, ThreadPool* thread_pool, bool& success) override;
 
     void* alloc_output(Tensor& out, size_t nbytes, BufferPool* pool) override;
     void  free_output(Tensor& t, BufferPool* pool) override;
@@ -54,9 +57,8 @@ public:
     /// (M5 / A19+). Gates the fast tensor GEMM and W8A8 int8-MMA paths.
     bool has_tensor_path() const;
 
-    /// Register the whole package weight region as one shared MTLBuffer wrapping
-    /// the mmap (newBufferWithBytesNoCopy). Individual weight tensors then carry
-    /// device_offset = (weight ptr - base). Returns false if wrapping failed.
+    /// Register the package mmap as one or more zero-copy shared MTLBuffers.
+    /// Large packages are split at page-aligned maxBufferLength boundaries.
     bool register_weight_region(void* base, size_t size);
 
     /// Enable per-weight copies for hybrid SSD-MoE. The package remains mmap'd
@@ -76,6 +78,10 @@ public:
     /// After register_weight_region, point a weight/constant tensor at the
     /// shared weight buffer with the correct device_offset (from t.data).
     void wrap_weight(Tensor& t);
+
+    /// Bind per-channel/group INT8 scales after quant metadata is available.
+    /// The scales can reside in a different package-region buffer from data.
+    void wrap_weight_int8(Tensor& t);
 
     /// Second pass for packed INT4 weights (call after quant metadata is set):
     /// decode ordinary BG32/BG128 linear weights into a Metal-friendly raw

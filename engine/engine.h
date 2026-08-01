@@ -265,6 +265,7 @@ public:
 
 private:
     void prepare_metal_prefill_weights();
+    bool decode_uses_metal_expert_cache() const;
 
     EngineConfig cfg_;
     Sampler sampler_;

@@ -60,6 +60,11 @@ struct Tensor {
     //     the same and the offset is carried separately).
     void*       device_data   = nullptr;
     size_t      device_offset = 0;
+    // Quantization scales may live in a different Metal buffer from the
+    // weight bytes when a very large package mmap is split at the device's
+    // maxBufferLength boundary.
+    void*       scales_device_data = nullptr;
+    size_t      scales_device_offset = 0;
     uint32_t    owner_id = 0;  // debug owner for pooled storage; 0 = unknown/non-pooled
     uint64_t    storage_id = 0; // debug allocation identity; copied by borrowed views
     const float* scales = nullptr; // quant scales for INT8/INT4 weights; borrowed from weight file
@@ -75,6 +80,10 @@ struct Tensor {
     // optional interleaved FP16 layout preserves those values while enabling
     // the existing NEON dense kernel.
     const void* fp8_bf16_fp16_data = nullptr;
+    // Optional exact BF16 sidecar for FP32 graph weights whose values all came
+    // from a BF16 checkpoint. Stored as interleaved raw BF16 bits; decode uses
+    // FP32 accumulation, so this only halves weight traffic and storage.
+    const void* fp32_bf16_data = nullptr;
     uint32_t    group_size = 0;    // K-dim quant group size; K means per-channel
     uint32_t    num_groups = 0;    // total groups = N * groups_per_row
     uint32_t    groups_per_row = 0;

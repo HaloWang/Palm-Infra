@@ -65,6 +65,11 @@ int main() {
         check(!cache.add_source(overflowing), "reject overflowing expert extent");
         check(cache.find_source("overflowing") == nullptr,
               "overflowing source is not registered");
+
+        auto short_stride = spec("short_stride", 0);
+        short_stride.expert_stride = short_stride.data_bytes - 1;
+        check(!cache.add_source(short_stride),
+              "reject expert stride shorter than its data");
     }
 
     // Direct BG128 blocks carry their own scales. The SSD cache should accept
@@ -167,6 +172,49 @@ int main() {
               "paged MXFP4 expert dispatches through matmul");
     }
 
+    // Storage tensors may place each expert's data and scale sidecar in one
+    // chunk. Verify that the explicit stride reaches the next expert rather
+    // than treating the intervening sidecar bytes as matrix data.
+    {
+        const std::string interleaved_path =
+            "/tmp/mollm_test_moe_ssd_interleaved.bin";
+        std::vector<uint16_t> interleaved(24, 0xffff);
+        for (int expert = 0; expert < 3; ++expert) {
+            interleaved[expert * 4] =
+                static_cast<uint16_t>(0x3c00 + expert);
+            interleaved[expert * 4 + 1] =
+                static_cast<uint16_t>(0x4000 + expert);
+            interleaved[12 + expert * 4] =
+                static_cast<uint16_t>(0x4400 + expert);
+            interleaved[12 + expert * 4 + 1] =
+                static_cast<uint16_t>(0x4800 + expert);
+        }
+        {
+            std::ofstream out(interleaved_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(interleaved.data()),
+                      static_cast<std::streamsize>(
+                          interleaved.size() * sizeof(uint16_t)));
+        }
+        auto gate_spec = spec("interleaved_gate", 0);
+        auto down_spec = spec(
+            "interleaved_down", 12 * sizeof(uint16_t));
+        gate_spec.expert_stride = 4 * sizeof(uint16_t);
+        down_spec.expert_stride = 4 * sizeof(uint16_t);
+        MoeSsdCache cache;
+        check(cache.open(interleaved_path, 8),
+              "open expert-interleaved cache");
+        check(cache.add_source(gate_spec) && cache.add_source(down_spec),
+              "add expert-interleaved sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("interleaved_gate"),
+                            cache.find_source("interleaved_down"),
+                            2, gate, down),
+              "load strided expert");
+        check(static_cast<const uint16_t*>(gate.data)[0] == 0x3c02 &&
+                  static_cast<const uint16_t*>(down.data)[1] == 0x4802,
+              "expert stride skips interleaved sidecar bytes");
+    }
+
     {
         MoeSsdCache cache;
         check(cache.open(path, 16), "open cache");  // holds exactly two expert pairs
@@ -229,9 +277,8 @@ int main() {
               "advanced window preserves expert bytes");
     }
 
-    // With room for all three pairs, request adjacent experts together. This
-    // exercises the coalesced component reads: each component run is read as
-    // one contiguous range, then scattered back to the individual tensors.
+    // With room for all three pairs, request adjacent experts together and
+    // verify independent expert-pair jobs preserve every tensor slice.
     {
         MoeSsdCache cache;
         check(cache.open(path, 24, 8), "open coalesced async cache");
@@ -253,6 +300,8 @@ int main() {
         check(static_cast<const uint16_t*>(gu.data)[0] == 0x4500 &&
               static_cast<const uint16_t*>(dw.data)[1] == 0x4c00,
               "coalesced expert two bytes match");
+        check(cache.acquire(gate, down, 1, gu, dw),
+              "finish adjacent expert-pair requests");
         MoeSsdCache::Stats stats = cache.stats();
         check(stats.misses == 3 && stats.bytes_read == 24,
               "coalesced reads preserve miss and byte accounting");
@@ -547,6 +596,48 @@ int main() {
               "reuse the retained next-layer route");
         check(cache.stats().hits == 1,
               "retained route produces a next-forward hit");
+    }
+
+    // Exact hash routes are known before their layer starts, so they should
+    // not reserve the previous token's route. Clearing cross-token retention
+    // must make the oldest former route entry evictable again.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 24, 2),
+              "open exact-route retention cache");
+        auto gate0 = spec("exact_retain_gate0", 0);
+        auto down0 = spec("exact_retain_down0", 6 * sizeof(uint16_t));
+        auto gate1 = spec("exact_retain_gate1", 0);
+        auto down1 = spec("exact_retain_down1", 6 * sizeof(uint16_t));
+        gate1.layer = down1.layer = 1;
+        check(cache.add_source(gate0) && cache.add_source(down0) &&
+                  cache.add_source(gate1) && cache.add_source(down1) &&
+                  cache.set_global_capacity_pool(true),
+              "configure exact-route retention cache");
+        const MoeSsdTensorSource* g0 =
+            cache.find_source("exact_retain_gate0");
+        const MoeSsdTensorSource* d0 =
+            cache.find_source("exact_retain_down0");
+        const MoeSsdTensorSource* g1 =
+            cache.find_source("exact_retain_gate1");
+        const MoeSsdTensorSource* d1 =
+            cache.find_source("exact_retain_down1");
+        Tensor gu, dw;
+        check(cache.retain_for_next_forward(g0, d0, {0, 1}) &&
+                  cache.acquire(g0, d0, 0, gu, dw) &&
+                  cache.acquire(g0, d0, 1, gu, dw) &&
+                  cache.acquire(g1, d1, 0, gu, dw),
+              "populate one retained and one ordinary route");
+        cache.begin_forward_pass();
+        check(cache.retain_for_next_forward(g0, d0, {0, 1}, false),
+              "clear exact-route cross-token retention");
+        check(cache.acquire(g1, d1, 0, gu, dw) &&
+                  cache.acquire(g1, d1, 1, gu, dw),
+              "admit a current-layer route after retention clear");
+        check(!cache.contains(g0, d0, 0) &&
+                  cache.contains(g1, d1, 0) &&
+                  cache.contains(g1, d1, 1),
+              "exact-route retention clear restores LRU eviction");
     }
 
     // Switch the global victim order according to cache pressure. When one

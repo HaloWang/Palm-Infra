@@ -36,6 +36,21 @@ struct MoeSsdTensorSpec {
     // Per-expert sidecar bytes. May be zero for BG128 data, whose blocks
     // already embed the scales consumed by the direct q4-dot kernels.
     uint64_t scales_bytes = 0;
+    // Distance between consecutive experts in an interleaved storage tensor.
+    // Zero retains the legacy component-major layout, where each component's
+    // own byte count is its stride.
+    uint64_t expert_stride = 0;
+
+    uint64_t data_file_offset(int expert) const {
+        const uint64_t stride = expert_stride != 0
+            ? expert_stride : data_bytes;
+        return data_offset + static_cast<uint64_t>(expert) * stride;
+    }
+    uint64_t scales_file_offset(int expert) const {
+        const uint64_t stride = expert_stride != 0
+            ? expert_stride : scales_bytes;
+        return scales_offset + static_cast<uint64_t>(expert) * stride;
+    }
 };
 
 class MoeSsdCache;
@@ -75,7 +90,8 @@ bool schedule_moe_hash_cross_layer_prefetch(
     const MoeSsdTensorSource* next_gate_up,
     const MoeSsdTensorSource* next_down,
     int num_experts,
-    int top_k);
+    int top_k,
+    bool demand_priority = false);
 
 class MoeSsdCache {
 public:
@@ -154,7 +170,8 @@ public:
     // complete route without hard-partitioning the shared pool.
     bool retain_for_next_forward(const MoeSsdTensorSource* gate_up,
                                  const MoeSsdTensorSource* down,
-                                 const std::vector<int>& experts);
+                                 const std::vector<int>& experts,
+                                 bool keep_cross_token = true);
 
     // Speculative reads are only serviced after real router requests.
     bool prefetch_many(const MoeSsdTensorSource* gate_up,
@@ -233,9 +250,10 @@ private:
         uint64_t unused_prefetch_evictions = 0;
         uint64_t short_term_reloads = 0;
     };
-    // One job reads a physically contiguous run of the same component
-    // (gate data/scales or down data/scales) for adjacent expert ids. Keeping
-    // components separate exposes a deep queue even for a single decode token.
+    // A job reads one component (gate/down data or scales) for a small window
+    // of experts. Interleaved packages keep data and scales adjacent on disk,
+    // but independent component jobs expose enough parallelism to the I/O
+    // workers and let the first expert become consumable sooner.
     struct IoJob {
         std::vector<Entry*> entries;
         uint8_t component = 0;
@@ -336,6 +354,10 @@ private:
     // one roomy enough to preserve routes across forward passes.
     std::unordered_map<int, size_t> layer_route_widths_;
     std::unordered_map<int, std::vector<int>> retained_experts_;
+    // Exponentially decayed per-layer route frequency. This only chooses
+    // which resident entries receive soft eviction protection; capacity
+    // remains a shared global pool and the current route always wins.
+    std::unordered_map<int, std::vector<float>> retained_scores_;
     std::unordered_map<int, PredictionRecord> pending_predictions_;
     std::unordered_map<int, LayerCounters> layer_stats_;
     std::unordered_map<uint64_t, uint64_t> last_evicted_epoch_;

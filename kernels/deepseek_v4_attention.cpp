@@ -16,6 +16,7 @@ namespace {
 constexpr float kPi = 3.14159265358979323846f;
 
 #if HAS_NEON
+
 bool grouped_fp16_interleaved_gemv(
     const float* input, const __fp16* packed_weight, float* output,
     int groups, int group_width, int rank, ThreadPool* thread_pool) {
@@ -49,7 +50,45 @@ bool grouped_fp16_interleaved_gemv(
             float32x4_t high0 = vdupq_n_f32(0.0f);
             float32x4_t low1 = vdupq_n_f32(0.0f);
             float32x4_t high1 = vdupq_n_f32(0.0f);
-            for (int k = 0; k < group_width; ++k) {
+            int k = 0;
+            for (; k + 1 < group_width; k += 2) {
+                const float activation0 = group_input[k];
+                const float activation1 = group_input[k + 1];
+                const float16x8_t values00 =
+                    vld1q_f16(weight_tile0 + static_cast<size_t>(k) * 8);
+                const float16x8_t values01 =
+                    vld1q_f16(
+                        weight_tile0 + static_cast<size_t>(k + 1) * 8);
+                low0 = vfmaq_n_f32(
+                    low0, vcvt_f32_f16(vget_low_f16(values00)), activation0);
+                high0 = vfmaq_n_f32(
+                    high0, vcvt_f32_f16(vget_high_f16(values00)), activation0);
+                low0 = vfmaq_n_f32(
+                    low0, vcvt_f32_f16(vget_low_f16(values01)), activation1);
+                high0 = vfmaq_n_f32(
+                    high0, vcvt_f32_f16(vget_high_f16(values01)), activation1);
+                if (weight_tile1) {
+                    const float16x8_t values10 =
+                        vld1q_f16(
+                            weight_tile1 + static_cast<size_t>(k) * 8);
+                    const float16x8_t values11 =
+                        vld1q_f16(
+                            weight_tile1 + static_cast<size_t>(k + 1) * 8);
+                    low1 = vfmaq_n_f32(
+                        low1, vcvt_f32_f16(vget_low_f16(values10)),
+                        activation0);
+                    high1 = vfmaq_n_f32(
+                        high1, vcvt_f32_f16(vget_high_f16(values10)),
+                        activation0);
+                    low1 = vfmaq_n_f32(
+                        low1, vcvt_f32_f16(vget_low_f16(values11)),
+                        activation1);
+                    high1 = vfmaq_n_f32(
+                        high1, vcvt_f32_f16(vget_high_f16(values11)),
+                        activation1);
+                }
+            }
+            for (; k < group_width; ++k) {
                 const float16x8_t values0 =
                     vld1q_f16(weight_tile0 + static_cast<size_t>(k) * 8);
                 const float activation = group_input[k];
@@ -318,27 +357,26 @@ int kernel_dsv4_compressor(
     if (start_pos == 0)
         reset_compressor_state(kv_state, score_state, cache);
 
-    std::vector<float> kv_values(
-        static_cast<size_t>(projected) * sequence);
-    std::vector<float> gate_values(
-        static_cast<size_t>(projected) * sequence);
+    const size_t projection_elements =
+        static_cast<size_t>(projected) * sequence;
+    std::vector<float> projection_values(projection_elements * 2);
+    float* kv_values = projection_values.data();
+    float* gate_values = kv_values + projection_elements;
     Tensor kv_output = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL,
-        projected, sequence, 1, 1, kv_values.data());
+        projected, sequence, 1, 1, kv_values);
     Tensor gate_output = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL,
-        projected, sequence, 1, 1, gate_values.data());
-    bool batched_projection = false;
+        projected, sequence, 1, 1, gate_values);
     if (sequence == 1 && thread_pool) {
-        std::vector<Tensor> projection_inputs = {hidden, hidden};
-        std::vector<Tensor> projection_weights = {wkv, wgate};
-        std::vector<Tensor> projection_outputs = {
-            kv_output, gate_output};
-        batched_projection = kernel_matmul_int8_gemv_batch(
-            projection_inputs, projection_weights,
-            projection_outputs, thread_pool);
-    }
-    if (!batched_projection) {
+        Tensor projection_output = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            projected, sequence, 2, 1, projection_values.data());
+        const std::vector<const Tensor*> projection_pairs = {
+            &hidden, &wkv, &hidden, &wgate};
+        kernel_matmul_batch(
+            projection_pairs, projection_output, thread_pool);
+    } else {
         kernel_matmul_fp32(hidden, wkv, kv_output, thread_pool);
         kernel_matmul_fp32(hidden, wgate, gate_output, thread_pool);
     }
@@ -362,9 +400,9 @@ int kernel_dsv4_compressor(
         const int destination_row =
             config.overlap ? config.ratio + within : within;
         const float* token_kv =
-            kv_values.data() + static_cast<size_t>(token) * projected;
+            kv_values + static_cast<size_t>(token) * projected;
         const float* token_gate =
-            gate_values.data() + static_cast<size_t>(token) * projected;
+            gate_values + static_cast<size_t>(token) * projected;
         float* state_kv =
             kv_state_data +
             static_cast<size_t>(destination_row) * projected;

@@ -970,6 +970,160 @@ int main() {
         }
     }
 
+    // DeepSeek-V4's compressor has two FP32 projections with the same input.
+    // The batched path must only coalesce worker dispatch, not arithmetic.
+    {
+        constexpr int batch = 2;
+        constexpr int K = 257;
+        constexpr int N = 70;
+        std::vector<float> input(K);
+        for (int k = 0; k < K; ++k)
+            input[k] = ((k * 17) % 43 - 21) * 0.0078125f;
+        std::vector<std::vector<float>> weight_data(
+            batch, std::vector<float>((size_t)N * K));
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs;
+        std::vector<Tensor> weights;
+        std::vector<Tensor> outputs;
+        for (int i = 0; i < batch; ++i) {
+            for (int n = 0; n < N; ++n)
+                for (int k = 0; k < K; ++k)
+                    weight_data[i][(size_t)n * K + k] =
+                        ((n * 11 + k * 5 + i * 7) % 37 - 18) * 0.00390625f;
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input.data()));
+            weights.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1,
+                weight_data[i].data()));
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            ThreadPool reference_pool(4);
+            kernel_matmul_fp32(
+                inputs.back(), weights.back(), reference, &reference_pool);
+        }
+
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_fp32_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "FP32 batched GEMV is supported");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(std::memcmp(
+                      actual[i].data(), expected[i].data(),
+                      N * sizeof(float)) == 0,
+                  "FP32 batched GEMV exactly matches individual GEMV");
+        }
+    }
+
+    // FP32 graph weights converted from a BF16 checkpoint can use an exact
+    // two-byte sidecar. Include values outside the exactly-representable FP16
+    // subset and require bit-identical FP32 accumulation results.
+    {
+        constexpr int batch = 2;
+        constexpr int K = 257;
+        constexpr int N = 70;
+        std::vector<float> input(K);
+        for (int k = 0; k < K; ++k)
+            input[k] = ((k * 7) % 31 - 15) * 0.009765625f;
+        std::vector<std::vector<float>> weight_data(
+            batch, std::vector<float>((size_t)N * K));
+        std::vector<std::vector<float>> expected(
+            batch, std::vector<float>(N));
+        std::vector<std::vector<float>> actual(
+            batch, std::vector<float>(N));
+        std::vector<Tensor> inputs;
+        std::vector<Tensor> weights;
+        std::vector<Tensor> outputs;
+        PackedWeightMap packed;
+        for (int i = 0; i < batch; ++i) {
+            for (size_t j = 0; j < weight_data[i].size(); ++j) {
+                const uint32_t bits =
+                    ((j + i) & 1 ? 0x80000000u : 0u) |
+                    (static_cast<uint32_t>(110 + (j % 28)) << 23) |
+                    (static_cast<uint32_t>((j * 13 + i * 5) % 128) << 16);
+                std::memcpy(&weight_data[i][j], &bits, sizeof(bits));
+            }
+            inputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+                input.data()));
+            weights.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1,
+                weight_data[i].data()));
+            Tensor reference_weight = weights.back();
+            Tensor reference = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                expected[i].data());
+            kernel_matmul_fp32(
+                inputs.back(), reference_weight, reference);
+            prepare_matmul_weight(
+                weights.back(), "exact_bf16_" + std::to_string(i),
+                weight_data[i].data(), packed);
+            CHECK(weights.back().fp32_bf16_data != nullptr,
+                  "exact BF16 FP32 weight builds a sidecar");
+            outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+                actual[i].data()));
+        }
+        ThreadPool pool(4);
+        CHECK(kernel_matmul_fp32_gemv_batch(
+                  inputs, weights, outputs, &pool),
+              "exact BF16 sidecars support batched GEMV");
+        for (int i = 0; i < batch; ++i) {
+            CHECK(std::memcmp(
+                      actual[i].data(), expected[i].data(),
+                      N * sizeof(float)) == 0,
+                  "exact BF16 sidecar preserves FP32 GEMV bits");
+        }
+    }
+
+    {
+        constexpr int M = 5;
+        constexpr int K = 129;
+        constexpr int N = 70;
+        std::vector<float> input((size_t)M * K);
+        std::vector<float> weight_data((size_t)N * K);
+        std::vector<float> expected((size_t)M * N);
+        std::vector<float> actual((size_t)M * N);
+        for (size_t i = 0; i < input.size(); ++i)
+            input[i] = ((i * 11) % 41 - 20) * 0.0068359375f;
+        for (size_t i = 0; i < weight_data.size(); ++i) {
+            const uint32_t bits =
+                (i & 1 ? 0x80000000u : 0u) |
+                (static_cast<uint32_t>(112 + (i % 24)) << 23) |
+                (static_cast<uint32_t>((i * 9) % 128) << 16);
+            std::memcpy(&weight_data[i], &bits, sizeof(bits));
+        }
+        Tensor a = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1,
+            input.data());
+        Tensor weight = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, K, 1, 1,
+            weight_data.data());
+        Tensor reference = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1,
+            expected.data());
+        Tensor output = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, M, 1, 1,
+            actual.data());
+        kernel_matmul_fp32(a, weight, reference);
+        PackedWeightMap packed;
+        prepare_matmul_weight(
+            weight, "exact_bf16_gemm", weight_data.data(), packed);
+        ThreadPool pool(4);
+        kernel_matmul_fp32(a, weight, output, &pool);
+        CHECK(std::memcmp(
+                  actual.data(), expected.data(),
+                  actual.size() * sizeof(float)) == 0,
+              "exact BF16 sidecar preserves FP32 GEMM bits");
+    }
+
     // BG32 uses the same batched-GEMV API with one embedded scale per
     // 32-value dot block.
     if (matmul_int4_q4dot_kernel_available()) {

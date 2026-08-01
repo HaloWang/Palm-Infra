@@ -304,6 +304,74 @@ static void matmul_fp16_neon_gemv_range(const float* A, const __fp16* B_packed,
     }
 }
 
+static void matmul_bf16_neon_gemv_range(const float* A,
+                                        const uint16_t* B_packed, float* C,
+                                        int K, int n_begin, int n_end) {
+    for (int n = n_begin; n < n_end; n += 8) {
+        const int n_tile_end = std::min(n + 8, n_end);
+        float32x4_t acc0 = vdupq_n_f32(0.f);
+        float32x4_t acc1 = vdupq_n_f32(0.f);
+        const uint16_t* b_tile = B_packed + (n & ~7) * K;
+        for (int k = 0; k < K; ++k) {
+            const uint16x8_t bits = vld1q_u16(b_tile + k * 8);
+            const float32x4_t low = vreinterpretq_f32_u32(
+                vshll_n_u16(vget_low_u16(bits), 16));
+            const float32x4_t high = vreinterpretq_f32_u32(
+                vshll_n_u16(vget_high_u16(bits), 16));
+            const float activation = A[k];
+            acc0 = vfmaq_n_f32(acc0, low, activation);
+            acc1 = vfmaq_n_f32(acc1, high, activation);
+        }
+        float values[8];
+        vst1q_f32(values, acc0);
+        vst1q_f32(values + 4, acc1);
+        for (int lane = 0; lane < 8 && n + lane < n_tile_end; ++lane)
+            C[n + lane] = values[lane];
+    }
+}
+
+static void matmul_bf16_neon_gemm_range(
+    const float* A, const uint16_t* B_packed, float* C,
+    int M, int N, int K, int lda, int ldc,
+    int m_begin, int m_end, int n_begin, int n_end) {
+    for (int m = m_begin; m < m_end; m += 8) {
+        const int m_tile_end = std::min(m + 8, m_end);
+        for (int n = n_begin; n < n_end; n += 8) {
+            const int n_tile_end = std::min(n + 8, n_end);
+            float32x4_t low[8];
+            float32x4_t high[8];
+            for (int row = 0; row < 8; ++row) {
+                low[row] = vdupq_n_f32(0.0f);
+                high[row] = vdupq_n_f32(0.0f);
+            }
+            const uint16_t* b_tile = B_packed + (n & ~7) * K;
+            for (int k = 0; k < K; ++k) {
+                const uint16x8_t bits = vld1q_u16(b_tile + k * 8);
+                const float32x4_t weights_low = vreinterpretq_f32_u32(
+                    vshll_n_u16(vget_low_u16(bits), 16));
+                const float32x4_t weights_high = vreinterpretq_f32_u32(
+                    vshll_n_u16(vget_high_u16(bits), 16));
+                for (int row = 0; row < m_tile_end - m; ++row) {
+                    const float activation = A[(m + row) * lda + k];
+                    low[row] = vfmaq_n_f32(
+                        low[row], weights_low, activation);
+                    high[row] = vfmaq_n_f32(
+                        high[row], weights_high, activation);
+                }
+            }
+            for (int row = 0; row < m_tile_end - m; ++row) {
+                float values[8];
+                vst1q_f32(values, low[row]);
+                vst1q_f32(values + 4, high[row]);
+                for (int lane = 0;
+                     lane < 8 && n + lane < n_tile_end; ++lane) {
+                    C[(m + row) * ldc + n + lane] = values[lane];
+                }
+            }
+        }
+    }
+}
+
 // FP16 accumulate variant: vfmaq_n_f16 does 8-lane FP16×FP16→FP16 FMA with
 // scalar broadcast. K_BLOCK store/reload (FP16→FP32→FP16) between blocks
 // limits within-block FP16 accumulation range for precision.
@@ -896,6 +964,87 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C, int M,
 #endif
 }
 
+bool kernel_matmul_fp32_gemv_batch(const std::vector<Tensor>& inputs,
+                                   const std::vector<Tensor>& weights,
+                                   std::vector<Tensor>& outputs,
+                                   ThreadPool* thread_pool) {
+    const size_t batch = inputs.size();
+    if (!thread_pool || thread_pool->num_threads() <= 1 || batch < 2 ||
+        weights.size() != batch || outputs.size() != batch) {
+        return false;
+    }
+
+    std::vector<int> row_offsets(batch + 1, 0);
+    std::vector<int> tile_offsets(batch + 1, 0);
+    int common_k = -1;
+    for (size_t i = 0; i < batch; ++i) {
+        const Tensor& input = inputs[i];
+        const Tensor& weight = weights[i];
+        const Tensor& output = outputs[i];
+        const int k = static_cast<int>(input.shape[0]);
+        const int n = static_cast<int>(weight.shape[0]);
+        if (input.prec != Precision::FP32 || !input.data ||
+            input.shape[1] != 1 || weight.prec != Precision::FP32 ||
+            !weight.data || weight.shape[1] != k ||
+            output.prec != Precision::FP32 || !output.data ||
+            output.shape[0] != n || output.shape[1] != 1 ||
+            (common_k >= 0 && common_k != k)) {
+            return false;
+        }
+        common_k = k;
+        row_offsets[i + 1] = row_offsets[i] + n;
+        tile_offsets[i + 1] = tile_offsets[i] + (n + 7) / 8;
+    }
+
+    const int total_rows = row_offsets.back();
+    if (total_rows <= 0)
+        return false;
+
+    bool all_bf16_sidecars = true;
+    for (const Tensor& weight : weights)
+        all_bf16_sidecars = all_bf16_sidecars && weight.fp32_bf16_data;
+    MatmulTimer timer;
+    timer.set_shape(all_bf16_sidecars ? "bf16_gemv_batch"
+                                      : "fp32_gemv_batch",
+                    1, total_rows, common_k, 0, 0,
+                    false, false, thread_pool->num_threads());
+    const int total_tiles = tile_offsets.back();
+    const int chunk = std::max(1, g_matmul_config.gemv_chunk_size / 8);
+    thread_pool->parallel_for(
+        0, total_tiles, chunk,
+        [&](int, int flat_begin, int flat_end) {
+            for (size_t i = 0; i < batch; ++i) {
+                const int begin = std::max(flat_begin, tile_offsets[i]);
+                const int end = std::min(flat_end, tile_offsets[i + 1]);
+                if (begin >= end)
+                    continue;
+                const Tensor& input = inputs[i];
+                const Tensor& weight = weights[i];
+                Tensor& output = outputs[i];
+                const int local_begin = (begin - tile_offsets[i]) * 8;
+                const int local_end = std::min(
+                    static_cast<int>(weight.shape[0]),
+                    (end - tile_offsets[i]) * 8);
+                if (weight.fp32_bf16_data) {
+                    matmul_bf16_neon_gemv_range(
+                        input.ptr<float>(),
+                        static_cast<const uint16_t*>(weight.fp32_bf16_data),
+                        output.ptr<float>(), common_k, local_begin, local_end);
+                } else {
+                    matmul_fp32_range_n(
+                        input.ptr<float>(), weight.ptr<float>(),
+                        output.ptr<float>(), 1,
+                        static_cast<int>(weight.shape[0]), common_k,
+                        static_cast<int>(input.stride[1] / sizeof(float)),
+                        static_cast<int>(weight.shape[1]),
+                        static_cast<int>(output.stride[1] / sizeof(float)),
+                        local_begin, local_end);
+                }
+            }
+        });
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // Dense FP32/FP16 dispatch
 // ---------------------------------------------------------------------------
@@ -927,6 +1076,73 @@ void matmul_dispatch_dense(const Tensor& A, const Tensor& B, Tensor& C,
     // We determine this by comparing K_weight with K: if they differ, it's
     // repacked.
     bool is_repacked = (K_weight != K);
+
+#if HAS_NEON
+    if (B.prec == Precision::FP32 && B.fp32_bf16_data) {
+        const int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        _timer.set_shape(M == 1 ? "bf16_gemv_interleaved"
+                                : "bf16_gemm_interleaved",
+                         M, N, K, 0, 0,
+                         false, true, n_threads);
+        const auto* packed =
+            static_cast<const uint16_t*>(B.fp32_bf16_data);
+        if (M == 1) {
+            auto run = [&](int n_begin, int n_end) {
+                matmul_bf16_neon_gemv_range(
+                    a_ptr, packed, c_ptr, K, n_begin, n_end);
+                const auto local = local_activation_range(
+                    act_n_begin, act_n_len, n_begin, n_end);
+                if (act != Activation::NONE && local.length != 0) {
+                    matmul_apply_activation_gemv(
+                        c_ptr + n_begin, n_end - n_begin, act,
+                        local.begin, local.length);
+                }
+            };
+            if (thread_pool && n_threads > 1 && N > 64) {
+                int chunk = std::max(N / (n_threads * 8), 64);
+                chunk = ((chunk + 7) / 8) * 8;
+                thread_pool->parallel_for(
+                    0, N, chunk,
+                    [&](int, int n_begin, int n_end) {
+                        run(n_begin, n_end);
+                    });
+            } else {
+                run(0, N);
+            }
+        } else {
+            auto run = [&](int m_begin, int m_end,
+                           int n_begin, int n_end) {
+                matmul_bf16_neon_gemm_range(
+                    a_ptr, packed, c_ptr, M, N, K, lda, ldc,
+                    m_begin, m_end, n_begin, n_end);
+                if (act != Activation::NONE && act_n_len != 0) {
+                    matmul_apply_activation(
+                        c_ptr + n_begin, M, n_end - n_begin, ldc,
+                        m_begin, m_end, act,
+                        std::max(0, act_n_begin - n_begin),
+                        act_n_len < 0
+                            ? -1
+                            : std::max(
+                                  0,
+                                  std::min(n_end, act_n_begin + act_n_len) -
+                                      std::max(n_begin, act_n_begin)));
+                }
+            };
+            if (thread_pool && n_threads > 1) {
+                constexpr int n_block = 128;
+                thread_pool->parallel_for_2d(
+                    M, 8, N, n_block,
+                    [&](int, int m_begin, int m_end,
+                        int n_begin, int n_end) {
+                        run(m_begin, m_end, n_begin, n_end);
+                    });
+            } else {
+                run(0, M, 0, N);
+            }
+        }
+        return;
+    }
+#endif
 
     // ---- Interleaved packing path (FP16 + NEON) ----
     // B is pre-packed at load time (engine) or by the caller (bench/test).

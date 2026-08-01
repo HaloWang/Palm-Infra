@@ -55,18 +55,18 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 
 | 标准吞吐 | Expert RAM cache | 结果 |
 |---|---:|---:|
-| `pp256 + tg64` | 16 GiB | **9.35 pp / 4.74 tg** |
+| `pp256 + tg64` | 16 GiB | **9.52 pp / 5.71 tg** |
 
 该标准样本使用 4 个 CPU 线程和 `warmup=3`。目前只完成了一个独立进程，
 并非通常采用的五进程中位数，因此暂作 provisional 数据。
 
 | Expert RAM cache | Decode | Peak RSS | 每个生成 token 的平均 SSD 读取量 |
 |---:|---:|---:|---:|
-| **1 GiB** | 4.37 t/s | **19.09 GiB** | 3.73 GB/token |
-| **10 GiB** | **4.73 t/s** | **24.32 GiB** | 1.89 GB/token |
-| **16 GiB** | 4.67 t/s | 26.91 GiB | **1.55 GB/token** |
+| **1 GiB** | 4.95 t/s | **19.66 GiB** | 3.57 GB/token |
+| **10 GiB** | 5.57 t/s | 26.57 GiB | 1.77 GB/token |
+| **16 GiB** | **5.59 t/s** | 27.03 GiB | **1.49 GB/token** |
 
-该实验使用 19-token 中文真实 prompt、生成 64 tokens、greedy decoding、
+该实验使用 20-token 中文真实 prompt、生成 64 tokens、greedy decoding、
 6 个 CPU 线程、`warmup=0`，每档 cache 取三个独立进程的中位数。由于测试
 协议不同，这组真实 prompt 数据不与标准 `pp256 + tg64` 性能图混排。SSD
 读取量采用与上方 122B 表格相同的摊销逻辑 expert 字节定义。

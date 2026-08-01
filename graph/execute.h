@@ -26,6 +26,9 @@ struct ExecContext {
     BufferPool*   pool    = nullptr;
     ThreadPool*   thread_pool = nullptr;
     Backend*      backend = nullptr;   // op dispatcher (CPU/NPU/...)
+    // Optional decode-only routed-MoE accelerator. All other graph operators
+    // continue through `backend`, so host intermediates remain authoritative.
+    Backend*      moe_backend = nullptr;
     bool          execution_failed = false;
     bool          profile_enabled = false;
     // DeepSeek-V4 activations are BF16 in the published inference graph.

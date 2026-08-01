@@ -123,6 +123,16 @@ struct SelectedW4A8Params {
     int activation_repeat;
 };
 
+struct SelectedMxfp4Params {
+    int selections;
+    int N;
+    int K;
+    int c_row_stride;
+    int groups_per_row;
+    int activation_repeat;
+    int activation_row_stride;
+};
+
 // Expert-grouped resident MoE GEMM. Routes are stored in fixed per-expert
 // segments of max_routes entries; each entry is the original [token, top-k]
 // selection index so outputs can be written directly in canonical order.
@@ -335,6 +345,9 @@ struct MoeW4Params {
     int output_row_stride;
     int gu_groups_per_row;
     int down_groups_per_row;
+    int gu_group_size;
+    int down_group_size;
+    float swiglu_limit;
 };
 
 struct MoeSharedW4Params {

@@ -30,6 +30,11 @@ def read_package_metadata(path: str) -> dict:
         return json.loads(f.read(meta_len))
 
 
+def read_package_weights_offset(path: str) -> int:
+    with open(path, "rb") as f:
+        return struct.unpack_from("<Q", f.read(128), 88)[0]
+
+
 def main():
     with tempfile.TemporaryDirectory() as tmp:
         weights_dir = Path(tmp) / "weights"
@@ -70,6 +75,7 @@ def main():
             ],
             group_size=2,
             num_groups=down_scales.size,
+            expert_interleave_count=2,
         )
 
         g = GraphBuilder()
@@ -127,7 +133,26 @@ def main():
         assert down_meta["shape"][:2] == [6, 4]
         assert down_meta["expert_data_bytes"] == down_q4.nbytes // 2
         assert down_meta["expert_scales_bytes"] == down_scales.nbytes // 2
+        assert down_meta["expert_stride"] == (
+            down_q4.nbytes + down_scales.nbytes) // 2
+        assert down_meta["data_offset"] == 88
+        assert down_meta["scales_offset"] == 88 + down_q4.nbytes // 2
         assert down_meta["weight_offset"] > gate_up_meta["weight_offset"]
+
+        weights_offset = read_package_weights_offset(package_path)
+        with open(package_path, "rb") as package:
+            package.seek(
+                weights_offset + down_meta["weight_offset"] + 88)
+            payload = package.read(down_q4.nbytes + down_scales.nbytes)
+        data_per_expert = down_q4.nbytes // 2
+        scales_per_expert = down_scales.nbytes // 2
+        expected = bytearray()
+        for expert in range(2):
+            expected += down_q4.tobytes()[
+                expert * data_per_expert:(expert + 1) * data_per_expert]
+            expected += down_scales.tobytes()[
+                expert * scales_per_expert:(expert + 1) * scales_per_expert]
+        assert payload == expected
 
     print("MoE expert storage metadata tests passed")
 

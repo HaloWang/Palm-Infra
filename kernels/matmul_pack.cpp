@@ -78,6 +78,60 @@ void maybe_pack_fp16_weight(Tensor& weight, const std::string& key,
     weight.is_interleaved = true;
 }
 
+void maybe_pack_exact_bf16_weight(Tensor& weight, const std::string& key,
+                                   const void* rowmajor_data,
+                                   PackedWeightMap& packed_weights) {
+#if HAS_NEON
+    if (weight.prec != Precision::FP32 ||
+        !g_matmul_config.use_interleave_pack ||
+        !is_2d_linear_weight(weight) || !rowmajor_data ||
+        weight.shape[0] < 8 || weight.shape[1] < 32) {
+        return;
+    }
+    const int N = static_cast<int>(weight.shape[0]);
+    const int K = static_cast<int>(weight.shape[1]);
+    const size_t source_elements = static_cast<size_t>(N) * K;
+    const auto* source = static_cast<const uint32_t*>(rowmajor_data);
+    for (size_t i = 0; i < source_elements; ++i) {
+        if ((source[i] & 0xffffu) != 0)
+            return;
+    }
+
+    const int padded_n = ((N + 7) / 8) * 8;
+    const size_t packed_elements = static_cast<size_t>(padded_n) * K;
+    if (packed_elements >
+        std::numeric_limits<size_t>::max() / sizeof(uint16_t)) {
+        return;
+    }
+    const std::string pack_key = key + "#fp32_bf16_interleaved";
+    auto it = packed_weights.find(pack_key);
+    if (it == packed_weights.end()) {
+        std::vector<uint8_t> buffer(packed_elements * sizeof(uint16_t));
+        auto* packed = reinterpret_cast<uint16_t*>(buffer.data());
+        for (int n_tile = 0; n_tile < padded_n; n_tile += 8) {
+            for (int k = 0; k < K; ++k) {
+                for (int lane = 0; lane < 8; ++lane) {
+                    const int n = n_tile + lane;
+                    packed[static_cast<size_t>(n_tile) * K +
+                           static_cast<size_t>(k) * 8 + lane] =
+                        n < N
+                            ? static_cast<uint16_t>(
+                                  source[static_cast<size_t>(n) * K + k] >> 16)
+                            : 0;
+                }
+            }
+        }
+        it = packed_weights.emplace(pack_key, std::move(buffer)).first;
+    }
+    weight.fp32_bf16_data = it->second.data();
+#else
+    (void)weight;
+    (void)key;
+    (void)rowmajor_data;
+    (void)packed_weights;
+#endif
+}
+
 void maybe_pack_int8_weight(Tensor& weight, const std::string& key,
                             const void* rowmajor_data,
                             PackedWeightMap& packed_weights) {
@@ -311,6 +365,8 @@ void prepare_matmul_weight(Tensor& weight, const std::string& key,
                            const void* weight_data,
                            PackedWeightMap& packed_weights, bool pack_fp16,
                            bool pack_fp8) {
+    maybe_pack_exact_bf16_weight(
+        weight, key, weight_data, packed_weights);
     if (pack_fp16)
         maybe_pack_fp16_weight(weight, key, weight_data, packed_weights);
     if (pack_fp8)

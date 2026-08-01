@@ -640,6 +640,12 @@ void LLMEngine::release_prefill_buffers() {
     invalidate_workspace_key(exec_ctx_prefill_);
 }
 
+bool LLMEngine::decode_uses_metal_expert_cache() const {
+    return cfg_.metal_ssd_full ||
+           (metal_backend_ &&
+            exec_ctx_decode_.moe_backend == metal_backend_.get());
+}
+
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
     mollm_trace::ScopedEvent trace_prefill("inference", "prefill");
     int n = (int)token_ids.size();
@@ -688,7 +694,7 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
                                       exec_ctx_prefill_.backend);
             invalidate_workspace_key(exec_ctx_prefill_);
         }
-        if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
+        if (decode_uses_metal_expert_cache() && moe_ssd_cache_ &&
             !moe_ssd_cache_->clear_resident()) {
             fprintf(stderr,
                     "Engine: warning: CPU expert cache was still busy after "
@@ -864,7 +870,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids) {
                                   exec_ctx_prefill_.backend);
         invalidate_workspace_key(exec_ctx_prefill_);
     }
-    if (cfg_.metal_ssd_full && moe_ssd_cache_ &&
+    if (decode_uses_metal_expert_cache() && moe_ssd_cache_ &&
         !moe_ssd_cache_->clear_resident()) {
         fprintf(stderr,
                 "Engine: warning: CPU expert cache was still busy after "

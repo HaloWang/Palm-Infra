@@ -71,7 +71,7 @@ offload](ssd-offload.md) for the cache sweep and I/O protocol.
 
 | Model | mollm pp/tg | llama.cpp pp/tg | Result |
 |---|---:|---:|---|
-| DeepSeek-V4-Flash (SSD offload) | **9.35** / **4.74** ‡ | 0 / 0 | llama.cpp OOM |
+| DeepSeek-V4-Flash (SSD offload) | **9.52** / **5.71** ‡ | 0 / 0 | llama.cpp OOM |
 
 ‡ Provisional single-process result using four CPU threads, `pp256 + tg64`,
 `warmup=3`, and a 16 GiB expert RAM cache. This is not yet the usual

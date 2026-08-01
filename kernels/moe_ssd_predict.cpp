@@ -89,7 +89,8 @@ bool schedule_moe_hash_cross_layer_prefetch(
     const MoeSsdTensorSource* next_gate_up,
     const MoeSsdTensorSource* next_down,
     int num_experts,
-    int top_k) {
+    int top_k,
+    bool demand_priority) {
     if (!next_gate_up || !next_down || !next_gate_up->cache ||
         next_gate_up->cache != next_down->cache ||
         token_ids.prec != Precision::INT32 || !token_ids.data ||
@@ -111,19 +112,21 @@ bool schedule_moe_hash_cross_layer_prefetch(
         return false;
     }
     const int32_t* table = token_to_experts.ptr<int32_t>();
+    std::vector<int> experts;
+    experts.reserve(static_cast<size_t>(top_k));
+    for (int rank = 0; rank < top_k; ++rank) {
+        const int expert =
+            table[static_cast<size_t>(token_id) * top_k + rank];
+        if (expert < 0 || expert >= num_experts)
+            return false;
+        experts.push_back(expert);
+    }
+    if (demand_priority)
+        return cache->request_many(next_gate_up, next_down, experts);
+
     return cache->submit_cross_layer_task(
-        [token_id, table, vocab_size, next_gate_up, next_down,
-         num_experts, top_k, cache] {
-            (void)vocab_size;
-            std::vector<int> experts;
-            experts.reserve(static_cast<size_t>(top_k));
-            for (int rank = 0; rank < top_k; ++rank) {
-                const int expert =
-                    table[static_cast<size_t>(token_id) * top_k + rank];
-                if (expert < 0 || expert >= num_experts)
-                    return;
-                experts.push_back(expert);
-            }
+        [experts = std::move(experts), next_gate_up, next_down,
+         top_k, cache] {
             mollm_trace::ScopedEvent trace_event(
                 "ssd.predict", "next_layer_hash_route",
                 "{\"layer\":" +

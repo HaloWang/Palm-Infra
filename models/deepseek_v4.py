@@ -59,11 +59,13 @@ def _add_layer_moe_weights(
         index,
         (f"layers.{layer}.ffn.experts.{expert}.{projection}.weight"
          for expert in range(experts)
-         for projection in ("w1", "w3")))
+         for projection in ("w1", "w3")),
+        interleave_expert_count=experts)
     streamed[down_ref] = aggregate_mxfp4_experts(
         index,
         (f"layers.{layer}.ffn.experts.{expert}.w2.weight"
-         for expert in range(experts)))
+         for expert in range(experts)),
+        interleave_expert_count=experts)
     streamed[shared_gate_ref] = dense_streamed_weight(
         index, f"layers.{layer}.ffn.shared_experts.w1.weight")
     streamed[shared_up_ref] = dense_streamed_weight(
@@ -459,7 +461,7 @@ def convert_full(
         "quantization": "native-fp8-mxfp4",
         "moe_expert_storage": {
             "version": 1,
-            "layout": "aggregate_rows_v1",
+            "layout": "expert_interleaved_v1",
             "num_experts": int(cfg["n_routed_experts"]),
             "layers": layers,
         },

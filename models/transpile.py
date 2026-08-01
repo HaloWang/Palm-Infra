@@ -1463,6 +1463,7 @@ class StreamedWeight:
     group_size: int = 0
     num_groups: int = 0
     flags: int = 0
+    expert_interleave_count: int = 0
 
     @property
     def data_size(self) -> int:
@@ -1477,19 +1478,28 @@ class StreamedWeight:
         return 88 + self.data_size + self.scales_size
 
     def header(self) -> dict:
+        interleaved = self.expert_interleave_count > 0
+        data_size = self.data_size + self.scales_size if interleaved else self.data_size
+        scales_size = 0 if interleaved else self.scales_size
+        flags = self.flags | ((1 << 4) if interleaved else 0)
         raw = _weight_header_bytes(
-            flags=self.flags, ndim=len(self.logical_shape),
+            flags=flags, ndim=len(self.logical_shape),
             precision=self.precision, shape=self.logical_shape,
-            data_size=self.data_size, scales_size=self.scales_size,
+            data_size=data_size, scales_size=scales_size,
             group_size=self.group_size, num_groups=self.num_groups)
         values = WEIGHT_HEADER_STRUCT.unpack(raw)
-        return {
+        result = {
             "flags": values[1], "ndim": values[2],
             "precision": values[3], "shape": list(values[4:8]),
             "data_offset": values[8], "data_size": values[9],
             "scales_offset": values[10], "scales_size": values[11],
             "group_size": values[12], "num_groups": values[13],
         }
+        if interleaved:
+            result["expert_interleave_count"] = self.expert_interleave_count
+            result["expert_raw_data_size"] = self.data_size
+            result["expert_raw_scales_size"] = self.scales_size
+        return result
 
     @staticmethod
     def _copy_ranges(output: BinaryIO,
@@ -1517,13 +1527,58 @@ class StreamedWeight:
                     f"{written} != {segment.written_size}")
 
     def write_to(self, output: BinaryIO):
+        header = self.header()
         output.write(_weight_header_bytes(
-            flags=self.flags, ndim=len(self.logical_shape),
+            flags=header["flags"], ndim=len(self.logical_shape),
             precision=self.precision, shape=self.logical_shape,
-            data_size=self.data_size, scales_size=self.scales_size,
+            data_size=header["data_size"], scales_size=header["scales_size"],
             group_size=self.group_size, num_groups=self.num_groups))
-        self._copy_ranges(output, self.data_ranges)
-        self._copy_ranges(output, self.scale_ranges)
+        if self.expert_interleave_count <= 0:
+            self._copy_ranges(output, self.data_ranges)
+            self._copy_ranges(output, self.scale_ranges)
+            return
+
+        count = self.expert_interleave_count
+        if self.data_size % count or self.scales_size % count:
+            raise ValueError("expert-interleaved weight is not expert-aligned")
+
+        def split_ranges(ranges: Sequence[WeightByteRange],
+                         bytes_per_expert: int):
+            groups = []
+            current = []
+            current_bytes = 0
+            for segment in ranges:
+                segment_offset = 0
+                remaining = segment.written_size
+                while remaining:
+                    take = min(remaining, bytes_per_expert - current_bytes)
+                    if take != segment.written_size:
+                        if (segment.transform is not None or
+                                segment.written_size != segment.size):
+                            raise ValueError(
+                                "transformed range crosses an expert boundary")
+                        piece = WeightByteRange(
+                            segment.path, segment.offset + segment_offset,
+                            take)
+                    else:
+                        piece = segment
+                    current.append(piece)
+                    current_bytes += take
+                    segment_offset += take
+                    remaining -= take
+                    if current_bytes == bytes_per_expert:
+                        groups.append(current)
+                        current = []
+                        current_bytes = 0
+            if current or len(groups) != count:
+                raise ValueError("expert ranges do not match expert count")
+            return groups
+
+        data_groups = split_ranges(self.data_ranges, self.data_size // count)
+        scale_groups = split_ranges(self.scale_ranges, self.scales_size // count)
+        for expert in range(count):
+            self._copy_ranges(output, data_groups[expert])
+            self._copy_ranges(output, scale_groups[expert])
 
 
 def _write_weight_file(path: str, data: np.ndarray,
@@ -1697,9 +1752,18 @@ def _augment_moe_expert_storage(meta: dict,
                     f"MoE expert metadata row mismatch for {ref}: "
                     f"shape[0]={header['shape'][0]} expected={expected_rows}"
                 )
-            if header["data_size"] % layer_num_experts != 0:
+            is_interleaved = bool(header["flags"] & (1 << 4))
+            raw_data_size = int(
+                header.get("expert_raw_data_size", header["data_size"]))
+            raw_scales_size = int(
+                header.get("expert_raw_scales_size", header["scales_size"]))
+            if is_interleaved and int(
+                    header.get("expert_interleave_count", 0)) != layer_num_experts:
+                raise ValueError(
+                    f"expert interleave count mismatch for {ref}")
+            if raw_data_size % layer_num_experts != 0:
                 raise ValueError(f"MoE expert data size is not expert-aligned: {ref}")
-            if header["scales_size"] and header["scales_size"] % layer_num_experts != 0:
+            if raw_scales_size and raw_scales_size % layer_num_experts != 0:
                 raise ValueError(f"MoE expert scale size is not expert-aligned: {ref}")
 
             groups_per_row = 0
@@ -1713,17 +1777,23 @@ def _augment_moe_expert_storage(meta: dict,
             spec["precision"] = header["precision"]
             spec["flags"] = header["flags"]
             spec["shape"] = header["shape"]
+            data_per_expert = raw_data_size // layer_num_experts
+            scales_per_expert = (
+                raw_scales_size // layer_num_experts
+                if raw_scales_size else 0)
             spec["data_offset"] = header["data_offset"]
-            spec["data_size"] = header["data_size"]
-            spec["scales_offset"] = header["scales_offset"]
-            spec["scales_size"] = header["scales_size"]
+            spec["data_size"] = raw_data_size
+            spec["scales_offset"] = (
+                header["data_offset"] + data_per_expert
+                if is_interleaved and scales_per_expert
+                else header["scales_offset"])
+            spec["scales_size"] = raw_scales_size
             spec["group_size"] = header["group_size"]
             spec["groups_per_row"] = groups_per_row
-            spec["expert_data_bytes"] = header["data_size"] // layer_num_experts
-            spec["expert_scales_bytes"] = (
-                header["scales_size"] // layer_num_experts
-                if header["scales_size"] else 0
-            )
+            spec["expert_data_bytes"] = data_per_expert
+            spec["expert_scales_bytes"] = scales_per_expert
+            if is_interleaved:
+                spec["expert_stride"] = data_per_expert + scales_per_expert
 
 
 def save_package(output_path: str,

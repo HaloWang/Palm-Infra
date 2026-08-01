@@ -1,6 +1,7 @@
 #include "graph/execute.h"
 #include "engine/backend.h"
 #include "kernels/bf16.h"
+#include "kernels/matmul.h"
 #include "kernels/moe.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
@@ -251,6 +252,7 @@ void execute_graph(ExecContext& ctx) {
         return;
     }
     ctx.backend->clear_dispatch_error();
+    matmul_reset_activation_cache();
     // Device-resident backends (Metal) keep intermediates in device buffers,
     // so borrowed-view detection can't rely on host-pointer equality; classify
     // views by op type instead, and skip the host owner-id assertions.
@@ -348,6 +350,40 @@ void execute_graph(ExecContext& ctx) {
             t.mem_type = MemoryType::NONE;
             t.owner_id = 0;
             t.storage_id = 0;
+        }
+    }
+
+    // The first hash-routed layer does not need an activation-based
+    // prediction: its exact expert set is known from the decode token before
+    // the graph starts. Queue it here; later hash layers are already covered
+    // by the ordinary one-layer-ahead scheduler, and eagerly queueing all of
+    // them would delay the layer-0 reads that are on the critical path.
+    if (ctx.moe_hash_cross_layer_prefetch) {
+        for (const GraphNode& moe : nodes) {
+            if (moe.op_type != OpType::MOE || moe.inputs.size() < 4)
+                continue;
+            const auto& moe_inputs = moe.inputs;
+            const int token_ids_input =
+                graph_params::get_i32(moe.params, 12, -1);
+            const int hash_table_input =
+                graph_params::get_i32(moe.params, 13, -1);
+            if (token_ids_input >= 0 && hash_table_input >= 0 &&
+                static_cast<size_t>(token_ids_input) < moe_inputs.size() &&
+                static_cast<size_t>(hash_table_input) < moe_inputs.size()) {
+                const Tensor& gate = tensors[moe_inputs[2]];
+                const Tensor& down = tensors[moe_inputs[3]];
+                schedule_moe_hash_cross_layer_prefetch(
+                    tensors[moe_inputs[token_ids_input]],
+                    tensors[moe_inputs[hash_table_input]],
+                    static_cast<const MoeSsdTensorSource*>(
+                        gate.moe_ssd_source),
+                    static_cast<const MoeSsdTensorSource*>(
+                        down.moe_ssd_source),
+                    graph_params::get_i32(moe.params, 1, 0),
+                    graph_params::get_i32(moe.params, 2, 0),
+                    true);
+                break;
+            }
         }
     }
 
@@ -587,8 +623,25 @@ void execute_graph(ExecContext& ctx) {
         // (matmul, attention, MoE, norm, ...) without recording allocator and
         // liveness bookkeeping as fake compute work.
         const uint64_t trace_start = mollm_trace::now_ns();
-        if (!inline_zero_copy_view)
-            ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+        if (!inline_zero_copy_view) {
+            bool delegated = false;
+            if (ctx.moe_backend && node.op_type == OpType::MOE &&
+                out.shape[1] == 1) {
+                bool success = false;
+                delegated = ctx.moe_backend->dispatch_host_moe(
+                    node, inputs, &out, ctx.thread_pool, success);
+                if (delegated && !success) {
+                    std::fprintf(
+                        stderr,
+                        "execute: routed-MoE accelerator failed at node %u\n",
+                        node.id);
+                    ctx.execution_failed = true;
+                    return;
+                }
+            }
+            if (!delegated)
+                ctx.backend->dispatch(node, inputs, &out, ctx.thread_pool);
+        }
         if (ctx.backend->dispatch_failed()) {
             std::fprintf(
                 stderr, "execute: backend rejected node %u (%s)\n",

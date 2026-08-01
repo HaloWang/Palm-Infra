@@ -129,9 +129,9 @@
   <rect x="700" y="988" width="17.4" height="13" rx="2" class="mollm"/><text x="725" y="999" class="value">16.53</text>
   <text x="700" y="1017" class="value">0 (OOM)</text>
   <text x="40" y="1055" class="label">DeepSeek-V4-Flash</text>
-  <rect x="200" y="1034" width="3.9" height="13" rx="2" class="mollm"/><text x="211" y="1045" class="value">9.35</text>
+  <rect x="200" y="1034" width="4.0" height="13" rx="2" class="mollm"/><text x="211" y="1045" class="value">9.52</text>
   <text x="200" y="1063" class="value">0 (OOM)</text>
-  <rect x="700" y="1034" width="5.0" height="13" rx="2" class="mollm"/><text x="713" y="1045" class="value">4.74</text>
+  <rect x="700" y="1034" width="6.0" height="13" rx="2" class="mollm"/><text x="713" y="1045" class="value">5.71</text>
   <text x="700" y="1063" class="value">0 (OOM)</text>
   <line x1="200" y1="1088" x2="620" y2="1088" class="axis"/>
   <text x="196" y="1106" class="tick">0</text><text x="292" y="1106" class="tick">250</text><text x="397" y="1106" class="tick">500</text><text x="502" y="1106" class="tick">750</text><text x="603" y="1106" class="tick">1000</text>

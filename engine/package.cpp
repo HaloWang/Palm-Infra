@@ -206,6 +206,13 @@ bool checked_multiply(uint64_t a, uint64_t b, uint64_t& result) {
     return true;
 }
 
+bool checked_add(uint64_t a, uint64_t b, uint64_t& result) {
+    if (b > std::numeric_limits<uint64_t>::max() - a)
+        return false;
+    result = a + b;
+    return true;
+}
+
 bool parse_package_header(const uint8_t* header, size_t file_size,
                           PackageHeaderInfo& out) {
     if (file_size < PACKAGE_HEADER_SIZE) {
@@ -447,26 +454,50 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                             item.value("scales_offset", uint64_t{0});
                         uint64_t scales_bytes =
                             item.value("expert_scales_bytes", uint64_t{0});
+                        uint64_t expert_stride =
+                            item.value("expert_stride", uint64_t{0});
                         uint64_t all_data = 0;
                         uint64_t all_scales = 0;
+                        uint64_t data_span = 0;
+                        uint64_t scales_span = 0;
+                        const uint64_t expert_tail =
+                            static_cast<uint64_t>(std::max(0, num_experts - 1));
+                        bool valid_spans = true;
+                        if (expert_stride != 0) {
+                            uint64_t stride_prefix = 0;
+                            valid_spans =
+                                checked_multiply(expert_stride, expert_tail,
+                                                 stride_prefix) &&
+                                checked_add(stride_prefix, data_bytes,
+                                            data_span);
+                            if (valid_spans && scales_bytes != 0) {
+                                valid_spans = checked_add(
+                                    stride_prefix, scales_bytes, scales_span);
+                            }
+                        } else {
+                            valid_spans =
+                                checked_multiply(
+                                    data_bytes,
+                                    static_cast<uint64_t>(num_experts),
+                                    all_data) &&
+                                checked_multiply(
+                                    scales_bytes,
+                                    static_cast<uint64_t>(num_experts),
+                                    all_scales);
+                            data_span = all_data;
+                            scales_span = all_scales;
+                        }
                         if (layer_index < 0 || num_experts <= 0 ||
                             spec.rows <= 0 || spec.cols <= 0 ||
                             static_cast<uint32_t>(spec.precision) >
                                 static_cast<uint32_t>(Precision::MXFP4) ||
-                            !checked_multiply(
-                                data_bytes,
-                                static_cast<uint64_t>(num_experts),
-                                all_data) ||
-                            !checked_multiply(
-                                scales_bytes,
-                                static_cast<uint64_t>(num_experts),
-                                all_scales) ||
+                            !valid_spans ||
                             weight_offset > ph.w_len ||
                             data_offset > ph.w_len - weight_offset ||
-                            all_data > ph.w_len - weight_offset - data_offset ||
+                            data_span > ph.w_len - weight_offset - data_offset ||
                             (scales_bytes &&
                              (scales_offset > ph.w_len - weight_offset ||
-                              all_scales >
+                              scales_span >
                                   ph.w_len - weight_offset - scales_offset))) {
                             fprintf(stderr,
                                     "Engine: MoE expert range out of package "
@@ -474,11 +505,24 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                     spec.weight_ref.c_str());
                             return false;
                         }
-                        mmap_weight_exclusion_ranges_.push_back(
-                            {weight_offset + data_offset, all_data});
-                        if (all_scales != 0) {
+                        if (expert_stride != 0) {
+                            const uint64_t begin = scales_bytes != 0
+                                ? std::min(data_offset, scales_offset)
+                                : data_offset;
+                            const uint64_t end = scales_bytes != 0
+                                ? std::max(data_offset + data_span,
+                                           scales_offset + scales_span)
+                                : data_offset + data_span;
                             mmap_weight_exclusion_ranges_.push_back(
-                                {weight_offset + scales_offset, all_scales});
+                                {weight_offset + begin, end - begin});
+                        } else {
+                            mmap_weight_exclusion_ranges_.push_back(
+                                {weight_offset + data_offset, all_data});
+                            if (all_scales != 0) {
+                                mmap_weight_exclusion_ranges_.push_back(
+                                    {weight_offset + scales_offset,
+                                     all_scales});
+                            }
                         }
                         spec.data_offset =
                             ph.w_off + weight_offset + data_offset;
@@ -498,6 +542,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                                 : 0;
                         spec.scales_bytes =
                             uses_embedded_scales ? 0 : scales_bytes;
+                        spec.expert_stride = expert_stride;
                         if (!cache->add_source(spec))
                             return false;
                         ++source_count;

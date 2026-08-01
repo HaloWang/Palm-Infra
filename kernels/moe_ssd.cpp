@@ -20,14 +20,19 @@
 namespace {
 
 bool component_range_fits(uint64_t offset, uint64_t bytes_per_expert,
-                          int num_experts, uint64_t file_size) {
+                          uint64_t expert_stride, int num_experts,
+                          uint64_t file_size) {
     if (bytes_per_expert == 0)
         return true;
     const uint64_t count = static_cast<uint64_t>(num_experts);
-    if (count > std::numeric_limits<uint64_t>::max() / bytes_per_expert)
+    const uint64_t stride = expert_stride != 0
+                                ? expert_stride : bytes_per_expert;
+    if (count == 0 || (count - 1) >
+                          std::numeric_limits<uint64_t>::max() / stride)
         return false;
-    const uint64_t total = count * bytes_per_expert;
-    return offset <= file_size && total <= file_size - offset;
+    const uint64_t last = (count - 1) * stride;
+    return offset <= file_size && last <= file_size - offset &&
+           bytes_per_expert <= file_size - offset - last;
 }
 
 bool source_bytes(const MoeSsdTensorSpec& spec, size_t& bytes) {
@@ -41,6 +46,24 @@ bool source_bytes(const MoeSsdTensorSpec& spec, size_t& bytes) {
         return false;
     bytes = data + scales;
     return true;
+}
+
+bool components_fit_expert_stride(const MoeSsdTensorSpec& spec) {
+    if (spec.expert_stride == 0)
+        return true;
+    if (spec.data_bytes > spec.expert_stride ||
+        spec.scales_bytes > spec.expert_stride)
+        return false;
+    if (spec.scales_bytes == 0)
+        return true;
+    if (spec.scales_offset >= spec.data_offset) {
+        const uint64_t relative = spec.scales_offset - spec.data_offset;
+        return relative >= spec.data_bytes &&
+               relative <= spec.expert_stride - spec.scales_bytes;
+    }
+    const uint64_t relative = spec.data_offset - spec.scales_offset;
+    return relative >= spec.scales_bytes &&
+           relative <= spec.expert_stride - spec.data_bytes;
 }
 
 bool expert_pair_bytes(const MoeSsdTensorSource* gate_up,
@@ -83,6 +106,7 @@ bool MoeSsdCache::clear_resident() {
     layer_resident_bytes_.clear();
     layer_route_widths_.clear();
     retained_experts_.clear();
+    retained_scores_.clear();
     pending_predictions_.clear();
     resident_bytes_ = 0;
     active_layer_ = -1;
@@ -168,6 +192,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         layer_resident_bytes_.clear();
         layer_route_widths_.clear();
         retained_experts_.clear();
+        retained_scores_.clear();
         pending_predictions_.clear();
         layer_stats_.clear();
         last_evicted_epoch_.clear();
@@ -192,11 +217,13 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
         return false;
     }
     size_t bytes = 0;
-    if (!source_bytes(spec, bytes) ||
+    if (!source_bytes(spec, bytes) || !components_fit_expert_stride(spec) ||
         !component_range_fits(spec.data_offset, spec.data_bytes,
-                              spec.num_experts, file_size_) ||
+                              spec.expert_stride, spec.num_experts,
+                              file_size_) ||
         !component_range_fits(spec.scales_offset, spec.scales_bytes,
-                              spec.num_experts, file_size_)) {
+                              spec.expert_stride, spec.num_experts,
+                              file_size_)) {
         std::fprintf(stderr,
                      "MoE SSD: expert storage range is invalid for %s\n",
                      spec.weight_ref.c_str());
@@ -603,7 +630,8 @@ bool MoeSsdCache::global_victim_before_locked(const Entry* candidate,
 bool MoeSsdCache::retain_for_next_forward(
     const MoeSsdTensorSource* gate_up,
     const MoeSsdTensorSource* down,
-    const std::vector<int>& experts) {
+    const std::vector<int>& experts,
+    bool keep_cross_token) {
     if (!gate_up || !down || !valid_pair(gate_up, down, 0))
         return false;
     std::lock_guard<std::mutex> lock(mutex_);
@@ -618,19 +646,77 @@ bool MoeSsdCache::retain_for_next_forward(
     const size_t retain_limit =
         std::max<size_t>(1, layer_share / layout->second.pair_bytes);
     std::vector<int>& retained = retained_experts_[layer];
-    retained.clear();
-    retained.reserve(std::min(retain_limit, experts.size()));
+    std::vector<float>& scores = retained_scores_[layer];
+    scores.resize(static_cast<size_t>(gate_up->spec.num_experts), 0.0f);
+    constexpr float kFrequencyDecay = 0.96875f;
+    for (float& score : scores)
+        score *= kFrequencyDecay;
+    for (int expert : experts) {
+        if (expert >= 0 && expert < gate_up->spec.num_experts)
+            scores[static_cast<size_t>(expert)] += 1.0f;
+    }
+
+    // An exactly known next route can be loaded on demand before this layer
+    // starts, so keeping its high-entropy previous route would only turn the
+    // shared pool into a hard per-layer reservation.
+    if (!keep_cross_token) {
+        retained.clear();
+        const auto entries = layer_entries_.find(layer);
+        if (entries != layer_entries_.end()) {
+            for (Entry* entry : entries->second)
+                entry->retained = false;
+        }
+        return true;
+    }
+
+    std::vector<int> next;
+    next.reserve(retain_limit);
+    // Never let historical frequency displace an expert needed by the
+    // current route.
     for (int expert : experts) {
         if (expert < 0 || expert >= gate_up->spec.num_experts ||
-            std::find(retained.begin(), retained.end(), expert) !=
-                retained.end()) {
+            std::find(next.begin(), next.end(), expert) != next.end()) {
             continue;
         }
-        retained.push_back(expert);
-        if (retained.size() == retain_limit)
+        next.push_back(expert);
+        if (next.size() == retain_limit)
             break;
     }
+
+    struct Candidate {
+        int expert = -1;
+        float score = 0.0f;
+        uint64_t used_at = 0;
+    };
+    std::vector<Candidate> candidates;
     const auto entries = layer_entries_.find(layer);
+    if (entries != layer_entries_.end()) {
+        candidates.reserve(entries->second.size());
+        for (const Entry* entry : entries->second) {
+            if (entry->gate_up != gate_up || entry->down != down ||
+                std::find(next.begin(), next.end(), entry->expert) !=
+                    next.end()) {
+                continue;
+            }
+            candidates.push_back({
+                entry->expert,
+                scores[static_cast<size_t>(entry->expert)],
+                entry->used_at,
+            });
+        }
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Candidate& lhs, const Candidate& rhs) {
+                  if (lhs.score != rhs.score)
+                      return lhs.score > rhs.score;
+                  return lhs.used_at > rhs.used_at;
+              });
+    for (const Candidate& candidate : candidates) {
+        if (next.size() == retain_limit)
+            break;
+        next.push_back(candidate.expert);
+    }
+    retained = std::move(next);
     if (entries != layer_entries_.end()) {
         for (Entry* entry : entries->second) {
             entry->retained =
@@ -701,6 +787,7 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
     };
     std::vector<MissingExpert> missing_experts;
     std::vector<Entry*> queued_entries;
+    bool promoted_reads = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!speculative) active_layer_ = gate_up->spec.layer;
@@ -740,6 +827,7 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                     ++layer_counters.prediction_attempts;
                     if (matched) ++layer_counters.prediction_matches;
                 }
+
                 pending_predictions_.erase(prediction);
             }
         }
@@ -748,6 +836,7 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
             layer_stats_[gate_up->spec.layer].prefetch_selected += count;
         missing_experts.reserve(count);
         queued_entries.reserve(count);
+        std::vector<Entry*> demanded_loading_entries;
 
         // Protect every resident member of this route before reserving any
         // misses. Reserving while walking the route can otherwise evict a
@@ -772,10 +861,37 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
                     entry->prediction_epoch = forward_epoch_;
                     entry->prediction_confidence =
                         std::max(entry->prediction_confidence, prediction_confidence);
+                } else if (entry->is_loading()) {
+                    demanded_loading_entries.push_back(entry);
                 }
                 continue;
             }
             missing_experts.push_back({expert, prediction_confidence});
+        }
+        if (!speculative && !demanded_loading_entries.empty()) {
+            // A correct prediction may still have component jobs waiting in
+            // the advisory queue. Once the real router asks for that entry,
+            // promote those jobs ahead of unrelated demand misses; otherwise
+            // a prediction hit can paradoxically complete after a cold miss.
+            auto job = low_priority_io_jobs_.begin();
+            while (job != low_priority_io_jobs_.end()) {
+                const bool demanded = std::any_of(
+                    job->entries.begin(), job->entries.end(),
+                    [&](const Entry* entry) {
+                        return std::find(
+                                   demanded_loading_entries.begin(),
+                                   demanded_loading_entries.end(), entry) !=
+                               demanded_loading_entries.end();
+                    });
+                if (!demanded) {
+                    ++job;
+                    continue;
+                }
+                job->speculative = false;
+                io_jobs_.push_back(std::move(*job));
+                job = low_priority_io_jobs_.erase(job);
+                promoted_reads = true;
+            }
         }
         if (!speculative) {
             layer_route_widths_[gate_up->spec.layer] =
@@ -801,14 +917,32 @@ bool MoeSsdCache::request_many_impl(const MoeSsdTensorSource* gate_up,
         }
         enqueue_entry_reads_locked(queued_entries, speculative);
     }
-    if (!queued_entries.empty()) io_cv_.notify_all();
+    if (!queued_entries.empty() || promoted_reads) io_cv_.notify_all();
     if (trace_start != 0) {
+        std::string trace_args =
+            "{\"layer\":" + std::to_string(gate_up->spec.layer) +
+            ",\"requested\":" + std::to_string(experts.size()) +
+            ",\"queued\":" + std::to_string(queued_entries.size()) +
+            ",\"promoted\":" + (promoted_reads ? "true" : "false") +
+            ",\"experts\":[";
+        for (size_t i = 0; i < experts.size(); ++i) {
+            if (i != 0) trace_args += ',';
+            trace_args += std::to_string(experts[i]);
+        }
+        trace_args += ']';
+        if (speculative) {
+            trace_args += ",\"confidence\":[";
+            for (size_t i = 0; i < confidence.size(); ++i) {
+                if (i != 0) trace_args += ',';
+                trace_args += std::to_string(confidence[i]);
+            }
+            trace_args += ']';
+        }
+        trace_args += '}';
         mollm_trace::record_duration(
             speculative ? "ssd.predict" : "ssd",
             speculative ? "prefetch_many" : "request_many", trace_start, mollm_trace::now_ns(),
-            "{\"layer\":" + std::to_string(gate_up->spec.layer) +
-            ",\"requested\":" + std::to_string(experts.size()) +
-            ",\"queued\":" + std::to_string(queued_entries.size()) + "}");
+            trace_args);
     }
     return true;
 }
@@ -817,7 +951,7 @@ size_t MoeSsdCache::recommended_prefetch_count(size_t predicted_count) const {
     if (predicted_count == 0) return 0;
     std::lock_guard<std::mutex> lock(mutex_);
     constexpr uint64_t kMinimumSamples = 128;
-    constexpr double kMinimumHitRate = 0.60;
+    constexpr double kMinimumHitRate = 0.80;
     const size_t minimum = std::max<size_t>(1, predicted_count / 2);
     size_t count = predicted_count;
     while (count > minimum) {
@@ -995,8 +1129,10 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
     } else {
         ++hits_;
     }
-    gate_up_out = make_tensor(*gate_up, entry->gate_up_data.data(), entry->gate_up_scales.data());
-    down_out = make_tensor(*down, entry->down_data.data(), entry->down_scales.data());
+    gate_up_out = make_tensor(
+        *gate_up, entry->gate_up_data.data(), entry->gate_up_scales.data());
+    down_out = make_tensor(
+        *down, entry->down_data.data(), entry->down_scales.data());
     LayerCounters& layer_counters = layer_stats_[gate_up->spec.layer];
     ++layer_counters.demand_acquires;
     if (fresh_miss) ++layer_counters.demand_misses;

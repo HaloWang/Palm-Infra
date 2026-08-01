@@ -8,11 +8,50 @@
 #include <cstddef>
 #include <cstdio>
 #include <cstring>
-#include <memory>
 #include <string>
 #include <utility>
+#include <vector>
 
+#include <sys/uio.h>
 #include <unistd.h>
+#if defined(__APPLE__)
+#include <pthread/qos.h>
+#endif
+
+namespace {
+
+bool preadv_exact(int fd, uint64_t offset, std::vector<iovec> vectors) {
+    size_t index = 0;
+    while (index < vectors.size()) {
+        const ssize_t bytes = preadv(
+            fd, vectors.data() + static_cast<ptrdiff_t>(index),
+            static_cast<int>(vectors.size() - index),
+            static_cast<off_t>(offset));
+        if (bytes < 0 && errno == EINTR)
+            continue;
+        if (bytes <= 0) {
+            std::fprintf(stderr,
+                         "MoE SSD: preadv failed at offset %llu: %s\n",
+                         static_cast<unsigned long long>(offset),
+                         bytes == 0 ? "unexpected EOF" : std::strerror(errno));
+            return false;
+        }
+        offset += static_cast<uint64_t>(bytes);
+        size_t consumed = static_cast<size_t>(bytes);
+        while (index < vectors.size() && consumed >= vectors[index].iov_len) {
+            consumed -= vectors[index].iov_len;
+            ++index;
+        }
+        if (index < vectors.size() && consumed != 0) {
+            vectors[index].iov_base =
+                static_cast<uint8_t*>(vectors[index].iov_base) + consumed;
+            vectors[index].iov_len -= consumed;
+        }
+    }
+    return true;
+}
+
+}  // namespace
 
 bool MoeSsdCache::read_exact(uint64_t offset, void* dst, size_t bytes) const {
     uint8_t* out = static_cast<uint8_t*>(dst);
@@ -48,16 +87,15 @@ MoeSsdCache::ByteBuffer& MoeSsdCache::component_buffer(Entry& entry, uint8_t com
 }
 
 uint64_t MoeSsdCache::component_offset(const Entry& entry, uint8_t component) {
-    const uint64_t expert = static_cast<uint64_t>(entry.expert);
     switch (component) {
     case 0:
-        return entry.gate_up->spec.data_offset + expert * entry.gate_up->spec.data_bytes;
+        return entry.gate_up->spec.data_file_offset(entry.expert);
     case 1:
-        return entry.gate_up->spec.scales_offset + expert * entry.gate_up->spec.scales_bytes;
+        return entry.gate_up->spec.scales_file_offset(entry.expert);
     case 2:
-        return entry.down->spec.data_offset + expert * entry.down->spec.data_bytes;
+        return entry.down->spec.data_file_offset(entry.expert);
     default:
-        return entry.down->spec.scales_offset + expert * entry.down->spec.scales_bytes;
+        return entry.down->spec.scales_file_offset(entry.expert);
     }
 }
 
@@ -65,50 +103,40 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
                                               bool low_priority) {
     if (entries.empty()) return;
     std::vector<Entry*> sorted = entries;
-    std::sort(sorted.begin(), sorted.end(),
-              [](const Entry* a, const Entry* b) { return a->expert < b->expert; });
+    // Exact route computation consumes experts in id order. Speculative
+    // entries arrive in router-confidence order instead; preserve that order
+    // so the most likely next-layer experts finish first.
+    if (!low_priority) {
+        std::sort(sorted.begin(), sorted.end(),
+                  [](const Entry* a, const Entry* b) {
+                      return a->expert < b->expert;
+                  });
+    }
 
-    // Four independent file regions make up one expert pair. Keep enough
-    // component jobs in flight to fill the I/O workers, but queue only a
-    // small expert batch at a time so the first pairs become ready while the
-    // main thread is already computing them. A single all-expert batch made
-    // every pair wait behind the final down/scales reads and lost that overlap.
-    const size_t batch_entries = std::max<size_t>(1, (size_t)io_workers_count_ / 4);
-    for (size_t batch_begin = 0; batch_begin < sorted.size(); batch_begin += batch_entries) {
-        const size_t batch_end = std::min(sorted.size(), batch_begin + batch_entries);
-        // Group only truly adjacent expert ids. Their slices are contiguous in
-        // the package, so one larger pread can feed every entry in the run.
-        for (uint8_t component = 0; component < 4; component++) {
-            size_t begin = batch_begin;
-            while (begin < batch_end) {
-                if (component_buffer(*sorted[begin], component).empty()) {
-                    ++begin;
-                    continue;
-                }
-                size_t end = begin + 1;
-                while (end < batch_end &&
-                       !component_buffer(*sorted[end], component).empty() &&
-                       sorted[end]->expert == sorted[end - 1]->expert + 1) {
-                    ++end;
-                }
+    // Fill a small expert window completely before moving to the next one.
+    // This makes the first routed pairs consumable while later reads continue
+    // instead of maximizing the number of half-loaded entries.
+    constexpr size_t kWindow = 1;
+    for (size_t begin = 0; begin < sorted.size(); begin += kWindow) {
+        const size_t end = std::min(sorted.size(), begin + kWindow);
+        for (uint8_t component = 0; component < 4; ++component) {
+            for (size_t index = begin; index < end; ++index) {
+                Entry* entry = sorted[index];
                 IoJob job;
                 job.component = component;
                 job.trace_id = next_trace_id_++;
                 job.speculative = low_priority;
-                job.entries.assign(sorted.begin() + static_cast<ptrdiff_t>(begin),
-                                   sorted.begin() + static_cast<ptrdiff_t>(end));
-                for (Entry* entry : job.entries) ++entry->pending_reads;
+                job.entries.push_back(entry);
+                ++entry->pending_reads;
                 if (mollm_trace::enabled()) {
-                    const Entry& first = *job.entries.front();
                     mollm_trace::record_flow(
                         "ssd.io", "queued_read", mollm_trace::now_ns(), job.trace_id, true,
-                        "{\"layer\":" + std::to_string(first.gate_up->spec.layer) +
-                        ",\"first_expert\":" + std::to_string(first.expert) +
-                        ",\"experts\":" + std::to_string(job.entries.size()) + "}");
+                        "{\"layer\":" + std::to_string(entry->gate_up->spec.layer) +
+                        ",\"first_expert\":" + std::to_string(entry->expert) +
+                        ",\"experts\":1}");
                 }
                 if (low_priority) low_priority_io_jobs_.push_back(std::move(job));
                 else io_jobs_.push_back(std::move(job));
-                begin = end;
             }
         }
     }
@@ -125,6 +153,38 @@ bool MoeSsdCache::read_job(const IoJob& job) {
                          std::strerror(errno));
         }
     };
+    if (job.component == 4 || job.component == 5) {
+        Entry& entry = *job.entries.front();
+        auto read_tensor = [&](uint8_t data_component,
+                               uint8_t scales_component) {
+            ByteBuffer& data = component_buffer(entry, data_component);
+            ByteBuffer& scales = component_buffer(entry, scales_component);
+            const uint64_t data_offset =
+                component_offset(entry, data_component);
+            const uint64_t scales_offset =
+                component_offset(entry, scales_component);
+            if (scales.empty() || scales_offset != data_offset + data.size()) {
+                if (!data.empty() &&
+                    !read_exact(data_offset, data.data(), data.size()))
+                    return false;
+                if (!scales.empty() &&
+                    !read_exact(scales_offset, scales.data(), scales.size()))
+                    return false;
+            } else {
+                std::vector<iovec> vectors = {
+                    {data.data(), data.size()},
+                    {scales.data(), scales.size()},
+                };
+                if (!preadv_exact(fd_, data_offset, std::move(vectors)))
+                    return false;
+            }
+            lock_buffer(data);
+            lock_buffer(scales);
+            return true;
+        };
+        return job.component == 4 ? read_tensor(0, 1)
+                                  : read_tensor(2, 3);
+    }
     const size_t bytes_per_entry = component_buffer(*job.entries.front(), job.component).size();
     if (bytes_per_entry == 0) return true;
     const uint64_t offset = component_offset(*job.entries.front(), job.component);
@@ -135,18 +195,30 @@ bool MoeSsdCache::read_job(const IoJob& job) {
         return true;
     }
 
-    const size_t merged_bytes = bytes_per_entry * job.entries.size();
-    std::unique_ptr<uint8_t[]> merged(new uint8_t[merged_bytes]);
-    if (!read_exact(offset, merged.get(), merged_bytes)) return false;
-    for (size_t i = 0; i < job.entries.size(); i++) {
-        ByteBuffer& dst = component_buffer(*job.entries[i], job.component);
-        std::memcpy(dst.data(), merged.get() + i * bytes_per_entry, bytes_per_entry);
-        lock_buffer(dst);
+    // These entries are adjacent in the package. Scatter one contiguous file
+    // read directly into their final cache buffers instead of allocating a
+    // temporary merged buffer and copying several megabytes a second time.
+    std::vector<iovec> vectors;
+    vectors.reserve(job.entries.size());
+    for (Entry* entry : job.entries) {
+        ByteBuffer& dst = component_buffer(*entry, job.component);
+        if (dst.size() != bytes_per_entry) return false;
+        vectors.push_back({dst.data(), dst.size()});
     }
+    if (!preadv_exact(fd_, offset, std::move(vectors)))
+        return false;
+    for (Entry* entry : job.entries)
+        lock_buffer(component_buffer(*entry, job.component));
     return true;
 }
 
 void MoeSsdCache::io_worker_main(int worker_index) {
+#if defined(__APPLE__)
+    // These threads unblock the foreground decode path. Explicitly keep them
+    // out of the utility/background QoS classes when the compute pool is
+    // continuously busy on heterogeneous Apple Silicon cores.
+    pthread_set_qos_class_self_np(QOS_CLASS_USER_INITIATED, 0);
+#endif
     if (mollm_trace::enabled()) {
         const std::string name = "ssd-io-" + std::to_string(worker_index);
         mollm_trace::set_thread_name(name.c_str());
@@ -156,7 +228,8 @@ void MoeSsdCache::io_worker_main(int worker_index) {
         {
             std::unique_lock<std::mutex> lock(mutex_);
             io_cv_.wait(lock, [&] {
-                return stop_io_ || !io_jobs_.empty() || !low_priority_io_jobs_.empty();
+                return stop_io_ || !io_jobs_.empty() ||
+                       !low_priority_io_jobs_.empty();
             });
             if (stop_io_ && io_jobs_.empty() && low_priority_io_jobs_.empty()) return;
             if (!io_jobs_.empty()) {
@@ -170,7 +243,9 @@ void MoeSsdCache::io_worker_main(int worker_index) {
         std::string trace_args;
         if (mollm_trace::enabled() && !job.entries.empty()) {
             const Entry& first = *job.entries.front();
-            const char* component = job.component == 0 ? "gate_data"
+            const char* component = job.component == 4 ? "gate_tensor"
+                                  : job.component == 5 ? "down_tensor"
+                                  : job.component == 0 ? "gate_data"
                                   : job.component == 1 ? "gate_scales"
                                   : job.component == 2 ? "down_data" : "down_scales";
             trace_args = "{\"layer\":" + std::to_string(first.gate_up->spec.layer) +

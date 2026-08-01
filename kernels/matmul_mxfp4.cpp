@@ -269,7 +269,6 @@ inline int32_t mxfp4_q8_dot32(const uint8_t* packed,
 #endif
     return vaddvq_s32(dot);
 }
-
 #endif
 
 #if HAS_NEON && defined(__aarch64__)
@@ -361,10 +360,50 @@ inline void mxfp4_q8_dot32_dual_pair(
         0, 1, 2, 3, 4, 6, 8, 12,
         0, -1, -2, -3, -4, -6, -8, -12,
     };
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    const uint8x16_t bytes0 = vld1q_u8(packed0);
+    const uint8x16_t bytes1 = vld1q_u8(packed1);
+    const int8x16_t weight_even0 = vqtbl1q_s8(
+        coefficient_table,
+        vandq_u8(bytes0, vdupq_n_u8(0x0f)));
+    const int8x16_t weight_even1 = vqtbl1q_s8(
+        coefficient_table,
+        vandq_u8(bytes1, vdupq_n_u8(0x0f)));
+    const int8x16_t weight_odd0 = vqtbl1q_s8(
+        coefficient_table, vshrq_n_u8(bytes0, 4));
+    const int8x16_t weight_odd1 = vqtbl1q_s8(
+        coefficient_table, vshrq_n_u8(bytes1, 4));
+    int32x4_t dots = vdupq_n_s32(0);
+    dots = vmmlaq_s32(
+        dots,
+        vcombine_s8(vld1_s8(q_even), vld1_s8(residual_even)),
+        vcombine_s8(vget_low_s8(weight_even0),
+                    vget_low_s8(weight_even1)));
+    dots = vmmlaq_s32(
+        dots,
+        vcombine_s8(vld1_s8(q_even + 8),
+                    vld1_s8(residual_even + 8)),
+        vcombine_s8(vget_high_s8(weight_even0),
+                    vget_high_s8(weight_even1)));
+    dots = vmmlaq_s32(
+        dots,
+        vcombine_s8(vld1_s8(q_odd), vld1_s8(residual_odd)),
+        vcombine_s8(vget_low_s8(weight_odd0),
+                    vget_low_s8(weight_odd1)));
+    dots = vmmlaq_s32(
+        dots,
+        vcombine_s8(vld1_s8(q_odd + 8),
+                    vld1_s8(residual_odd + 8)),
+        vcombine_s8(vget_high_s8(weight_odd0),
+                    vget_high_s8(weight_odd1)));
+    primary0 = vgetq_lane_s32(dots, 0);
+    primary1 = vgetq_lane_s32(dots, 1);
+    residual0 = vgetq_lane_s32(dots, 2);
+    residual1 = vgetq_lane_s32(dots, 3);
+    return;
+#endif
     const int8x16_t activation_even = vld1q_s8(q_even);
     const int8x16_t activation_odd = vld1q_s8(q_odd);
-    const int8x16_t correction_even = vld1q_s8(residual_even);
-    const int8x16_t correction_odd = vld1q_s8(residual_odd);
     auto dot = [&](const uint8_t* packed,
                    int32x4_t& primary_dot,
                    int32x4_t& residual_dot) {
@@ -379,9 +418,9 @@ inline void mxfp4_q8_dot32_dual_pair(
         primary_dot = vdotq_s32(
             primary_dot, weight_odd, activation_odd);
         residual_dot = vdotq_s32(
-            vdupq_n_s32(0), weight_even, correction_even);
+            vdupq_n_s32(0), weight_even, vld1q_s8(residual_even));
         residual_dot = vdotq_s32(
-            residual_dot, weight_odd, correction_odd);
+            residual_dot, weight_odd, vld1q_s8(residual_odd));
     };
     int32x4_t primary_dot0;
     int32x4_t residual_dot0;
@@ -402,6 +441,83 @@ inline void mxfp4_q8_dot32_dual_pair(
     residual0 = vgetq_lane_s32(residual_sums, 0);
     residual1 = vgetq_lane_s32(residual_sums, 1);
 }
+
+inline void mxfp4_q8_dot32_dual_four(
+    const uint8_t* packed0, const uint8_t* packed1,
+    const uint8_t* packed2, const uint8_t* packed3,
+    const int8_t* q_even, const int8_t* q_odd,
+    const int8_t* residual_even, const int8_t* residual_odd,
+    int32x4_t& primary, int32x4_t& residual) {
+#if defined(__ARM_FEATURE_MATMUL_INT8)
+    int32_t primary0;
+    int32_t primary1;
+    int32_t primary2;
+    int32_t primary3;
+    int32_t residual0;
+    int32_t residual1;
+    int32_t residual2;
+    int32_t residual3;
+    mxfp4_q8_dot32_dual_pair(
+        packed0, packed1, q_even, q_odd,
+        residual_even, residual_odd,
+        primary0, residual0, primary1, residual1);
+    mxfp4_q8_dot32_dual_pair(
+        packed2, packed3, q_even, q_odd,
+        residual_even, residual_odd,
+        primary2, residual2, primary3, residual3);
+    primary = {primary0, primary1, primary2, primary3};
+    residual = {residual0, residual1, residual2, residual3};
+    return;
+#endif
+    const int8x16_t coefficient_table = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    const int8x16_t activation_even = vld1q_s8(q_even);
+    const int8x16_t activation_odd = vld1q_s8(q_odd);
+    auto dot = [&](const uint8_t* packed,
+                   int32x4_t& primary_dot,
+                   int32x4_t& residual_dot) {
+        const uint8x16_t bytes = vld1q_u8(packed);
+        const int8x16_t weight_even = vqtbl1q_s8(
+            coefficient_table,
+            vandq_u8(bytes, vdupq_n_u8(0x0f)));
+        const int8x16_t weight_odd = vqtbl1q_s8(
+            coefficient_table, vshrq_n_u8(bytes, 4));
+        primary_dot = vdotq_s32(
+            vdupq_n_s32(0), weight_even, activation_even);
+        primary_dot = vdotq_s32(
+            primary_dot, weight_odd, activation_odd);
+        residual_dot = vdotq_s32(
+            vdupq_n_s32(0), weight_even, vld1q_s8(residual_even));
+        residual_dot = vdotq_s32(
+            residual_dot, weight_odd, vld1q_s8(residual_odd));
+    };
+    int32x4_t primary_dot0;
+    int32x4_t residual_dot0;
+    int32x4_t primary_dot1;
+    int32x4_t residual_dot1;
+    int32x4_t primary_dot2;
+    int32x4_t residual_dot2;
+    int32x4_t primary_dot3;
+    int32x4_t residual_dot3;
+    dot(packed0, primary_dot0, residual_dot0);
+    dot(packed1, primary_dot1, residual_dot1);
+    dot(packed2, primary_dot2, residual_dot2);
+    dot(packed3, primary_dot3, residual_dot3);
+    auto reduce_pairs = [](int32x4_t first, int32x4_t second) {
+        const int32x4_t pairs = vpaddq_s32(first, second);
+        const int32x4_t sums = vpaddq_s32(pairs, pairs);
+        return vget_low_s32(sums);
+    };
+    primary = vcombine_s32(
+        reduce_pairs(primary_dot0, primary_dot1),
+        reduce_pairs(primary_dot2, primary_dot3));
+    residual = vcombine_s32(
+        reduce_pairs(residual_dot0, residual_dot1),
+        reduce_pairs(residual_dot2, residual_dot3));
+}
+
 #endif
 
 void matmul_fp8_gemv_range(
@@ -457,6 +573,51 @@ void matmul_mxfp4_q8_gemv_range(
     const int bytes_per_row = K / 2;
     int n = n_begin;
 #if HAS_NEON && defined(__aarch64__)
+    for (; n + 3 < n_end; n += 4) {
+        const uint8_t* w_row0 =
+            weights + static_cast<size_t>(n) * bytes_per_row;
+        const uint8_t* w_row1 = w_row0 + bytes_per_row;
+        const uint8_t* w_row2 = w_row1 + bytes_per_row;
+        const uint8_t* w_row3 = w_row2 + bytes_per_row;
+        const uint8_t* s_row0 =
+            scales + static_cast<size_t>(n) * groups;
+        const uint8_t* s_row1 = s_row0 + groups;
+        const uint8_t* s_row2 = s_row1 + groups;
+        const uint8_t* s_row3 = s_row2 + groups;
+        float32x4_t sums = vdupq_n_f32(0.0f);
+        for (int group = 0; group < groups; ++group) {
+            const size_t packed_offset =
+                static_cast<size_t>(group) * 16;
+            int32x4_t primary_dot;
+            int32x4_t residual_dot;
+            mxfp4_q8_dot32_dual_four(
+                w_row0 + packed_offset, w_row1 + packed_offset,
+                w_row2 + packed_offset, w_row3 + packed_offset,
+                q_even + packed_offset, q_odd + packed_offset,
+                residual_even + packed_offset,
+                residual_odd + packed_offset,
+                primary_dot, residual_dot);
+            const uint32x4_t scale_codes = {
+                s_row0[group], s_row1[group],
+                s_row2[group], s_row3[group],
+            };
+            uint32x4_t scale_bits = vshlq_n_u32(scale_codes, 23);
+            scale_bits = vbslq_u32(
+                vceqq_u32(scale_codes, vdupq_n_u32(0)),
+                vdupq_n_u32(uint32_t{1} << 22), scale_bits);
+            scale_bits = vbslq_u32(
+                vceqq_u32(scale_codes, vdupq_n_u32(0xff)),
+                vdupq_n_u32(0x7fc00000u), scale_bits);
+            const float32x4_t weight_scales =
+                vreinterpretq_f32_u32(scale_bits);
+            const float32x4_t combined = vmlaq_n_f32(
+                vmulq_n_f32(vcvtq_f32_s32(primary_dot), a_scales[group]),
+                vcvtq_f32_s32(residual_dot), residual_scales[group]);
+            sums = vfmaq_f32(
+                sums, combined, vmulq_n_f32(weight_scales, 0.5f));
+        }
+        vst1q_f32(output + n, sums);
+    }
     for (; n + 1 < n_end; n += 2) {
         const uint8_t* w_row0 =
             weights + static_cast<size_t>(n) * bytes_per_row;
@@ -865,8 +1026,17 @@ uint8_t encode_fp8_e4m3fn(float value) {
     uint32_t bits = 0;
     std::memcpy(&bits, &magnitude, sizeof(bits));
     int exponent = static_cast<int>((bits >> 23) & 0xff) - 127;
-    int significand = static_cast<int>(
-        std::nearbyint(std::ldexp(magnitude, 3 - exponent)));
+    // Round the FP32 significand from 23 to 3 fraction bits directly. This is
+    // exactly round-to-nearest-even, but avoids ldexp + nearbyint for every
+    // activation element entering an FP8/MXFP4 matmul.
+    const uint32_t mantissa = bits & 0x7fffffu;
+    int significand = 8 + static_cast<int>(mantissa >> 20);
+    const uint32_t remainder = mantissa & 0xfffffu;
+    constexpr uint32_t halfway = 0x80000u;
+    if (remainder > halfway ||
+        (remainder == halfway && (significand & 1) != 0)) {
+        ++significand;
+    }
     if (significand == 16) {
         ++exponent;
         significand = 8;
@@ -1066,11 +1236,12 @@ bool kernel_matmul_mxfp4_gemv_batch(
         kMxBlock, K / kMxBlock, false, false,
         thread_pool->num_threads());
     BatchScratch* batch_data = &scratch;
-    const int threads = thread_pool->num_threads();
-    const int chunk = balanced_parallel_grain(N, threads, 64, 2);
-    thread_pool->parallel_for(
-        0, N, chunk, [&](int, int begin, int end) {
-            for (size_t i = 0; i < batch; ++i) {
+    thread_pool->parallel_for_2d(
+        static_cast<int>(batch), 1, N, 64,
+        [&](int, int batch_begin, int batch_end,
+            int begin, int end) {
+            for (int index = batch_begin; index < batch_end; ++index) {
+                const size_t i = static_cast<size_t>(index);
                 const Mxfp4ActivationScratch& activation =
                     batch_data->activations[
                         batch_data->input_indices[i]];
@@ -1217,11 +1388,11 @@ void matmul_dispatch_mxfp4(const Tensor& A, const Tensor& B, Tensor& C,
                 C.ptr<float>(), N, K, begin, end);
         };
         if (thread_pool && threads > 1 && N > 64) {
-            const int chunk =
-                balanced_parallel_grain(N, threads, 64, 2);
-            thread_pool->parallel_for(
-                0, N, chunk,
-                [&](int, int begin, int end) { run(begin, end); });
+            thread_pool->parallel_for_2d(
+                1, 1, N, 64,
+                [&](int, int, int, int begin, int end) {
+                    run(begin, end);
+                });
         } else {
             run(0, N);
         }

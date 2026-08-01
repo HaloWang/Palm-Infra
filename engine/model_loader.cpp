@@ -235,6 +235,28 @@ size_t LLMEngine::lock_dense_package_weights() {
         mollm::detail::normalize_byte_ranges(
             mmap_weight_exclusion_ranges_, len);
 
+#if defined(MADV_DONTNEED)
+    // Expert aggregates and dense weights with complete CPU sidecars are no
+    // longer read through this mapping. Graph loading touched the latter to
+    // build their packed representation, so proactively release those clean
+    // file pages before locking the real dense working set and expert cache.
+    for (const auto& range : expert_ranges) {
+        if (range.begin >= range.end)
+            continue;
+        const uintptr_t raw_begin =
+            reinterpret_cast<uintptr_t>(base) + range.begin;
+        const uintptr_t raw_end =
+            reinterpret_cast<uintptr_t>(base) + range.end;
+        const uintptr_t aligned_begin =
+            raw_begin / page_size * page_size;
+        const uintptr_t aligned_end =
+            (raw_end + page_size - 1) / page_size * page_size;
+        madvise(
+            reinterpret_cast<void*>(aligned_begin),
+            aligned_end - aligned_begin, MADV_DONTNEED);
+    }
+#endif
+
     auto lock_range = [&](uint64_t begin, uint64_t end) -> bool {
         if (begin >= end)
             return true;
@@ -373,6 +395,10 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.compute_strides();
             t.data = data;
             t.rowmajor_data = data;
+            t.device_data = nullptr;
+            t.device_offset = 0;
+            t.scales_device_data = nullptr;
+            t.scales_device_offset = 0;
             t.mem_type = MemoryType::EXTERNAL;
             t.is_interleaved = false;
             t.is_q4_repacked = false;
@@ -380,6 +406,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             t.is_q4_g128_packed = false;
             t.q8_repack_data = nullptr;
             t.fp8_bf16_fp16_data = nullptr;
+            t.fp32_bf16_data = nullptr;
             t.q4_repack_data = nullptr;
             t.q4_g32_data = nullptr;
             t.q4_g128_data = nullptr;
@@ -389,7 +416,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             // load-time repacking rewrites t.data to an out-of-region buffer).
             // Packed INT4 weights need a second pass after quant metadata is set
             // (see finalize_metal_weight) to decode the packed block layout.
-            if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
+            if (metal_backend_ && exec_ctx.backend == metal_backend_.get() &&
+                t.prec != Precision::INT4 &&
+                t.prec != Precision::INT8)
                 as_metal(metal_backend_)->wrap_weight(t);
 #endif
         };
@@ -400,6 +429,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         // remain in their native BG32/BG128 package layout.
         auto finalize_metal_weight = [&]() {
             if (metal_backend_ && exec_ctx.backend == metal_backend_.get()) {
+                if (t.prec == Precision::INT8)
+                    as_metal(metal_backend_)->wrap_weight(t);
                 bool is_aggregate_expert =
                     wref.find("_experts_") != std::string::npos;
                 as_metal(metal_backend_)
@@ -457,12 +488,73 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 }
                 void* data = const_cast<uint8_t*>(
                     blob + weight_header.data_offset);
+                const void* scales = weight_header.scales_size
+                    ? blob + weight_header.scales_offset : nullptr;
+                if ((weight_header.flags &
+                     MappedFile::FLAG_EXPERT_INTERLEAVED) != 0) {
+                    const auto experts_it =
+                        package_metadata_.find("num_experts");
+                    const int experts = experts_it != package_metadata_.end()
+                        ? std::atoi(experts_it->second.c_str()) : 0;
+                    const uint64_t rows = weight_header.shape[0];
+                    const uint64_t cols = weight_header.shape[1];
+                    if (weight_header.precision !=
+                            static_cast<uint32_t>(Precision::MXFP4) ||
+                        experts <= 0 || rows % experts != 0 ||
+                        cols % 32 != 0 ||
+                        rows > std::numeric_limits<uint64_t>::max() / cols) {
+                        fprintf(stderr,
+                                "Engine: unsupported expert-interleaved "
+                                "weight %s\n", wref.c_str());
+                        return false;
+                    }
+                    const uint64_t elements = rows * cols;
+                    const uint64_t data_bytes = elements / 2;
+                    const uint64_t scale_bytes = elements / 32;
+                    if (data_bytes > SIZE_MAX || scale_bytes > SIZE_MAX ||
+                        data_bytes + scale_bytes != weight_header.data_size) {
+                        fprintf(stderr,
+                                "Engine: invalid expert-interleaved payload "
+                                "for %s\n", wref.c_str());
+                        return false;
+                    }
+                    auto [storage_it, inserted] = packed_weights_.try_emplace(
+                        wref + "#expert_native");
+                    std::vector<uint8_t>& storage = storage_it->second;
+                    if (inserted || storage.empty()) {
+                        storage.resize(static_cast<size_t>(
+                            data_bytes + scale_bytes));
+                        const size_t expert_data =
+                            static_cast<size_t>(data_bytes / experts);
+                        const size_t expert_scales =
+                            static_cast<size_t>(scale_bytes / experts);
+                        const size_t expert_stride =
+                            expert_data + expert_scales;
+                        const uint8_t* source =
+                            blob + weight_header.data_offset;
+                        uint8_t* data_out = storage.data();
+                        uint8_t* scales_out =
+                            storage.data() + data_bytes;
+                        for (int expert = 0; expert < experts; ++expert) {
+                            std::memcpy(
+                                data_out + expert * expert_data,
+                                source + expert * expert_stride,
+                                expert_data);
+                            std::memcpy(
+                                scales_out + expert * expert_scales,
+                                source + expert * expert_stride + expert_data,
+                                expert_scales);
+                        }
+                    }
+                    data = storage.data();
+                    scales = storage.data() + data_bytes;
+                    weight_header.flags &=
+                        ~MappedFile::FLAG_EXPERT_INTERLEAVED;
+                    weight_header.data_size = data_bytes;
+                    weight_header.scales_size = scale_bytes;
+                }
                 setup_weight(
                     data, static_cast<Precision>(weight_header.precision));
-                const void* scales =
-                    weight_header.scales_size
-                        ? blob + weight_header.scales_offset
-                        : nullptr;
                 if (!mollm::detail::configure_weight_metadata(
                         t, weight_header, scales, wref.c_str())) {
                     return false;
@@ -472,12 +564,22 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     wref.find("embed_tokens") != std::string::npos ||
                     wref.find("vision_pos_embed.weights") !=
                         std::string::npos;
-                prepare_matmul_weight(
-                    t, wref, data, packed_weights_, !lookup_table,
-                    native_fp8_weight_nodes.count(node.id) == 0);
-                if (native_fp8_weight_nodes.count(node.id) != 0)
-                    prepare_fp8_bf16_fp16_weight(
-                        t, wref, data, packed_weights_);
+                const bool metal_only_weight =
+                    metal_backend_ &&
+                    exec_ctx.backend == metal_backend_.get();
+                // Resident Metal consumes package-native FP16/W8 bytes (and
+                // builds its own W4 device layout). CPU q8-dot/interleaved
+                // sidecars duplicate nearly the entire model and are never
+                // read on this path. Hybrid SSD decode still loads its CPU
+                // graph separately and prepares the required sidecars there.
+                if (!metal_only_weight) {
+                    prepare_matmul_weight(
+                        t, wref, data, packed_weights_, !lookup_table,
+                        native_fp8_weight_nodes.count(node.id) == 0);
+                    if (native_fp8_weight_nodes.count(node.id) != 0)
+                        prepare_fp8_bf16_fp16_weight(
+                            t, wref, data, packed_weights_);
+                }
                 // Once a CPU sidecar owns every value needed by the selected
                 // FP8 kernel, the original package pages are no longer used at
                 // inference time. Exclude the whole weight blob (header, data,
@@ -487,6 +589,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                 const bool complete_cpu_sidecar =
                     (t.prec == Precision::FP8_E4M3 &&
                      (t.q8_repack_data || t.fp8_bf16_fp16_data)) ||
+                    (t.prec == Precision::FP32 && t.fp32_bf16_data) ||
                     (t.prec == Precision::FP16 && t.is_interleaved &&
                      t.data != data);
                 if (complete_cpu_sidecar) {
@@ -531,12 +634,16 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             node.params.str[0].find("embed_tokens") != std::string::npos ||
             node.params.str[0].find("vision_pos_embed.weights") !=
                 std::string::npos;
-        prepare_matmul_weight(
-            t, wpath, t.data, packed_weights_, !lookup_table,
-            native_fp8_weight_nodes.count(node.id) == 0);
-        if (native_fp8_weight_nodes.count(node.id) != 0)
-            prepare_fp8_bf16_fp16_weight(
-                t, wpath, t.data, packed_weights_);
+        const bool metal_only_weight =
+            metal_backend_ && exec_ctx.backend == metal_backend_.get();
+        if (!metal_only_weight) {
+            prepare_matmul_weight(
+                t, wpath, t.data, packed_weights_, !lookup_table,
+                native_fp8_weight_nodes.count(node.id) == 0);
+            if (native_fp8_weight_nodes.count(node.id) != 0)
+                prepare_fp8_bf16_fp16_weight(
+                    t, wpath, t.data, packed_weights_);
+        }
         finalize_metal_weight();
     }
 
@@ -822,6 +929,9 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
+    exec_ctx_prefill_.moe_backend = nullptr;
+    exec_ctx_decode_.moe_backend = nullptr;
+    exec_ctx_vision_.moe_backend = nullptr;
     metal_backend_.reset();
     if (cfg_.device == Device::METAL) {
 #ifdef MOLLM_METAL
@@ -906,9 +1016,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
             return false;
         }
 
-        // DeepSeek-V4 currently has CPU-only FP8/MXFP4, hyper-connection and
-        // sparse-attention kernels. Running this graph through Metal would
-        // silently dispatch unsupported operators and corrupt the result.
+        // DeepSeek-V4 hyper-connection and sparse-attention operators remain
+        // CPU kernels. With SSD offload, however, decode can delegate only the
+        // routed MXFP4 experts to Metal while keeping host intermediates and
+        // the shared expert on CPU.
         if (cfg_.device == Device::METAL) {
             if (cfg_.metal_ssd_full) {
                 fprintf(stderr,
@@ -916,14 +1027,16 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                         "--metal-ssd-full\n");
                 return false;
             }
-            fprintf(stderr,
-                    "Engine: DeepSeek-V4 currently uses the CPU backend; "
-                    "ignoring --device metal\n");
-            metal_backend_.reset();
-            cfg_.device = Device::CPU;
             exec_ctx_prefill_.backend = &cpu_backend_;
             exec_ctx_decode_.backend = &cpu_backend_;
             exec_ctx_vision_.backend = &cpu_backend_;
+            if (cfg_.moe_ssd_cache_bytes == 0) {
+                fprintf(stderr,
+                        "Engine: DeepSeek-V4 currently uses the CPU backend; "
+                        "ignoring --device metal without SSD offload\n");
+                metal_backend_.reset();
+                cfg_.device = Device::CPU;
+            }
         }
     }
 
@@ -933,7 +1046,10 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     if (metal_backend_ && package_weights_base_ && package_weights_size_) {
         if (moe_ssd_cache_) {
             as_metal(metal_backend_)->enable_weight_copy_mode();
-            if (cfg_.metal_ssd_full) {
+            const bool dsv4_hybrid =
+                architecture == "deepseek-v4" &&
+                cfg_.device == Device::METAL;
+            if (cfg_.metal_ssd_full || dsv4_hybrid) {
                 if (!as_metal(metal_backend_)
                          ->configure_moe_ssd_io(
                              cfg_.package_path, cfg_.moe_ssd_cache_bytes,
@@ -941,9 +1057,22 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                              cfg_.moe_ssd_cross_layer_prefetch)) {
                     return false;
                 }
-                fprintf(stderr,
-                        "Engine: full-Metal SSD decode enabled; experts load "
-                        "directly into Shared Metal buffers\n");
+                if (dsv4_hybrid) {
+                    exec_ctx_decode_.moe_backend = metal_backend_.get();
+                    // The Metal cache owns routed-expert demand traffic on
+                    // this path. CPU cross-layer prediction would populate a
+                    // second cache with the same tensors and contend for both
+                    // SSD bandwidth and UMA pages without serving compute.
+                    exec_ctx_decode_.moe_cross_layer_prefetch = false;
+                    exec_ctx_decode_.moe_hash_cross_layer_prefetch = false;
+                    fprintf(stderr,
+                            "Engine: DeepSeek-V4 hybrid SSD decode enabled; "
+                            "routed MXFP4 experts use Metal I/O and GPU compute\n");
+                } else {
+                    fprintf(stderr,
+                            "Engine: full-Metal SSD decode enabled; experts "
+                            "load directly into Shared Metal buffers\n");
+                }
             } else {
                 fprintf(stderr,
                         "Engine: Metal/SSD hybrid adaptively selects CPU/Metal "

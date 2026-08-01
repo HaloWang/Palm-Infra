@@ -266,7 +266,8 @@ def integer_streamed_weight(index: SafeTensorIndex,
 
 
 def aggregate_mxfp4_experts(index: SafeTensorIndex,
-                            names: Iterable[str]) -> StreamedWeight:
+                            names: Iterable[str], *,
+                            interleave_expert_count: int = 0) -> StreamedWeight:
     """Concatenate per-expert MXFP4 matrices in expert-major row order."""
     tensors = [index.tensor(name) for name in names]
     if not tensors:
@@ -296,4 +297,5 @@ def aggregate_mxfp4_experts(index: SafeTensorIndex,
         scale_ranges=[scale.source for scale in scales],
         group_size=32,
         num_groups=sum(scale.nbytes for scale in scales),
+        expert_interleave_count=interleave_expert_count,
     )

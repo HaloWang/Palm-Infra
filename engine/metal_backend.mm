@@ -17,12 +17,14 @@
 #include <cassert>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <map>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <unistd.h>
 
 #ifndef MOLLM_METALLIB_PATH
 #define MOLLM_METALLIB_PATH ""
@@ -54,7 +56,14 @@ struct MetalBackend::Impl {
     // pipeline cache by kernel function name
     std::unordered_map<std::string, id<MTLComputePipelineState>> pipelines;
 
-    // one MTLBuffer wrapping the whole package weight region (zero-copy mmap)
+    struct WeightRegion {
+        id<MTLBuffer> buffer = nil;
+        char* base = nullptr;
+        size_t size = 0;
+    };
+    // Zero-copy views over the package mmap. Most packages need one region;
+    // very large packages are split at the device's single-buffer limit.
+    std::vector<WeightRegion> weight_regions;
     id<MTLBuffer>            weight_buffer = nil;
     void*                    weight_base   = nullptr;
     size_t                   weight_size   = 0;
@@ -122,6 +131,7 @@ struct MetalBackend::Impl {
         int topk_group = 1;
         bool norm_topk = true;
         float routed_scale = 1.0f;
+        const Tensor* token_to_experts = nullptr;
     };
     std::unordered_map<int, SsdMoeLayerInfo> ssd_moe_layers;
 
@@ -167,6 +177,21 @@ struct MetalBackend::Impl {
 
     bool ok = false;
 
+    const WeightRegion* find_weight_region(const void* ptr, size_t bytes,
+                                           size_t& offset) const {
+        if (!ptr) return nullptr;
+        const char* p = static_cast<const char*>(ptr);
+        for (const auto& region : weight_regions) {
+            if (p < region.base) continue;
+            const size_t relative = static_cast<size_t>(p - region.base);
+            if (relative <= region.size && bytes <= region.size - relative) {
+                offset = relative;
+                return &region;
+            }
+        }
+        return nullptr;
+    }
+
     static uint64_t ssd_key(int layer, int expert) {
         return (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
                static_cast<uint32_t>(expert);
@@ -178,16 +203,34 @@ struct MetalBackend::Impl {
                              std::vector<SsdExpertView>& views,
                              bool speculative = false) {
         views.clear();
-        if (!ssd_io_queue || !ssd_file ||
-            gate.layer != down.layer ||
-            gate.precision != Precision::INT4 ||
-            down.precision != Precision::INT4 ||
-            (gate.flags & MappedFile::FLAG_INT4_BG128) == 0 ||
-            (down.flags & MappedFile::FLAG_INT4_BG128) == 0)
+        const bool bg128 =
+            gate.precision == Precision::INT4 &&
+            down.precision == Precision::INT4 &&
+            (gate.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
+            (down.flags & MappedFile::FLAG_INT4_BG128) != 0;
+        const bool mxfp4 =
+            gate.precision == Precision::MXFP4 &&
+            down.precision == Precision::MXFP4 &&
+            gate.group_size == 32 && down.group_size == 32;
+        if (!ssd_io_queue || !ssd_file || gate.layer != down.layer ||
+            (!bg128 && !mxfp4))
             return false;
 
+        const uint64_t gate_tensor_bytes =
+            gate.data_bytes + gate.scales_bytes;
+        const uint64_t down_tensor_bytes =
+            down.data_bytes + down.scales_bytes;
+        if ((gate.scales_bytes != 0 &&
+             gate.scales_file_offset(0) !=
+                 gate.data_file_offset(0) + gate.data_bytes) ||
+            (down.scales_bytes != 0 &&
+             down.scales_file_offset(0) !=
+                 down.data_file_offset(0) + down.data_bytes)) {
+            return false;
+        }
+
         const size_t pair_bytes =
-            static_cast<size_t>(gate.data_bytes + down.data_bytes);
+            static_cast<size_t>(gate_tensor_bytes + down_tensor_bytes);
         if (pair_bytes == 0 || pair_bytes > ssd_capacity_bytes)
             return false;
         if (!speculative)
@@ -309,7 +352,8 @@ struct MetalBackend::Impl {
                 entry.down_ready_event = down_ready_event;
                 entry.gate_up_offset = entry.slot * ssd_slot_bytes;
                 entry.down_offset =
-                    entry.gate_up_offset + static_cast<size_t>(gate.data_bytes);
+                    entry.gate_up_offset +
+                    static_cast<size_t>(gate_tensor_bytes);
                 entry.bytes = pair_bytes;
                 entry.used_at = ++ssd_clock;
                 entry.gate_ready_value = load_ready_value;
@@ -323,11 +367,9 @@ struct MetalBackend::Impl {
                 [gate_io
                     loadBuffer:entry.gate_up
                          offset:entry.gate_up_offset
-                           size:gate.data_bytes
+                           size:gate_tensor_bytes
                    sourceHandle:ssd_file
-             sourceHandleOffset:gate.data_offset +
-                                static_cast<uint64_t>(expert) *
-                                    gate.data_bytes];
+             sourceHandleOffset:gate.data_file_offset(expert)];
             }
             for (int expert : missing) {
                 const auto& entry =
@@ -335,11 +377,9 @@ struct MetalBackend::Impl {
                 [down_io
                     loadBuffer:entry.down
                          offset:entry.down_offset
-                           size:down.data_bytes
+                           size:down_tensor_bytes
                    sourceHandle:ssd_file
-             sourceHandleOffset:down.data_offset +
-                                static_cast<uint64_t>(expert) *
-                                    down.data_bytes];
+             sourceHandleOffset:down.data_file_offset(expert)];
             }
             const uint64_t gate_start = mollm_trace::now_ns();
             const uint64_t down_start = gate_start;
@@ -348,9 +388,9 @@ struct MetalBackend::Impl {
             const int layer = gate.layer;
             const size_t expert_count = missing.size();
             const size_t gate_bytes =
-                static_cast<size_t>(gate.data_bytes) * expert_count;
+                static_cast<size_t>(gate_tensor_bytes) * expert_count;
             const size_t down_bytes =
-                static_cast<size_t>(down.data_bytes) * expert_count;
+                static_cast<size_t>(down_tensor_bytes) * expert_count;
             [gate_io
                 addCompletedHandler:^(id<MTLIOCommandBuffer> completed) {
                 if (gate_start != 0) {
@@ -871,6 +911,11 @@ id<MTLBuffer> buf_of(const Tensor* t) {
     return (__bridge id<MTLBuffer>)t->device_data;
 }
 
+id<MTLBuffer> scales_buf_of(const Tensor* t) {
+    if (!t || !t->scales_device_data) return nil;
+    return (__bridge id<MTLBuffer>)t->scales_device_data;
+}
+
 // element size in bytes for a precision, for offset math.
 size_t esize(Precision p) {
     switch (p) {
@@ -1017,6 +1062,7 @@ MetalBackend::~MetalBackend() {
         impl_->decoded_q4_weights.clear();
         impl_->weight_copies.clear();
         impl_->persistent.clear();
+        impl_->weight_regions.clear();
         impl_->weight_buffer = nil;
         impl_->pool.reset();
     }
@@ -1082,14 +1128,13 @@ void MetalBackend::lm_head_gemv_impl(
             w.activation=activation;
             w.group_size=(int)weight.group_size;
             w.groups_per_row=(int)weight.groups_per_row;
-            const size_t scales_boff =
-                (char*)weight.scales - (char*)impl_->weight_base;
+            const size_t scales_boff = weight.scales_device_offset;
             constexpr int NR0=2;
             const int NSG =
                 std::min(gemv_nsg_cap(), (K+127)/128);
             ps=impl_->pipeline("gemv_w8_f32a_i8b_f32c");
             [enc setComputePipelineState:ps];
-            [enc setBuffer:impl_->weight_buffer
+            [enc setBuffer:scales_buf_of(&weight)
                    offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
             const NSUInteger tgcount =
@@ -1175,19 +1220,43 @@ bool MetalBackend::has_tensor_path() const {
 bool MetalBackend::register_weight_region(void* base, size_t size) {
     if (!impl_->ok || !base || size == 0) return false;
     @autoreleasepool {
-        id<MTLBuffer> b = [impl_->device newBufferWithBytesNoCopy:base
-                                                           length:size
-                                                          options:MTLResourceStorageModeShared
-                                                      deallocator:nil];
-        if (!b) {
-            fprintf(stderr, "MetalBackend: newBufferWithBytesNoCopy(%zu) failed "
-                            "(maxBufferLength=%llu)\n",
-                    size, (unsigned long long)impl_->device.maxBufferLength);
-            return false;
+        impl_->weight_regions.clear();
+        const size_t page_size = static_cast<size_t>(getpagesize());
+        const size_t max_buffer =
+            static_cast<size_t>(impl_->device.maxBufferLength);
+        const size_t chunk_limit = (max_buffer / page_size) * page_size;
+        if (chunk_limit == 0) return false;
+        size_t offset = 0;
+        while (offset < size) {
+            const size_t length = std::min(chunk_limit, size - offset);
+            char* chunk_base = static_cast<char*>(base) + offset;
+            id<MTLBuffer> buffer =
+                [impl_->device newBufferWithBytesNoCopy:chunk_base
+                                                  length:length
+                                                 options:MTLResourceStorageModeShared
+                                             deallocator:nil];
+            if (!buffer) {
+                fprintf(stderr,
+                        "MetalBackend: newBufferWithBytesNoCopy(%zu) failed "
+                        "at package offset %zu (maxBufferLength=%llu)\n",
+                        length, offset,
+                        (unsigned long long)impl_->device.maxBufferLength);
+                impl_->weight_regions.clear();
+                impl_->weight_buffer = nil;
+                return false;
+            }
+            impl_->weight_regions.push_back({buffer, chunk_base, length});
+            offset += length;
         }
-        impl_->weight_buffer = b;
+        impl_->weight_buffer = impl_->weight_regions.front().buffer;
         impl_->weight_base = base;
         impl_->weight_size = size;
+        if (impl_->weight_regions.size() > 1) {
+            fprintf(stderr,
+                    "MetalBackend: split %.1f MB weight region across %zu "
+                    "zero-copy buffers\n",
+                    size / 1e6, impl_->weight_regions.size());
+        }
     }
     return true;
 }
@@ -1256,7 +1325,7 @@ bool MetalBackend::configure_moe_ssd_io(const std::string& package_path,
 
 void MetalBackend::wrap_weight(Tensor& t) {
     if (!t.data) return;
-    if (!impl_->weight_buffer) {
+    if (impl_->weight_regions.empty()) {
         if (!impl_->copy_weights) return;
         // INT4 g128 is decoded after quant metadata is configured. INT8 needs
         // its scale storage co-located and is not yet supported by the hybrid
@@ -1283,16 +1352,61 @@ void MetalBackend::wrap_weight(Tensor& t) {
         }
         return;
     }
-    char* base = (char*)impl_->weight_base;
-    char* ptr  = (char*)t.data;
-    if (ptr < base || ptr >= base + impl_->weight_size) {
-        // Weight lies outside the registered region — allocate a copy instead.
-        alloc_persistent(t, t.nbytes());
-        std::memcpy(t.data, ptr, t.nbytes());
+    size_t storage_bytes = t.nbytes();
+    if (t.prec == Precision::INT4 &&
+        ((t.is_q4_g128_packed && t.q4_g128_data) ||
+         (t.is_q4_g32_packed && t.q4_g32_data))) {
+        int last = 3;
+        while (last > 1 && t.shape[last] == 1) --last;
+        int64_t rows = 1;
+        for (int d = 0; d < last; ++d) rows *= t.shape[d];
+        const size_t block_bytes = t.is_q4_g128_packed
+            ? sizeof(Q4B8G128Block)
+            : sizeof(Q4B8G32Block);
+        storage_bytes =
+            static_cast<size_t>((rows + 7) / 8) *
+            static_cast<size_t>(t.groups_per_row) * block_bytes;
+    }
+    size_t offset = 0;
+    void* ptr = t.data;
+    const auto* region =
+        impl_->find_weight_region(ptr, storage_bytes, offset);
+    if (!region) {
+        // A tensor straddling a package-region boundary is rare; copy just
+        // that tensor rather than forcing the whole package into one buffer.
+        alloc_persistent(t, storage_bytes);
+        std::memcpy(t.data, ptr, storage_bytes);
+        if (t.prec == Precision::INT8) wrap_weight_int8(t);
         return;
     }
-    t.device_data = (__bridge void*)impl_->weight_buffer;
-    t.device_offset = (size_t)(ptr - base);
+    t.device_data = (__bridge void*)region->buffer;
+    t.device_offset = offset;
+    if (t.prec == Precision::INT8) wrap_weight_int8(t);
+}
+
+void MetalBackend::wrap_weight_int8(Tensor& t) {
+    if (t.prec != Precision::INT8 || !t.scales || t.num_groups == 0)
+        return;
+    const size_t scale_bytes =
+        static_cast<size_t>(t.num_groups) * sizeof(float);
+    size_t offset = 0;
+    const auto* region =
+        impl_->find_weight_region(t.scales, scale_bytes, offset);
+    if (region) {
+        t.scales_device_data = (__bridge void*)region->buffer;
+        t.scales_device_offset = offset;
+        return;
+    }
+    @autoreleasepool {
+        id<MTLBuffer> buffer =
+            [impl_->device newBufferWithLength:scale_bytes
+                                       options:MTLResourceStorageModeShared];
+        if (!buffer) return;
+        std::memcpy([buffer contents], t.scales, scale_bytes);
+        impl_->persistent.push_back(buffer);
+        t.scales_device_data = (__bridge void*)buffer;
+        t.scales_device_offset = 0;
+    }
 }
 
 void MetalBackend::wrap_weight_int4(Tensor& t, bool keep_native_experts) {
@@ -1761,7 +1875,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
             w.group_size = (int)B.group_size;
             w.groups_per_row = (int)B.groups_per_row;
-            size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+            size_t scales_boff = B.scales_device_offset;
             const int NR0 = 2;
             const int NSG =
                 std::min(gemv_nsg_cap(), (p.K + 127) / 128);
@@ -1771,7 +1885,7 @@ void MetalBackend::dispatch(const GraphNode& node,
             [enc setBuffer:buf_of(&A) offset:0 atIndex:0];
             [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
             [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
-            [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:4];
+            [enc setBuffer:scales_buf_of(&B) offset:scales_boff atIndex:4];
             [enc setBytes:&w length:sizeof(w) atIndex:3];
             [enc setThreadgroupMemoryLength:
                 (NSUInteger)(NR0 * 32 * sizeof(float)) atIndex:0];
@@ -1894,7 +2008,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     w.c_row_stride = p.c_row_stride;
                     w.activation = p.activation;
                     w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
-                    size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+                    size_t scales_boff = B.scales_device_offset;
                     id<MTLComputePipelineState> ps = impl_->pipeline("gemm_w8a8_i8a_i8b_f32c");
                     [enc setComputePipelineState:ps];
                     [enc setBuffer:a_i8 offset:0 atIndex:0];
@@ -1902,7 +2016,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
                     [enc setBytes:&w length:sizeof(w) atIndex:3];
                     [enc setBuffer:sa offset:0 atIndex:4];
-                    [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:5];
+                    [enc setBuffer:scales_buf_of(&B) offset:scales_boff atIndex:5];
                     // NRB=64 (M) x NRA=64 (N) tile / threadgroup, 128 threads;
                     // int32 accumulators staged in 64*64*4 = 16KB threadgroup.
                     [enc setThreadgroupMemoryLength:64*64*sizeof(int32_t) atIndex:0];
@@ -1922,7 +2036,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 w.act_n_begin = p.act_n_begin; w.act_n_len = p.act_n_len;
                 w.group_size = (int)B.group_size;
                 w.groups_per_row = (int)B.groups_per_row;
-                size_t scales_boff = (char*)B.scales - (char*)impl_->weight_base;
+                size_t scales_boff = B.scales_device_offset;
                 id<MTLBuffer> ah = cast_activation_to_f16();
                 w.a_row_stride = p.K;
                 // M64 improves occupancy for the smaller projection shapes.
@@ -1937,7 +2051,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                 [enc setBuffer:ah offset:0 atIndex:0];
                 [enc setBuffer:buf_of(&B) offset:B.device_offset atIndex:1];
                 [enc setBuffer:buf_of(&C) offset:0 atIndex:2];
-                [enc setBuffer:impl_->weight_buffer offset:scales_boff atIndex:4];
+                [enc setBuffer:scales_buf_of(&B) offset:scales_boff atIndex:4];
                 [enc setBytes:&w length:sizeof(w) atIndex:3];
                 [enc setThreadgroupMemoryLength:64*32*sizeof(uint16_t) atIndex:0];
                 const NSUInteger m_tile = use_m128 ? 128 : 64;
@@ -3374,14 +3488,22 @@ void MetalBackend::dispatch(const GraphNode& node,
             router_score_func == 0 ||
             (router_score_func == 1 && router_bias);
         const int moe_seq = (int)inputs[0]->shape[1];
-        const bool resident_w4_prefill =
+        const bool resident_w8 =
+            !ssd_gate && !ssd_down && !has_shared &&
+            inputs[2]->prec == Precision::INT8 &&
+            inputs[3]->prec == Precision::INT8 &&
+            inputs[2]->scales_device_data &&
+            inputs[3]->scales_device_data;
+        const bool resident_quant_prefill =
             moe_seq > 1 && !ssd_w4 && !has_shared;
-        bool gpu_w4 = impl_->has_tensor && supported_router &&
-            inputs[1]->prec == Precision::FP16 && inputs[2]->prec == Precision::INT4 &&
-            inputs[3]->prec == Precision::INT4 && top_k <= 16 && n_group <= 16 &&
-            (moe_seq == 1 || resident_w4_prefill) &&
+        const bool gpu_quant_moe = impl_->has_tensor && supported_router &&
+            inputs[1]->prec == Precision::FP16 &&
+            ((inputs[2]->prec == Precision::INT4 &&
+              inputs[3]->prec == Precision::INT4) || resident_w8) &&
+            top_k <= 16 && n_group <= 16 &&
+            (moe_seq == 1 || resident_quant_prefill) &&
             (ssd_w4 || !has_shared);
-        if (gpu_w4) {
+        if (gpu_quant_moe) {
             const Tensor& x = *inputs[0]; const Tensor& router = *inputs[1];
             const Tensor& gu = *inputs[2]; const Tensor& down = *inputs[3];
             const Tensor* bias = router_bias;
@@ -3461,6 +3583,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             mp.hidden_row_stride=estride(x,1);mp.output_row_stride=estride(*output,1);
             mp.gu_groups_per_row=(int)gu.groups_per_row;
             mp.down_groups_per_row=(int)down.groups_per_row;
+            mp.gu_group_size=(int)gu.group_size;
+            mp.down_group_size=(int)down.group_size;
             size_t gu_rows=(size_t)num_experts*2*intermediate;
             size_t down_rows=(size_t)num_experts*hidden_size;
             auto native_bg128 = [](const Tensor& w,
@@ -3754,6 +3878,475 @@ void MetalBackend::dispatch(const GraphNode& node,
                              MTLSizeMake(64, 1, 1)];
                 }
                 profile_resident_moe_stage("MOE.select");
+            }
+
+            // Resident W8 expert tensors stay in their package-native
+            // row-major layout. Run only the selected rows on Metal and bind
+            // their scale arrays independently; this avoids both the generic
+            // CPU fallback and a model-sized CPU packed sidecar.
+            if (resident_w8) {
+                const bool w8pc =
+                    gu.groups_per_row == 1 &&
+                    down.groups_per_row == 1;
+                if (w8pc && seq >= 64 && impl_->has_tensor) {
+                    const int selections = seq * top_k;
+                    const size_t qx_bytes =
+                        (size_t)seq * hidden_size;
+                    const size_t sx_bytes =
+                        (size_t)seq * sizeof(float);
+                    const size_t qi_bytes =
+                        (size_t)selections * intermediate;
+                    const size_t si_bytes =
+                        (size_t)selections * sizeof(float);
+                    const size_t selected_bytes =
+                        (size_t)selections * hidden_size * sizeof(float);
+                    const size_t expert_counts_bytes =
+                        (size_t)num_experts * sizeof(uint32_t);
+                    const size_t expert_routes_bytes =
+                        (size_t)num_experts * (size_t)seq *
+                        sizeof(int32_t);
+                    const size_t jobs_queue_bytes =
+                        (size_t)selections * 2 * sizeof(uint32_t);
+                    const size_t jobs_bytes = 2 * jobs_queue_bytes;
+                    const size_t job_count_bytes =
+                        2 * sizeof(uint32_t);
+                    const size_t dispatch_bytes =
+                        12 * sizeof(uint32_t);
+
+                    void* qx_h = impl_->pool->acquire(qx_bytes);
+                    void* sx_h = impl_->pool->acquire(sx_bytes);
+                    void* qi_h = impl_->pool->acquire(qi_bytes);
+                    void* si_h = impl_->pool->acquire(si_bytes);
+                    void* selected_h =
+                        impl_->pool->acquire(selected_bytes);
+                    void* counts_h =
+                        impl_->pool->acquire(expert_counts_bytes);
+                    void* routes_h =
+                        impl_->pool->acquire(expert_routes_bytes);
+                    void* jobs_h = impl_->pool->acquire(jobs_bytes);
+                    void* job_count_h =
+                        impl_->pool->acquire(job_count_bytes);
+                    void* dispatch_h =
+                        impl_->pool->acquire(dispatch_bytes);
+                    id<MTLBuffer> qx = (__bridge id<MTLBuffer>)qx_h;
+                    id<MTLBuffer> sx = (__bridge id<MTLBuffer>)sx_h;
+                    id<MTLBuffer> qi = (__bridge id<MTLBuffer>)qi_h;
+                    id<MTLBuffer> si = (__bridge id<MTLBuffer>)si_h;
+                    id<MTLBuffer> selected =
+                        (__bridge id<MTLBuffer>)selected_h;
+                    id<MTLBuffer> counts =
+                        (__bridge id<MTLBuffer>)counts_h;
+                    id<MTLBuffer> routes =
+                        (__bridge id<MTLBuffer>)routes_h;
+                    id<MTLBuffer> jobs =
+                        (__bridge id<MTLBuffer>)jobs_h;
+                    id<MTLBuffer> job_count =
+                        (__bridge id<MTLBuffer>)job_count_h;
+                    id<MTLBuffer> dispatch =
+                        (__bridge id<MTLBuffer>)dispatch_h;
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_reset_expert_counts")];
+                    [enc setBuffer:counts offset:0 atIndex:0];
+                    [enc setBuffer:job_count offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    grid1d(num_experts);
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_build_expert_routes")];
+                    [enc setBuffer:idx offset:0 atIndex:0];
+                    [enc setBuffer:counts offset:0 atIndex:1];
+                    [enc setBuffer:routes offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(num_experts, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_build_grouped_jobs")];
+                    [enc setBuffer:counts offset:0 atIndex:0];
+                    [enc setBuffer:jobs offset:0 atIndex:1];
+                    [enc setBuffer:job_count offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:jobs offset:jobs_queue_bytes atIndex:4];
+                    grid1d(num_experts);
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_finalize_grouped_dispatch")];
+                    [enc setBuffer:job_count offset:0 atIndex:0];
+                    [enc setBuffer:dispatch offset:0 atIndex:1];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    grid1d(1);
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                    profile_resident_moe_stage("MOE.group_routes_w8");
+
+                    auto quantize_rows = [&](id<MTLBuffer> src,
+                                             uint src_offset,
+                                             int rows, int K,
+                                             int row_stride,
+                                             id<MTLBuffer> dst,
+                                             id<MTLBuffer> dst_scales) {
+                        QuantActParams qp{};
+                        qp.M = rows;
+                        qp.K = K;
+                        qp.a_offset = src_offset;
+                        qp.a_row_stride = row_stride;
+                        [enc setComputePipelineState:
+                                 impl_->pipeline("quantize_act_i8")];
+                        [enc setBuffer:src offset:0 atIndex:0];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+                        [enc setBuffer:dst_scales offset:0 atIndex:4];
+                        [enc setThreadgroupMemoryLength:
+                                 4 * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
+                            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                    };
+                    auto grouped_w8 = [&](id<MTLBuffer> activation,
+                                           id<MTLBuffer> activation_scales,
+                                           const Tensor& weight,
+                                           int output_rows, int inner,
+                                           int rows_per_expert,
+                                           bool activation_by_token,
+                                           bool paired_gate_up,
+                                           bool large_route_tile,
+                                           id<MTLBuffer> destination,
+                                           int destination_stride) {
+                        GroupedW4A8Params gp{};
+                        gp.experts = num_experts;
+                        gp.max_routes = seq;
+                        gp.top_k = top_k;
+                        gp.N = output_rows;
+                        gp.K = inner;
+                        gp.c_row_stride = destination_stride;
+                        gp.groups_per_row = 1;
+                        gp.rows_per_expert = rows_per_expert;
+                        gp.activation_by_token =
+                            activation_by_token ? 1 : 0;
+                        const char* pipeline_name = paired_gate_up
+                            ? (large_route_tile
+                                   ? "gemm_grouped_experts_w8_gate_up_r32"
+                                   : "gemm_grouped_experts_w8_gate_up_r16")
+                            : (large_route_tile
+                                   ? "gemm_grouped_experts_w8_down_r32"
+                                   : "gemm_grouped_experts_w8_down_r16");
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(pipeline_name)];
+                        [enc setBuffer:activation offset:0 atIndex:0];
+                        [enc setBuffer:buf_of(&weight)
+                                offset:weight.device_offset atIndex:1];
+                        [enc setBuffer:destination offset:0 atIndex:2];
+                        [enc setBytes:&gp length:sizeof(gp) atIndex:3];
+                        [enc setBuffer:activation_scales
+                                offset:0 atIndex:4];
+                        [enc setBuffer:scales_buf_of(&weight)
+                                offset:weight.scales_device_offset atIndex:5];
+                        [enc setBuffer:counts offset:0 atIndex:6];
+                        [enc setBuffer:routes offset:0 atIndex:7];
+                        [enc setBuffer:jobs
+                                offset:large_route_tile
+                                    ? jobs_queue_bytes : 0
+                               atIndex:8];
+                        const NSUInteger route_tile =
+                            large_route_tile ? 32 : 16;
+                        const NSUInteger projected_rows =
+                            paired_gate_up ? 64 : 64;
+                        const NSUInteger staging_bytes =
+                            (projected_rows + route_tile) * 32;
+                        const NSUInteger result_bytes =
+                            projected_rows * route_tile * sizeof(int32_t);
+                        [enc setThreadgroupMemoryLength:
+                                 std::max(staging_bytes, result_bytes)
+                                                       atIndex:0];
+                        const NSUInteger record = paired_gate_up
+                            ? (large_route_tile ? 1 : 0)
+                            : (large_route_tile ? 3 : 2);
+                        [enc dispatchThreadgroupsWithIndirectBuffer:dispatch
+                            indirectBufferOffset:
+                                record * 3 * sizeof(uint32_t)
+                            threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+                    };
+
+                    quantize_rows(
+                        buf_of(&x), (uint)eoffset(x), seq,
+                        hidden_size, estride(x, 1), qx, sx);
+                    grouped_w8(
+                        qx, sx, gu, intermediate, hidden_size,
+                        2 * intermediate, true, true, false,
+                        merged, intermediate);
+                    grouped_w8(
+                        qx, sx, gu, intermediate, hidden_size,
+                        2 * intermediate, true, true, true,
+                        merged, intermediate);
+                    profile_resident_moe_stage("MOE.gate_up_w8a8_grouped");
+
+                    quantize_rows(
+                        merged, 0, selections, intermediate,
+                        intermediate, qi, si);
+                    grouped_w8(
+                        qi, si, down, hidden_size, intermediate,
+                        hidden_size, false, false, false,
+                        selected, hidden_size);
+                    grouped_w8(
+                        qi, si, down, hidden_size, intermediate,
+                        hidden_size, false, false, true,
+                        selected, hidden_size);
+                    profile_resident_moe_stage("MOE.down_w8a8_grouped");
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline("moe_combine_selected")];
+                    [enc setBuffer:selected offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:tw offset:0 atIndex:4];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (hidden_size + 63) / 64,
+                                 (seq + 3) / 4, 1)
+                        threadsPerThreadgroup:MTLSizeMake(64, 4, 1)];
+
+                    impl_->pending_free.push_back({qx_h, qx_bytes});
+                    impl_->pending_free.push_back({sx_h, sx_bytes});
+                    impl_->pending_free.push_back({qi_h, qi_bytes});
+                    impl_->pending_free.push_back({si_h, si_bytes});
+                    impl_->pending_free.push_back(
+                        {selected_h, selected_bytes});
+                    impl_->pending_free.push_back(
+                        {counts_h, expert_counts_bytes});
+                    impl_->pending_free.push_back(
+                        {routes_h, expert_routes_bytes});
+                    impl_->pending_free.push_back({jobs_h, jobs_bytes});
+                    impl_->pending_free.push_back(
+                        {job_count_h, job_count_bytes});
+                    impl_->pending_free.push_back(
+                        {dispatch_h, dispatch_bytes});
+                    impl_->pending_free.push_back({idx_h, idx_bytes});
+                    impl_->pending_free.push_back({tw_h, tw_bytes});
+                    impl_->pending_free.push_back({logits_h, logits_bytes});
+                    impl_->pending_free.push_back({merged_h, merged_bytes});
+                    break;
+                }
+                if (w8pc && seq == 1) {
+                    const int selections = seq * top_k;
+                    const size_t qx_bytes =
+                        (size_t)seq * hidden_size;
+                    const size_t sx_bytes =
+                        (size_t)seq * sizeof(float);
+                    const size_t qi_bytes =
+                        (size_t)selections * intermediate;
+                    const size_t si_bytes =
+                        (size_t)selections * sizeof(float);
+                    const size_t selected_bytes =
+                        (size_t)selections * hidden_size * sizeof(float);
+                    void* qx_h = impl_->pool->acquire(qx_bytes);
+                    void* sx_h = impl_->pool->acquire(sx_bytes);
+                    void* qi_h = impl_->pool->acquire(qi_bytes);
+                    void* si_h = impl_->pool->acquire(si_bytes);
+                    void* selected_h =
+                        impl_->pool->acquire(selected_bytes);
+                    id<MTLBuffer> qx = (__bridge id<MTLBuffer>)qx_h;
+                    id<MTLBuffer> sx = (__bridge id<MTLBuffer>)sx_h;
+                    id<MTLBuffer> qi = (__bridge id<MTLBuffer>)qi_h;
+                    id<MTLBuffer> si = (__bridge id<MTLBuffer>)si_h;
+                    id<MTLBuffer> selected =
+                        (__bridge id<MTLBuffer>)selected_h;
+
+                    auto quantize_rows = [&](id<MTLBuffer> src,
+                                             uint src_offset,
+                                             int rows, int K,
+                                             int row_stride,
+                                             id<MTLBuffer> dst,
+                                             id<MTLBuffer> dst_scales) {
+                        QuantActParams qp{};
+                        qp.M = rows;
+                        qp.K = K;
+                        qp.a_offset = src_offset;
+                        qp.a_row_stride = row_stride;
+                        [enc setComputePipelineState:
+                                 impl_->pipeline("quantize_act_i8")];
+                        [enc setBuffer:src offset:0 atIndex:0];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&qp length:sizeof(qp) atIndex:3];
+                        [enc setBuffer:dst_scales offset:0 atIndex:4];
+                        [enc setThreadgroupMemoryLength:
+                                 8 * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(rows, 1, 1)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32, 8, 1)];
+                    };
+                    auto selected_w8 = [&](id<MTLBuffer> activation,
+                                           id<MTLBuffer> activation_scales,
+                                           const Tensor& weight,
+                                           int N, int K,
+                                           int rows_per_expert,
+                                           int activation_rows,
+                                           int activation_repeat,
+                                           id<MTLBuffer> dst,
+                                           int dst_stride) {
+                        SelectedW4A8Params sp{};
+                        sp.selections = selections;
+                        sp.N = N;
+                        sp.K = K;
+                        sp.c_offset = 0;
+                        sp.c_row_stride = dst_stride;
+                        sp.group_size = K;
+                        sp.groups_per_row = 1;
+                        sp.rows_per_expert = rows_per_expert;
+                        sp.activation_rows = activation_rows;
+                        sp.activation_repeat = activation_repeat;
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "gemv_selected_experts_w8_i8a_i8b_f32c")];
+                        [enc setBuffer:activation offset:0 atIndex:0];
+                        [enc setBuffer:buf_of(&weight)
+                                offset:weight.device_offset atIndex:1];
+                        [enc setBuffer:dst offset:0 atIndex:2];
+                        [enc setBytes:&sp length:sizeof(sp) atIndex:3];
+                        [enc setBuffer:activation_scales
+                                offset:0 atIndex:4];
+                        [enc setBuffer:scales_buf_of(&weight)
+                                offset:weight.scales_device_offset atIndex:5];
+                        [enc setBuffer:idx offset:0 atIndex:6];
+                        constexpr NSUInteger w8_nsg = 4;
+                        constexpr NSUInteger rows_per_tg = w8_nsg * 8;
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(
+                                     (N + rows_per_tg - 1) / rows_per_tg,
+                                     1, selections)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32, w8_nsg, 1)];
+                    };
+
+                    quantize_rows(
+                        buf_of(&x), (uint)eoffset(x), seq,
+                        hidden_size, estride(x, 1), qx, sx);
+                    selected_w8(
+                        qx, sx, gu, 2 * intermediate, hidden_size,
+                        2 * intermediate, seq, top_k,
+                        merged, 2 * intermediate);
+                    profile_resident_moe_stage("MOE.gate_up_w8a8");
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline(
+                                 "moe_swiglu_quantize_row")];
+                    [enc setBuffer:merged offset:0 atIndex:0];
+                    [enc setBuffer:qi offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:si offset:0 atIndex:4];
+                    constexpr NSUInteger swiglu_nsg = 8;
+                    [enc setThreadgroupMemoryLength:
+                             swiglu_nsg * sizeof(float) atIndex:0];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(selections, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(32, swiglu_nsg, 1)];
+
+                    selected_w8(
+                        qi, si, down, hidden_size, intermediate,
+                        hidden_size, selections, 1,
+                        selected, hidden_size);
+                    profile_resident_moe_stage("MOE.down_w8a8");
+
+                    [enc setComputePipelineState:
+                             impl_->pipeline("moe_combine_selected")];
+                    [enc setBuffer:selected offset:0 atIndex:0];
+                    [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+                    [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                    [enc setBuffer:tw offset:0 atIndex:4];
+                    [enc dispatchThreadgroups:
+                             MTLSizeMake(
+                                 (hidden_size + 255) / 256, 1, 1)
+                        threadsPerThreadgroup:
+                             MTLSizeMake(256, 1, 1)];
+                    impl_->pending_free.push_back({qx_h, qx_bytes});
+                    impl_->pending_free.push_back({sx_h, sx_bytes});
+                    impl_->pending_free.push_back({qi_h, qi_bytes});
+                    impl_->pending_free.push_back({si_h, si_bytes});
+                    impl_->pending_free.push_back(
+                        {selected_h, selected_bytes});
+                    impl_->pending_free.push_back({idx_h, idx_bytes});
+                    impl_->pending_free.push_back({tw_h, tw_bytes});
+                    impl_->pending_free.push_back({logits_h, logits_bytes});
+                    impl_->pending_free.push_back({merged_h, merged_bytes});
+                    break;
+                }
+                const bool exact_decode =
+                    seq == 1 && gu.groups_per_row == 1 &&
+                    down.groups_per_row == 1;
+                [enc setComputePipelineState:
+                         impl_->pipeline(
+                             exact_decode
+                                 ? "moe_gate_up_w8_precise"
+                                 : "moe_gate_up_w8")];
+                [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+                [enc setBuffer:buf_of(&gu)
+                        offset:gu.device_offset atIndex:1];
+                [enc setBuffer:merged offset:0 atIndex:2];
+                [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                [enc setBuffer:scales_buf_of(&gu)
+                        offset:gu.scales_device_offset atIndex:4];
+                [enc setBuffer:idx offset:0 atIndex:5];
+                if (exact_decode)
+                    [enc setThreadgroupMemoryLength:
+                             4 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:
+                         MTLSizeMake(
+                             exact_decode
+                                 ? (2 * intermediate + 3) / 4
+                                 : (2 * intermediate + 31) / 32,
+                                     top_k, seq)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                profile_resident_moe_stage("MOE.gate_up_w8");
+
+                [enc setComputePipelineState:
+                         impl_->pipeline("moe_swiglu_selected")];
+                [enc setBuffer:merged offset:0 atIndex:0];
+                [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                const NSUInteger sw_n =
+                    (NSUInteger)seq * top_k * intermediate;
+                [enc dispatchThreadgroups:
+                         MTLSizeMake((sw_n + 255) / 256, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+
+                [enc setComputePipelineState:
+                         impl_->pipeline(
+                             exact_decode
+                                 ? "moe_down_combine_w8_precise"
+                                 : "moe_down_combine_w8")];
+                [enc setBuffer:merged offset:0 atIndex:0];
+                [enc setBuffer:buf_of(&down)
+                        offset:down.device_offset atIndex:1];
+                [enc setBuffer:buf_of(output) offset:0 atIndex:2];
+                [enc setBytes:&mp length:sizeof(mp) atIndex:3];
+                [enc setBuffer:scales_buf_of(&down)
+                        offset:down.scales_device_offset atIndex:4];
+                [enc setBuffer:idx offset:0 atIndex:5];
+                [enc setBuffer:tw offset:0 atIndex:6];
+                if (exact_decode)
+                    [enc setThreadgroupMemoryLength:
+                             4 * sizeof(float) atIndex:0];
+                [enc dispatchThreadgroups:
+                         MTLSizeMake(
+                             exact_decode
+                                 ? (hidden_size + 3) / 4
+                                 : (hidden_size + 31) / 32,
+                             seq, 1)
+                    threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+                profile_resident_moe_stage("MOE.down_w8");
+
+                impl_->pending_free.push_back({idx_h, idx_bytes});
+                impl_->pending_free.push_back({tw_h, tw_bytes});
+                impl_->pending_free.push_back({logits_h, logits_bytes});
+                impl_->pending_free.push_back({merged_h, merged_bytes});
+                break;
             }
 
 #ifdef MOLLM_METAL_TENSOR
@@ -4801,4 +5394,545 @@ void MetalBackend::dispatch(const GraphNode& node,
             impl_->ops_in_cmd = 0;
         }
     }
+}
+
+bool MetalBackend::dispatch_host_moe(
+    const GraphNode& node, const std::vector<const Tensor*>& inputs,
+    Tensor* output, ThreadPool* thread_pool, bool& success) {
+    success = false;
+    if (node.op_type != OpType::MOE || !output || inputs.size() < 7 ||
+        !inputs[0] || !inputs[1] || !inputs[2] || !inputs[3] ||
+        !inputs[4] || !inputs[5] || !inputs[6] ||
+        inputs[0]->shape[1] != 1) {
+        return false;
+    }
+
+    const OpParams& params = node.params;
+    const int hidden_size = graph_params::get_i32(
+        params, 0, static_cast<int>(output->shape[0]));
+    const int num_experts = graph_params::get_i32(params, 1, 0);
+    const int top_k = graph_params::get_i32(params, 2, 0);
+    const int intermediate = graph_params::get_i32(params, 3, 0);
+    const int shared_intermediate = graph_params::get_i32(
+        params, 4, intermediate);
+    const int score_func = graph_params::get_i32(params, 5, 0);
+    const bool normalize_topk =
+        graph_params::get_i32(params, 6, 1) != 0;
+    const bool has_shared = graph_params::get_i32(params, 7, 1) != 0;
+    const int num_groups = graph_params::get_i32(params, 8, 1);
+    const int topk_groups = graph_params::get_i32(params, 9, 1);
+    const bool shared_has_gate =
+        graph_params::get_i32(params, 10, 1) != 0;
+    const int bias_input = graph_params::get_i32(params, 11, -1);
+    const int token_input = graph_params::get_i32(params, 12, -1);
+    const int hash_input = graph_params::get_i32(params, 13, -1);
+    const float routed_scale = graph_params::get_f32(params, 0, 1.0f);
+    const float swiglu_limit = graph_params::get_f32(params, 1, 0.0f);
+
+    const auto* gate_source = static_cast<const MoeSsdTensorSource*>(
+        inputs[2]->moe_ssd_source);
+    const auto* down_source = static_cast<const MoeSsdTensorSource*>(
+        inputs[3]->moe_ssd_source);
+    const bool supported = impl_->ssd_io_queue && gate_source && down_source &&
+        gate_source->cache == down_source->cache &&
+        gate_source->spec.precision == Precision::MXFP4 &&
+        down_source->spec.precision == Precision::MXFP4 &&
+        gate_source->spec.group_size == 32 &&
+        down_source->spec.group_size == 32 && has_shared &&
+        !shared_has_gate && hidden_size > 0 && num_experts > 0 &&
+        top_k > 0 && top_k <= num_experts && intermediate > 0 &&
+        output->shape[0] == hidden_size && output->shape[1] == 1;
+    if (!supported)
+        return false;
+
+    const Tensor& hidden = *inputs[0];
+    const Tensor& router = *inputs[1];
+    const Tensor* bias =
+        bias_input >= 0 && static_cast<size_t>(bias_input) < inputs.size()
+            ? inputs[bias_input] : nullptr;
+    const Tensor* token_ids =
+        token_input >= 0 && static_cast<size_t>(token_input) < inputs.size()
+            ? inputs[token_input] : nullptr;
+    const Tensor* token_to_experts =
+        hash_input >= 0 && static_cast<size_t>(hash_input) < inputs.size()
+            ? inputs[hash_input] : nullptr;
+
+    // The host-MoE path bypasses MetalBackend::dispatch(), so learn its layer
+    // metadata here. From the second decode token onward this makes the next
+    // layer's router available before its exact gate executes.
+    impl_->ssd_moe_layers[gate_source->spec.layer] = {
+        &router,
+        bias,
+        gate_source,
+        down_source,
+        hidden_size,
+        num_experts,
+        top_k,
+        intermediate,
+        score_func,
+        std::max(1, num_groups),
+        std::max(1, topk_groups),
+        normalize_topk,
+        routed_scale,
+        token_to_experts,
+    };
+
+    std::vector<float> logits(static_cast<size_t>(num_experts));
+    Tensor logits_tensor = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        num_experts, 1, 1, 1, logits.data());
+    kernel_matmul_fp32(
+        hidden, router, logits_tensor, thread_pool,
+        Activation::NONE, 0, -1, true);
+
+    mollm::detail::MoeRoutingParams routing;
+    routing.num_experts = num_experts;
+    routing.top_k = top_k;
+    routing.score_func = score_func;
+    routing.normalize_topk = normalize_topk;
+    routing.num_groups = std::max(1, num_groups);
+    routing.topk_groups = std::max(1, topk_groups);
+    routing.scaling_factor = routed_scale;
+    std::vector<int> routes;
+    std::vector<float> route_weights;
+    bool routed = false;
+    if (token_ids && token_to_experts &&
+        token_ids->prec == Precision::INT32 &&
+        token_to_experts->prec == Precision::INT32) {
+        routed = mollm::detail::select_moe_hash_routes(
+            logits.data(), 1, token_ids->ptr<int32_t>(),
+            token_to_experts->ptr<int32_t>(),
+            static_cast<int>(token_to_experts->shape[1]), routing,
+            routes, route_weights);
+    } else {
+        routed = mollm::detail::select_moe_routes(
+            logits.data(), 1,
+            bias && bias->data ? bias->ptr<float>() : nullptr,
+            routing, routes, route_weights);
+    }
+    if (!routed || static_cast<int>(routes.size()) != top_k ||
+        static_cast<int>(route_weights.size()) != top_k) {
+        success = false;
+        return true;
+    }
+
+    std::vector<Impl::SsdExpertView> views;
+    const uint64_t io_start = mollm_trace::now_ns();
+    if (!impl_->acquire_ssd_experts(
+            gate_source->spec, down_source->spec, routes, views) ||
+        static_cast<int>(views.size()) != top_k) {
+        success = false;
+        return true;
+    }
+    mollm_trace::record_duration(
+        "metal.ssd", "mxfp4_demand_schedule", io_start,
+        mollm_trace::now_ns(),
+        "{\"layer\":" + std::to_string(gate_source->spec.layer) + "}",
+        "good");
+
+    if (impl_->ssd_cross_layer_prefetch) {
+        const auto next = impl_->ssd_moe_layers.find(
+            gate_source->spec.layer + 1);
+        if (next != impl_->ssd_moe_layers.end()) {
+            const Impl::SsdMoeLayerInfo& info = next->second;
+            if (info.router && info.gate_up && info.down &&
+                info.hidden == hidden_size && info.experts > 0 &&
+                info.top_k > 0 && info.top_k <= info.experts) {
+                const uint64_t prefetch_start = mollm_trace::now_ns();
+                std::vector<float> predicted_logits(
+                    static_cast<size_t>(info.experts));
+                Tensor predicted_logits_tensor = Tensor::create(
+                    Precision::FP32, MemoryType::EXTERNAL,
+                    info.experts, 1, 1, 1, predicted_logits.data());
+                kernel_matmul_fp32(
+                    hidden, *info.router, predicted_logits_tensor,
+                    thread_pool, Activation::NONE, 0, -1, true);
+
+                mollm::detail::MoeRoutingParams predicted_routing;
+                predicted_routing.num_experts = info.experts;
+                predicted_routing.top_k = info.top_k;
+                predicted_routing.score_func = info.score_func;
+                predicted_routing.normalize_topk = info.norm_topk;
+                predicted_routing.num_groups = info.n_group;
+                predicted_routing.topk_groups = info.topk_group;
+                predicted_routing.scaling_factor = info.routed_scale;
+                std::vector<int> predicted_routes;
+                std::vector<float> predicted_weights;
+                bool predicted = false;
+                if (info.token_to_experts && token_ids &&
+                    info.token_to_experts->prec == Precision::INT32 &&
+                    token_ids->prec == Precision::INT32) {
+                    predicted = mollm::detail::select_moe_hash_routes(
+                        predicted_logits.data(), 1,
+                        token_ids->ptr<int32_t>(),
+                        info.token_to_experts->ptr<int32_t>(),
+                        static_cast<int>(info.token_to_experts->shape[1]),
+                        predicted_routing, predicted_routes,
+                        predicted_weights);
+                } else {
+                    predicted = mollm::detail::select_moe_routes(
+                        predicted_logits.data(), 1,
+                        info.bias && info.bias->data
+                            ? info.bias->ptr<float>() : nullptr,
+                        predicted_routing, predicted_routes,
+                        predicted_weights);
+                }
+                std::vector<Impl::SsdExpertView> predicted_views;
+                if (predicted) {
+                    impl_->acquire_ssd_experts(
+                        info.gate_up->spec, info.down->spec,
+                        predicted_routes, predicted_views, true);
+                }
+                mollm_trace::record_duration(
+                    "metal.ssd", "mxfp4_cross_layer_prefetch",
+                    prefetch_start, mollm_trace::now_ns(),
+                    "{\"layer\":" +
+                        std::to_string(info.gate_up->spec.layer) +
+                        ",\"experts\":" +
+                        std::to_string(predicted_routes.size()) + "}",
+                    "yellow");
+            }
+        }
+    }
+
+    const size_t hidden_bytes =
+        static_cast<size_t>(hidden_size) * sizeof(float);
+    const size_t merged_bytes =
+        static_cast<size_t>(top_k) * 2 * intermediate * sizeof(float);
+    const size_t selected_bytes =
+        static_cast<size_t>(top_k) * hidden_size * sizeof(float);
+    const size_t quantized_hidden_bytes = static_cast<size_t>(hidden_size);
+    const size_t hidden_scale_bytes =
+        static_cast<size_t>(hidden_size / 32) * sizeof(float);
+    const size_t quantized_intermediate_bytes =
+        static_cast<size_t>(top_k) * intermediate;
+    const size_t intermediate_scale_bytes =
+        static_cast<size_t>(top_k) * (intermediate / 32) * sizeof(float);
+    const size_t weights_bytes =
+        static_cast<size_t>(top_k) * sizeof(float);
+    const size_t offsets_bytes =
+        static_cast<size_t>(2 * top_k) * sizeof(uint64_t);
+    const size_t indices_bytes =
+        static_cast<size_t>(top_k) * sizeof(uint32_t);
+    void* hidden_handle = impl_->pool->acquire(hidden_bytes);
+    void* merged_handle = impl_->pool->acquire(merged_bytes);
+    void* selected_handle = impl_->pool->acquire(selected_bytes);
+    void* quantized_hidden_handle =
+        impl_->pool->acquire(quantized_hidden_bytes);
+    void* hidden_scale_handle = impl_->pool->acquire(hidden_scale_bytes);
+    void* residual_hidden_handle =
+        impl_->pool->acquire(quantized_hidden_bytes);
+    void* residual_hidden_scale_handle =
+        impl_->pool->acquire(hidden_scale_bytes);
+    void* quantized_intermediate_handle =
+        impl_->pool->acquire(quantized_intermediate_bytes);
+    void* intermediate_scale_handle =
+        impl_->pool->acquire(intermediate_scale_bytes);
+    void* residual_intermediate_handle =
+        impl_->pool->acquire(quantized_intermediate_bytes);
+    void* residual_intermediate_scale_handle =
+        impl_->pool->acquire(intermediate_scale_bytes);
+    void* weights_handle = impl_->pool->acquire(weights_bytes);
+    void* offsets_handle = impl_->pool->acquire(offsets_bytes);
+    void* indices_handle = impl_->pool->acquire(indices_bytes);
+    auto release_buffers = [&] {
+        impl_->pool->release(hidden_handle, hidden_bytes);
+        impl_->pool->release(merged_handle, merged_bytes);
+        impl_->pool->release(selected_handle, selected_bytes);
+        impl_->pool->release(
+            quantized_hidden_handle, quantized_hidden_bytes);
+        impl_->pool->release(hidden_scale_handle, hidden_scale_bytes);
+        impl_->pool->release(
+            residual_hidden_handle, quantized_hidden_bytes);
+        impl_->pool->release(
+            residual_hidden_scale_handle, hidden_scale_bytes);
+        impl_->pool->release(
+            quantized_intermediate_handle, quantized_intermediate_bytes);
+        impl_->pool->release(
+            intermediate_scale_handle, intermediate_scale_bytes);
+        impl_->pool->release(
+            residual_intermediate_handle, quantized_intermediate_bytes);
+        impl_->pool->release(
+            residual_intermediate_scale_handle, intermediate_scale_bytes);
+        impl_->pool->release(weights_handle, weights_bytes);
+        impl_->pool->release(offsets_handle, offsets_bytes);
+        impl_->pool->release(indices_handle, indices_bytes);
+    };
+    if (!hidden_handle || !merged_handle || !selected_handle ||
+        !quantized_hidden_handle || !hidden_scale_handle ||
+        !residual_hidden_handle || !residual_hidden_scale_handle ||
+        !quantized_intermediate_handle || !intermediate_scale_handle ||
+        !residual_intermediate_handle ||
+        !residual_intermediate_scale_handle ||
+        !weights_handle || !offsets_handle || !indices_handle) {
+        release_buffers();
+        success = false;
+        return true;
+    }
+    std::memcpy(
+        MetalBufferPool::contents(hidden_handle), hidden.data, hidden_bytes);
+    std::memcpy(
+        MetalBufferPool::contents(weights_handle), route_weights.data(),
+        weights_bytes);
+    auto* offsets = static_cast<uint64_t*>(
+        MetalBufferPool::contents(offsets_handle));
+    auto* indices = static_cast<uint32_t*>(
+        MetalBufferPool::contents(indices_handle));
+    for (int selection = 0; selection < top_k; ++selection) {
+        offsets[selection] = views[selection].gate_up_offset;
+        offsets[top_k + selection] = views[selection].down_offset;
+        indices[selection] = static_cast<uint32_t>(selection);
+    }
+
+    id<MTLBuffer> hidden_buffer =
+        (__bridge id<MTLBuffer>)hidden_handle;
+    id<MTLBuffer> merged_buffer =
+        (__bridge id<MTLBuffer>)merged_handle;
+    id<MTLBuffer> selected_buffer =
+        (__bridge id<MTLBuffer>)selected_handle;
+    id<MTLBuffer> quantized_hidden_buffer =
+        (__bridge id<MTLBuffer>)quantized_hidden_handle;
+    id<MTLBuffer> hidden_scale_buffer =
+        (__bridge id<MTLBuffer>)hidden_scale_handle;
+    id<MTLBuffer> residual_hidden_buffer =
+        (__bridge id<MTLBuffer>)residual_hidden_handle;
+    id<MTLBuffer> residual_hidden_scale_buffer =
+        (__bridge id<MTLBuffer>)residual_hidden_scale_handle;
+    id<MTLBuffer> quantized_intermediate_buffer =
+        (__bridge id<MTLBuffer>)quantized_intermediate_handle;
+    id<MTLBuffer> intermediate_scale_buffer =
+        (__bridge id<MTLBuffer>)intermediate_scale_handle;
+    id<MTLBuffer> residual_intermediate_buffer =
+        (__bridge id<MTLBuffer>)residual_intermediate_handle;
+    id<MTLBuffer> residual_intermediate_scale_buffer =
+        (__bridge id<MTLBuffer>)residual_intermediate_scale_handle;
+    id<MTLBuffer> route_weight_buffer =
+        (__bridge id<MTLBuffer>)weights_handle;
+    id<MTLBuffer> offset_buffer =
+        (__bridge id<MTLBuffer>)offsets_handle;
+    id<MTLBuffer> index_buffer =
+        (__bridge id<MTLBuffer>)indices_handle;
+
+    id<MTLCommandBuffer> command = [impl_->queue commandBuffer];
+    command.label = @"mollm hybrid MXFP4 SSD MoE";
+    std::unordered_set<void*> waited_events;
+    for (const auto& view : views) {
+        if (view.gate_ready_event &&
+            view.gate_ready_event.signaledValue < view.gate_ready_value) {
+            void* key = (__bridge void*)view.gate_ready_event;
+            if (waited_events.insert(key).second) {
+                [command encodeWaitForEvent:view.gate_ready_event
+                                      value:view.gate_ready_value];
+            }
+        }
+    }
+
+    MoeW4Params moe_params{};
+    moe_params.hidden = hidden_size;
+    moe_params.experts = num_experts;
+    moe_params.top_k = top_k;
+    moe_params.intermediate = intermediate;
+    moe_params.seq_len = 1;
+    moe_params.routed_scale = routed_scale;
+    moe_params.swiglu_limit = swiglu_limit;
+
+    SelectedMxfp4Params gate_params{};
+    gate_params.selections = top_k;
+    gate_params.N = 2 * intermediate;
+    gate_params.K = hidden_size;
+    gate_params.c_row_stride = 2 * intermediate;
+    gate_params.groups_per_row = hidden_size / 32;
+    gate_params.activation_repeat = top_k;
+    gate_params.activation_row_stride = hidden_size;
+
+    id<MTLComputeCommandEncoder> encoder =
+        [command computeCommandEncoder];
+    QuantActParams hidden_quant{};
+    hidden_quant.M = 1;
+    hidden_quant.K = hidden_size;
+    hidden_quant.a_row_stride = hidden_size;
+    hidden_quant.block_size = 32;
+    [encoder setComputePipelineState:
+                 impl_->pipeline("quantize_act_fp8_i8_block32")];
+    [encoder setBuffer:hidden_buffer offset:0 atIndex:0];
+    [encoder setBuffer:quantized_hidden_buffer offset:0 atIndex:2];
+    [encoder setBytes:&hidden_quant length:sizeof(hidden_quant) atIndex:3];
+    [encoder setBuffer:hidden_scale_buffer offset:0 atIndex:4];
+    [encoder setBuffer:residual_hidden_buffer offset:0 atIndex:5];
+    [encoder setBuffer:residual_hidden_scale_buffer offset:0 atIndex:6];
+    constexpr NSUInteger quant_simdgroups = 4;
+    const NSUInteger hidden_blocks =
+        (static_cast<NSUInteger>(hidden_size) + 127) / 128;
+    [encoder dispatchThreadgroups:
+                 MTLSizeMake(hidden_blocks, 1, 1)
+             threadsPerThreadgroup:
+                 MTLSizeMake(32, quant_simdgroups, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [encoder setComputePipelineState:
+                 impl_->pipeline(
+                     "gemv_selected_slots_mxfp4_i8a_f32c")];
+    [encoder setBuffer:quantized_hidden_buffer offset:0 atIndex:0];
+    [encoder setBuffer:views.front().gate_up offset:0 atIndex:1];
+    [encoder setBuffer:merged_buffer offset:0 atIndex:2];
+    [encoder setBytes:&gate_params length:sizeof(gate_params) atIndex:3];
+    [encoder setBuffer:hidden_scale_buffer offset:0 atIndex:4];
+    [encoder setBuffer:residual_hidden_buffer offset:0 atIndex:5];
+    [encoder setBuffer:offset_buffer offset:0 atIndex:6];
+    [encoder setBuffer:index_buffer offset:0 atIndex:7];
+    [encoder setBuffer:residual_hidden_scale_buffer offset:0 atIndex:8];
+    [encoder setThreadgroupMemoryLength:
+                 static_cast<NSUInteger>(
+                     2 * hidden_size +
+                     2 * (hidden_size / 32) * sizeof(float))
+                              atIndex:0];
+    [encoder dispatchThreadgroups:
+                 MTLSizeMake((2 * intermediate + 63) / 64, 1, top_k)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    [encoder setComputePipelineState:
+                 impl_->pipeline("moe_swiglu_route_bf16")];
+    [encoder setBuffer:merged_buffer offset:0 atIndex:0];
+    [encoder setBytes:&moe_params length:sizeof(moe_params) atIndex:3];
+    [encoder setBuffer:route_weight_buffer offset:0 atIndex:4];
+    [encoder dispatchThreads:
+                 MTLSizeMake(
+                     static_cast<NSUInteger>(top_k) * intermediate,
+                     1, 1)
+             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+    [encoder memoryBarrierWithScope:MTLBarrierScopeBuffers];
+
+    QuantActParams intermediate_quant{};
+    intermediate_quant.M = top_k;
+    intermediate_quant.K = intermediate;
+    intermediate_quant.a_row_stride = 2 * intermediate;
+    intermediate_quant.block_size = 32;
+    [encoder setComputePipelineState:
+                 impl_->pipeline("quantize_act_fp8_i8_block32")];
+    [encoder setBuffer:merged_buffer offset:0 atIndex:0];
+    [encoder setBuffer:quantized_intermediate_buffer offset:0 atIndex:2];
+    [encoder setBytes:&intermediate_quant
+                length:sizeof(intermediate_quant) atIndex:3];
+    [encoder setBuffer:intermediate_scale_buffer offset:0 atIndex:4];
+    [encoder setBuffer:residual_intermediate_buffer offset:0 atIndex:5];
+    [encoder setBuffer:residual_intermediate_scale_buffer
+                 offset:0 atIndex:6];
+    const NSUInteger intermediate_fp8_blocks =
+        (static_cast<NSUInteger>(intermediate) + 127) / 128;
+    [encoder dispatchThreadgroups:
+                 MTLSizeMake(
+                     static_cast<NSUInteger>(top_k) *
+                         intermediate_fp8_blocks,
+                     1, 1)
+             threadsPerThreadgroup:
+                 MTLSizeMake(32, quant_simdgroups, 1)];
+    [encoder endEncoding];
+
+    waited_events.clear();
+    for (const auto& view : views) {
+        if (view.down_ready_event &&
+            view.down_ready_event.signaledValue < view.down_ready_value) {
+            void* key = (__bridge void*)view.down_ready_event;
+            if (waited_events.insert(key).second) {
+                [command encodeWaitForEvent:view.down_ready_event
+                                      value:view.down_ready_value];
+            }
+        }
+    }
+
+    SelectedMxfp4Params down_params{};
+    down_params.selections = top_k;
+    down_params.N = hidden_size;
+    down_params.K = intermediate;
+    down_params.c_row_stride = hidden_size;
+    down_params.groups_per_row = intermediate / 32;
+    down_params.activation_repeat = 1;
+    down_params.activation_row_stride = intermediate;
+    encoder = [command computeCommandEncoder];
+    [encoder setComputePipelineState:
+                 impl_->pipeline(
+                     "gemv_selected_slots_mxfp4_i8a_f32c")];
+    [encoder setBuffer:quantized_intermediate_buffer offset:0 atIndex:0];
+    [encoder setBuffer:views.front().down offset:0 atIndex:1];
+    [encoder setBuffer:selected_buffer offset:0 atIndex:2];
+    [encoder setBytes:&down_params length:sizeof(down_params) atIndex:3];
+    [encoder setBuffer:intermediate_scale_buffer offset:0 atIndex:4];
+    [encoder setBuffer:residual_intermediate_buffer offset:0 atIndex:5];
+    [encoder setBuffer:offset_buffer
+                 offset:static_cast<NSUInteger>(top_k) * sizeof(uint64_t)
+                atIndex:6];
+    [encoder setBuffer:index_buffer offset:0 atIndex:7];
+    [encoder setBuffer:residual_intermediate_scale_buffer
+                 offset:0 atIndex:8];
+    [encoder setThreadgroupMemoryLength:
+                 static_cast<NSUInteger>(
+                     2 * intermediate +
+                     2 * (intermediate / 32) * sizeof(float))
+                              atIndex:0];
+    [encoder dispatchThreadgroups:
+                 MTLSizeMake((hidden_size + 63) / 64, 1, top_k)
+             threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+    [encoder endEncoding];
+    const uint64_t gpu_start = mollm_trace::now_ns();
+    [command commit];
+
+    std::vector<float> shared_values(static_cast<size_t>(hidden_size));
+    Tensor shared_output = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        hidden_size, 1, 1, 1, shared_values.data());
+    const bool shared_ok = kernel_moe_shared_expert(
+        hidden, *inputs[4], *inputs[5], *inputs[6], nullptr,
+        shared_output, thread_pool, shared_intermediate, true,
+        swiglu_limit);
+
+    [command waitUntilCompleted];
+    const uint64_t gpu_end = mollm_trace::now_ns();
+    mollm_trace::record_duration(
+        "metal.ssd", "mxfp4_routed_experts", gpu_start, gpu_end,
+        "{\"layer\":" + std::to_string(gate_source->spec.layer) + "}",
+        "thread_state_running");
+    const double gpu_seconds = command.GPUEndTime - command.GPUStartTime;
+    if (gpu_seconds > 0.0 && gpu_end != 0) {
+        const uint64_t gpu_ns =
+            static_cast<uint64_t>(gpu_seconds * 1e9);
+        mollm_trace::record_duration(
+            "metal.ssd", "mxfp4_gpu",
+            gpu_end > gpu_ns ? gpu_end - gpu_ns : 0, gpu_end,
+            "{\"layer\":" + std::to_string(gate_source->spec.layer) + "}",
+            "thread_state_running");
+    }
+    if (!shared_ok || command.status == MTLCommandBufferStatusError) {
+        if (command.status == MTLCommandBufferStatusError) {
+            NSError* error = command.error;
+            std::fprintf(
+                stderr, "MetalBackend: hybrid MXFP4 MoE failed: %s\n",
+                error ? error.localizedDescription.UTF8String : "?");
+        }
+        release_buffers();
+        success = false;
+        return true;
+    }
+
+    const float* selected = static_cast<const float*>(
+        MetalBufferPool::contents(selected_handle));
+    float* destination = output->ptr<float>();
+    std::fill(destination, destination + hidden_size, 0.0f);
+    std::vector<int> order(static_cast<size_t>(top_k));
+    for (int selection = 0; selection < top_k; ++selection)
+        order[selection] = selection;
+    std::stable_sort(
+        order.begin(), order.end(),
+        [&](int left, int right) { return routes[left] < routes[right]; });
+    for (int selection : order) {
+        const float* source =
+            selected + static_cast<size_t>(selection) * hidden_size;
+        for (int dim = 0; dim < hidden_size; ++dim)
+            destination[dim] += source[dim];
+    }
+    for (int dim = 0; dim < hidden_size; ++dim)
+        destination[dim] += shared_values[dim];
+    release_buffers();
+    success = true;
+    return true;
 }

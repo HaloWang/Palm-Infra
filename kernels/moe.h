@@ -6,6 +6,20 @@
 
 class ThreadPool;
 
+// Compute only the dense/shared expert branch of an MoE layer. Keeping this
+// independent from routed execution lets SSD device backends overlap routed
+// expert I/O and compute with the CPU shared MLP.
+bool kernel_moe_shared_expert(const Tensor& hidden,
+                              const Tensor& gate,
+                              const Tensor& up,
+                              const Tensor& down,
+                              const Tensor* scale_weight,
+                              Tensor& output,
+                              ThreadPool* thread_pool,
+                              int intermediate_size,
+                              bool emulate_bf16,
+                              float swiglu_limit = 0.0f);
+
 // Fused Qwen-style sparse MLP.
 //
 // Inputs:

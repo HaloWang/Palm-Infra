@@ -47,6 +47,19 @@ public:
                           const std::vector<const Tensor*>& inputs,
                           Tensor* output, ThreadPool* thread_pool) = 0;
 
+    /// Optional host-resident MoE delegation. A hybrid device backend may
+    /// consume CPU tensors, execute only routed experts on the device, and
+    /// write the final FP32 output back into host storage. Returns true when
+    /// the node was handled; `success` distinguishes a completed dispatch from
+    /// a handled runtime failure. Unsupported nodes return false so the normal
+    /// graph backend can execute them.
+    virtual bool dispatch_host_moe(
+        const GraphNode&, const std::vector<const Tensor*>&, Tensor*,
+        ThreadPool*, bool& success) {
+        success = false;
+        return false;
+    }
+
     /// Reset/query a recoverable dispatch failure. Most kernels are legacy
     /// void functions, so this side channel lets checked operators stop graph
     /// execution without changing every backend dispatch signature at once.

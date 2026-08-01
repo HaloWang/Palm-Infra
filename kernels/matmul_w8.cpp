@@ -5,6 +5,66 @@
 #include <cstdint>
 #include <vector>
 
+namespace {
+
+struct ActivationQuantCacheEntry {
+    const float* data = nullptr;
+    uint64_t storage_id = 0;
+    int k = 0;
+    int lda = 0;
+    int k_storage = 0;
+    uint64_t generation = 0;
+    std::vector<int8_t> values;
+    std::vector<float> scales;
+};
+
+thread_local std::vector<ActivationQuantCacheEntry> g_activation_quant_cache;
+thread_local uint64_t g_activation_quant_generation = 1;
+
+const ActivationQuantCacheEntry& cached_fp8_q8_activation(
+    const float* data, uint64_t storage_id, int k, int lda, int k_storage) {
+    ActivationQuantCacheEntry* reusable = nullptr;
+    for (auto& entry : g_activation_quant_cache) {
+        if (entry.data == data && entry.storage_id == storage_id &&
+            entry.k == k && entry.lda == lda &&
+            entry.k_storage == k_storage) {
+            if (entry.generation != g_activation_quant_generation) {
+                quantize_a_fp8_q8_blocks(
+                    data, 1, k, lda, k_storage,
+                    entry.values, entry.scales);
+                entry.generation = g_activation_quant_generation;
+            }
+            return entry;
+        }
+        if (!reusable && entry.generation != g_activation_quant_generation)
+            reusable = &entry;
+    }
+    if (!reusable) {
+        g_activation_quant_cache.emplace_back();
+        reusable = &g_activation_quant_cache.back();
+    }
+    reusable->data = data;
+    reusable->storage_id = storage_id;
+    reusable->k = k;
+    reusable->lda = lda;
+    reusable->k_storage = k_storage;
+    quantize_a_fp8_q8_blocks(
+        data, 1, k, lda, k_storage,
+        reusable->values, reusable->scales);
+    reusable->generation = g_activation_quant_generation;
+    return *reusable;
+}
+
+}  // namespace
+
+void matmul_reset_activation_cache() {
+    if (++g_activation_quant_generation == 0) {
+        g_activation_quant_generation = 1;
+        for (auto& entry : g_activation_quant_cache)
+            entry.generation = 0;
+    }
+}
+
 static void matmul_int8_scalar_range(const float* A, const int8_t* B,
                                      const float* scales, int group_size,
                                      int groups_per_row, float* C, int M, int N,
@@ -1123,7 +1183,15 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
         std::vector<float> a_scales;
         int K_padded =
             ((K + MATMUL_Q8_BLOCK - 1) / MATMUL_Q8_BLOCK) * MATMUL_Q8_BLOCK;
-        if (fp8_activation) {
+        const std::vector<int8_t>* qA_source = &qA;
+        const std::vector<float>* scale_source = &a_scales;
+        if (fp8_activation && A.storage_id != 0) {
+            const auto& cached = cached_fp8_q8_activation(
+                a_ptr, A.storage_id, K, lda,
+                use_q8_dot_gemv_repack ? K_padded : K);
+            qA_source = &cached.values;
+            scale_source = &cached.scales;
+        } else if (fp8_activation) {
             quantize_a_fp8_q8_blocks(
                 a_ptr, M, K, lda,
                 use_q8_dot_gemv_repack ? K_padded : K, qA, a_scales);
@@ -1132,8 +1200,8 @@ void matmul_dispatch_int8(const Tensor& A, const Tensor& B, Tensor& C,
                 a_ptr, M, K, lda,
                 use_q8_dot_gemv_repack ? K_padded : K, qA, a_scales);
         }
-        const int8_t* qA_data = qA.data();
-        const float* a_scales_data = a_scales.data();
+        const int8_t* qA_data = qA_source->data();
+        const float* a_scales_data = scale_source->data();
         if (!use_parallel) {
 #if defined(__ARM_FEATURE_DOTPROD)
             if (use_q8_dot_gemv_repack) {

@@ -1614,6 +1614,86 @@ kernel void gemv_selected_experts_bg32_i8a_i4b_f32c(
     }
 }
 
+// Resident W8PC selected-expert GEMV. One SIMD group evaluates eight output
+// rows while reusing each int8 activation vector across all rows. Weight and
+// activation scales are both per row, so the whole K reduction stays int32.
+kernel void gemv_selected_experts_w8_i8a_i8b_f32c(
+    device const int8_t* A [[buffer(0)]],
+    device const int8_t* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant SelectedW4A8Params& p [[buffer(3)]],
+    device const float* SCALE_A [[buffer(4)]],
+    device const float* SCALE_W [[buffer(5)]],
+    device const int* expert_idx [[buffer(6)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int selection = (int)tg.z;
+    const int row0 =
+        ((int)tg.x * (int)nsg + (int)sg) * 8;
+    if (selection >= p.selections || row0 >= p.N) return;
+
+    const int activation_row =
+        selection / max(p.activation_repeat, 1);
+    const int expert = expert_idx[selection];
+    device const int8_t* activation =
+        A + (ulong)activation_row * p.K;
+    int sums[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int vector_end = p.K & ~3;
+    for (int k = (int)lane * 4;
+         k + 3 < p.K; k += 128) {
+        const int4 av = int4(
+            *(device const char4*)(activation + k));
+        #pragma unroll
+        for (int channel = 0; channel < 8; ++channel) {
+            const int row = row0 + channel;
+            if (row >= p.N) continue;
+            const ulong flatrow =
+                (ulong)expert * p.rows_per_expert + row;
+            const int4 weight = int4(
+                *(device const char4*)(B + flatrow * p.K + k));
+            const int4 product = av * weight;
+            sums[channel] +=
+                product.x + product.y + product.z + product.w;
+        }
+    }
+    for (int k = vector_end + (int)lane;
+         k < p.K; k += 32) {
+        const int av = (int)activation[k];
+        #pragma unroll
+        for (int channel = 0; channel < 8; ++channel) {
+            const int row = row0 + channel;
+            if (row >= p.N) continue;
+            const ulong flatrow =
+                (ulong)expert * p.rows_per_expert + row;
+            sums[channel] += av * (int)B[flatrow * p.K + k];
+        }
+    }
+    const int4 reduced0 = simd_sum(int4(
+        sums[0], sums[1], sums[2], sums[3]));
+    const int4 reduced1 = simd_sum(int4(
+        sums[4], sums[5], sums[6], sums[7]));
+    if (lane == 0) {
+        const float activation_scale = SCALE_A[activation_row];
+        device float* output =
+            C + p.c_offset +
+            (ulong)selection * p.c_row_stride + row0;
+        #pragma unroll
+        for (int channel = 0; channel < 8; ++channel) {
+            const int row = row0 + channel;
+            if (row >= p.N) continue;
+            const ulong flatrow =
+                (ulong)expert * p.rows_per_expert + row;
+            const int dot = channel < 4
+                ? reduced0[channel]
+                : reduced1[channel - 4];
+            output[channel] =
+                (float)dot * activation_scale * SCALE_W[flatrow];
+        }
+    }
+}
+
 // Decode-specialized native BG128 GEMV. Four lanes cooperate on one
 // quantization group, so a SIMD group evaluates eight groups concurrently.
 // Each lane reads one contiguous 32-value qgi slice and reuses its activation
@@ -1693,6 +1773,187 @@ kernel void gemv_selected_slots_bg128_i8a_i4b_f32c(
                     sum * activation_scale;
         }
     }
+}
+
+constant char kMxfp4Coefficients[16] = {
+    0, 1, 2, 3, 4, 6, 8, 12,
+    0, -1, -2, -3, -4, -6, -8, -12,
+};
+
+inline int mxfp4_coefficient(uint nibble) {
+    return (int)kMxfp4Coefficients[nibble & 15u];
+}
+
+inline int4 mxfp4_coefficient4(uint4 nibble) {
+    const int4 magnitude = int4(nibble & uint4(7u));
+    int4 coefficient = magnitude;
+    coefficient += select(int4(0), int4(1), magnitude >= int4(5));
+    coefficient += select(int4(0), int4(1), magnitude >= int4(6));
+    coefficient += select(int4(0), int4(3), magnitude >= int4(7));
+    return select(
+        coefficient, -coefficient, (nibble & uint4(8u)) != uint4(0u));
+}
+
+inline float decode_e8m0_metal(uint code) {
+    const uint bits = code == 0u ? (1u << 22) : (code << 23);
+    return as_type<float>(bits);
+}
+
+inline float round_bf16_metal(float value) {
+    uint bits = as_type<uint>(value);
+    const uint exponent = bits & 0x7f800000u;
+    if (exponent == 0x7f800000u) return value;
+    bits += 0x7fffu + ((bits >> 16) & 1u);
+    return as_type<float>(bits & 0xffff0000u);
+}
+
+// Fast MXFP4 path: one K32 activation scale exactly matches one E8M0 weight
+// scale. The SIMD group forms eight signed integer dots in parallel and only
+// converts the eight reduced sums to FP32.
+kernel void gemv_selected_slots_mxfp4_i8a_f32c(
+    device const int8_t* A [[buffer(0)]],
+    device const uint8_t* B [[buffer(1)]],
+    device float* C [[buffer(2)]],
+    constant SelectedMxfp4Params& p [[buffer(3)]],
+    device const float* activation_scales [[buffer(4)]],
+    device const int8_t* residual_A [[buffer(5)]],
+    device const ulong* weight_offsets [[buffer(6)]],
+    device const uint* selection_indices [[buffer(7)]],
+    device const float* residual_scales [[buffer(8)]],
+    threadgroup int8_t* activation_cache [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint3 threads [[threads_per_threadgroup]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]]) {
+    const int ordered_selection = (int)tg.z;
+    const int row0 = (int)tg.x * 64 + (int)sg * 16;
+    if (ordered_selection >= p.selections || row0 >= p.N) return;
+    // Two adjacent lanes cooperate on one output row. Each lane consumes 16
+    // adjacent K values (eight packed FP4 bytes), so every weight byte is read
+    // exactly once and a K32 block needs only one shuffle.
+    const int row_in_simdgroup = (int)lane >> 1;
+    const int lane_in_row = (int)lane & 1;
+    const int row = row0 + row_in_simdgroup;
+    const int weight_row = min(row, p.N - 1);
+    const int selection = (int)selection_indices[ordered_selection];
+    const int activation_row =
+        selection / max(p.activation_repeat, 1);
+    device const int8_t* activation_source =
+        A + (ulong)activation_row * p.K;
+    device const int8_t* residual_source =
+        residual_A + (ulong)activation_row * p.K;
+    threadgroup int8_t* activation = activation_cache;
+    threadgroup int8_t* residual_activation =
+        activation_cache + p.K;
+    threadgroup float* cached_scales =
+        (threadgroup float*)(activation_cache + 2 * p.K);
+    threadgroup float* cached_residual_scales =
+        cached_scales + p.groups_per_row;
+    for (uint index = tid; index < (uint)p.K; index += threads.x) {
+        activation[index] = activation_source[index];
+        residual_activation[index] = residual_source[index];
+    }
+    for (uint index = tid; index < (uint)p.groups_per_row;
+         index += threads.x) {
+        cached_scales[index] = activation_scales[
+            (ulong)activation_row * p.groups_per_row + index];
+        cached_residual_scales[index] = residual_scales[
+            (ulong)activation_row * p.groups_per_row + index];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    device const uint8_t* weight =
+        B + weight_offsets[ordered_selection];
+    const ulong data_bytes = (ulong)p.N * (ulong)(p.K / 2);
+    device const uint8_t* scales = weight + data_bytes;
+    float sum = 0.0f;
+
+    for (int group = 0; group < p.groups_per_row; ++group) {
+        const int k0 = group * 32 + lane_in_row * 16;
+        const ulong packed_offset =
+            (ulong)weight_row * (p.K / 2) + (ulong)(k0 >> 1);
+        const uchar4 packed0 =
+            *(device const uchar4*)(weight + packed_offset);
+        const uchar4 packed1 =
+            *(device const uchar4*)(weight + packed_offset + 4u);
+        const int4 low0 = mxfp4_coefficient4(uint4(packed0 & uchar4(15u)));
+        const int4 high0 = mxfp4_coefficient4(uint4(packed0 >> 4));
+        const int4 low1 = mxfp4_coefficient4(uint4(packed1 & uchar4(15u)));
+        const int4 high1 = mxfp4_coefficient4(uint4(packed1 >> 4));
+
+        const char4 a0 = *(threadgroup const char4*)(activation + k0);
+        const char4 a1 = *(threadgroup const char4*)(activation + k0 + 4);
+        const char4 a2 = *(threadgroup const char4*)(activation + k0 + 8);
+        const char4 a3 = *(threadgroup const char4*)(activation + k0 + 12);
+        const int4 even0 = int4(char4(a0.xz, a1.xz));
+        const int4 odd0 = int4(char4(a0.yw, a1.yw));
+        const int4 even1 = int4(char4(a2.xz, a3.xz));
+        const int4 odd1 = int4(char4(a2.yw, a3.yw));
+
+        const char4 r0 =
+            *(threadgroup const char4*)(residual_activation + k0);
+        const char4 r1 =
+            *(threadgroup const char4*)(residual_activation + k0 + 4);
+        const char4 r2 =
+            *(threadgroup const char4*)(residual_activation + k0 + 8);
+        const char4 r3 =
+            *(threadgroup const char4*)(residual_activation + k0 + 12);
+        const int4 residual_even0 = int4(char4(r0.xz, r1.xz));
+        const int4 residual_odd0 = int4(char4(r0.yw, r1.yw));
+        const int4 residual_even1 = int4(char4(r2.xz, r3.xz));
+        const int4 residual_odd1 = int4(char4(r2.yw, r3.yw));
+
+        const int4 primary_products =
+            even0 * low0 + odd0 * high0 +
+            even1 * low1 + odd1 * high1;
+        const int4 residual_products =
+            residual_even0 * low0 + residual_odd0 * high0 +
+            residual_even1 * low1 + residual_odd1 * high1;
+        int dot = primary_products.x + primary_products.y +
+                  primary_products.z + primary_products.w;
+        int residual_dot =
+            residual_products.x + residual_products.y +
+            residual_products.z + residual_products.w;
+        dot += simd_shuffle_down(dot, 1);
+        residual_dot += simd_shuffle_down(residual_dot, 1);
+        if (lane_in_row == 0 && row < p.N) {
+            const float a_scale = cached_scales[group];
+            const float residual_scale = cached_residual_scales[group];
+            const uint scale_code = scales[
+                (ulong)weight_row * p.groups_per_row + group];
+            sum +=
+                ((float)dot * a_scale +
+                 (float)residual_dot * residual_scale) *
+                (0.5f * decode_e8m0_metal(scale_code));
+        }
+    }
+    if (lane_in_row == 0 && row < p.N)
+        C[(ulong)selection * p.c_row_stride + row] =
+            round_bf16_metal(sum);
+}
+
+// DeepSeek-V4 applies route weights before the down projection and rounds the
+// routed intermediate to BF16. Keep those semantics in one lightweight pass.
+kernel void moe_swiglu_route_bf16(
+    device float* merged [[buffer(0)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device const float* topw [[buffer(4)]],
+    uint index [[thread_position_in_grid]]) {
+    const uint selection = index / (uint)p.intermediate;
+    const uint column = index - selection * (uint)p.intermediate;
+    if (selection >= (uint)(p.seq_len * p.top_k)) return;
+    const ulong base =
+        (ulong)selection * (ulong)(2 * p.intermediate);
+    float gate = round_bf16_metal(merged[base + column]);
+    float up = round_bf16_metal(
+        merged[base + (uint)p.intermediate + column]);
+    if (p.swiglu_limit > 0.0f) {
+        gate = min(gate, p.swiglu_limit);
+        up = clamp(up, -p.swiglu_limit, p.swiglu_limit);
+    }
+    const float activated =
+        (gate / (1.0f + exp(-gate))) * up * topw[selection];
+    merged[base + column] = round_bf16_metal(activated);
 }
 
 // Resident-package variant of the native BG128 selected GEMV. The whole
@@ -1991,6 +2252,194 @@ kernel void moe_finalize_grouped_dispatch(
 // implementation is instantiated with independent output tiles: paired
 // gate/up favors occupancy, while the single down projection benefits from a
 // wider tile.
+template<int NRA, int NRB, bool PAIRED_GATE_UP>
+inline void gemm_grouped_experts_w8_impl(
+    device const int8_t* A,
+    device const int8_t* B,
+    device float* C,
+    constant GroupedW4A8Params& p,
+    device const float* SCALE_A,
+    device const float* SCALE_W,
+    device const atomic_uint* expert_counts,
+    device const int* expert_routes,
+    device const uint2* grouped_jobs,
+    threadgroup int8_t* shmem,
+    uint3 tg,
+    ushort tid) {
+    constexpr int NK = 32;
+    constexpr int NUM_THREADS =
+        32 * MOLLM_GROUPED_MOE_SIMDGROUPS;
+    constexpr int projections = PAIRED_GATE_UP ? 2 : 1;
+    constexpr int projected_rows = projections * NRA;
+
+    const uint2 grouped_job = grouped_jobs[tg.x];
+    const int expert = (int)grouped_job.x;
+    if (expert >= p.experts) return;
+    const int route_begin = (int)grouped_job.y;
+    const int route_count = (int)atomic_load_explicit(
+        expert_counts + expert, memory_order_relaxed);
+    if (route_begin >= route_count) return;
+    const int row_begin = (int)tg.y * NRA;
+    if (row_begin >= p.N) return;
+
+    threadgroup int8_t* staged_w = shmem;
+    threadgroup int8_t* staged_a =
+        staged_w + projected_rows * NK;
+    auto tW = tensor(
+        staged_w, dextents<int32_t,2>(NK, projected_rows));
+    auto tA = tensor(
+        staged_a, dextents<int32_t,2>(NK, NRB));
+    matmul2d<
+        matmul2d_descriptor(
+            NRB, projected_rows, NK, false, true, true,
+            matmul2d_descriptor::mode::multiply_accumulate),
+        execution_simdgroups<MOLLM_GROUPED_MOE_SIMDGROUPS>> mm;
+    auto dot =
+        mm.template get_destination_cooperative_tensor<
+            decltype(tA), decltype(tW), int32_t>();
+
+    constexpr int UNROLL = 16;
+    constexpr int weight_work =
+        projected_rows * (NK / UNROLL);
+    constexpr int activation_work =
+        NRB * (NK / UNROLL);
+    for (int k0 = 0; k0 < p.K; k0 += NK) {
+        for (int work = (int)tid;
+             work < weight_work; work += NUM_THREADS) {
+            const int projected_row = work / (NK / UNROLL);
+            const int ksub = work % (NK / UNROLL);
+            const int projection = projected_row / NRA;
+            const int local_row = projected_row % NRA;
+            const int output_row = row_begin + local_row;
+            const int weight_row =
+                projection * p.N + output_row;
+            threadgroup int8_t* destination =
+                staged_w + projected_row * NK + ksub * UNROLL;
+            if (output_row < p.N) {
+                device const int8_t* source =
+                    B +
+                    ((ulong)expert * (ulong)p.rows_per_expert +
+                     (ulong)weight_row) * (ulong)p.K +
+                    (ulong)k0 + (ulong)ksub * UNROLL;
+                *((threadgroup ulong*)destination) =
+                    *((device const ulong*)source);
+                *((threadgroup ulong*)(destination + 8)) =
+                    *((device const ulong*)(source + 8));
+            } else {
+                *((threadgroup ulong*)destination) = 0;
+                *((threadgroup ulong*)(destination + 8)) = 0;
+            }
+        }
+        for (int work = (int)tid;
+             work < activation_work; work += NUM_THREADS) {
+            const int local_route = work / (NK / UNROLL);
+            const int ksub = work % (NK / UNROLL);
+            const int route_slot = route_begin + local_route;
+            const bool valid_route = route_slot < route_count;
+            const int selection = valid_route
+                ? expert_routes[
+                      (ulong)expert * (ulong)p.max_routes +
+                      (ulong)route_slot]
+                : 0;
+            const int activation_row = p.activation_by_token
+                ? selection / p.top_k
+                : selection;
+            threadgroup int8_t* destination =
+                staged_a + local_route * NK + ksub * UNROLL;
+            if (valid_route) {
+                device const int8_t* source =
+                    A + (ulong)activation_row * (ulong)p.K +
+                    (ulong)k0 + (ulong)ksub * UNROLL;
+                *((threadgroup ulong*)destination) =
+                    *((device const ulong*)source);
+                *((threadgroup ulong*)(destination + 8)) =
+                    *((device const ulong*)(source + 8));
+            } else {
+                *((threadgroup ulong*)destination) = 0;
+                *((threadgroup ulong*)(destination + 8)) = 0;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        auto activation_tile = tA.slice(0, 0);
+        auto weight_tile = tW.slice(0, 0);
+        mm.run(activation_tile, weight_tile, dot);
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // The staging area is dead once K is complete. Reuse it for the portable
+    // cooperative-tensor store, then dequantize and optionally fuse SwiGLU.
+    threadgroup int32_t* result = (threadgroup int32_t*)shmem;
+    auto tResult = tensor(
+        result, dextents<int32_t,2>(projected_rows, NRB));
+    dot.store(tResult);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (int work = (int)tid;
+         work < NRA * NRB; work += NUM_THREADS) {
+        const int local_route = work / NRA;
+        const int local_row = work % NRA;
+        const int route_slot = route_begin + local_route;
+        const int output_row = row_begin + local_row;
+        if (route_slot >= route_count || output_row >= p.N) continue;
+        const int selection = expert_routes[
+            (ulong)expert * (ulong)p.max_routes +
+            (ulong)route_slot];
+        const int activation_row = p.activation_by_token
+            ? selection / p.top_k
+            : selection;
+        const float activation_scale = SCALE_A[activation_row];
+        const ulong scale_base =
+            (ulong)expert * (ulong)p.rows_per_expert;
+        const int gate_dot =
+            result[local_route * projected_rows + local_row];
+        const float gate =
+            (float)gate_dot * activation_scale *
+            SCALE_W[scale_base + (ulong)output_row];
+        float value = gate;
+        if constexpr (PAIRED_GATE_UP) {
+            const int up_dot = result[
+                local_route * projected_rows + NRA + local_row];
+            const float up =
+                (float)up_dot * activation_scale *
+                SCALE_W[
+                    scale_base + (ulong)p.N +
+                    (ulong)output_row];
+            value = (gate / (1.0f + exp(-gate))) * up;
+        }
+        C[(ulong)selection * (ulong)p.c_row_stride +
+          (ulong)output_row] = value;
+    }
+}
+
+#define MOLLM_DEFINE_GROUPED_W8_KERNEL(NAME, NRA, NRB, PAIRED)          \
+kernel void NAME(                                                       \
+    device const int8_t* A [[buffer(0)]],                               \
+    device const int8_t* B [[buffer(1)]],                               \
+    device float* C [[buffer(2)]],                                      \
+    constant GroupedW4A8Params& p [[buffer(3)]],                        \
+    device const float* SCALE_A [[buffer(4)]],                          \
+    device const float* SCALE_W [[buffer(5)]],                          \
+    device const atomic_uint* expert_counts [[buffer(6)]],              \
+    device const int* expert_routes [[buffer(7)]],                      \
+    device const uint2* grouped_jobs [[buffer(8)]],                     \
+    threadgroup int8_t* shmem [[threadgroup(0)]],                       \
+    uint3 tg [[threadgroup_position_in_grid]],                           \
+    ushort tid [[thread_index_in_threadgroup]]) {                       \
+    gemm_grouped_experts_w8_impl<NRA, NRB, PAIRED>(                    \
+        A, B, C, p, SCALE_A, SCALE_W, expert_counts, expert_routes,    \
+        grouped_jobs, shmem, tg, tid);                                  \
+}
+
+MOLLM_DEFINE_GROUPED_W8_KERNEL(
+    gemm_grouped_experts_w8_gate_up_r16, 32, 16, true)
+MOLLM_DEFINE_GROUPED_W8_KERNEL(
+    gemm_grouped_experts_w8_gate_up_r32, 32, 32, true)
+MOLLM_DEFINE_GROUPED_W8_KERNEL(
+    gemm_grouped_experts_w8_down_r16, 64, 16, false)
+MOLLM_DEFINE_GROUPED_W8_KERNEL(
+    gemm_grouped_experts_w8_down_r32, 64, 32, false)
+
+#undef MOLLM_DEFINE_GROUPED_W8_KERNEL
+
 template<int NRA, int NRB, bool PAIRED_GATE_UP>
 inline void gemm_grouped_experts_bg128_impl(
     device const int8_t* A,
@@ -3940,6 +4389,162 @@ kernel void moe_gate_up_w4(
     }
 }
 
+// Resident W8 selected-expert projection. One SIMD group owns eight output
+// rows and reuses every activation float4 across them. Four independent SIMD
+// groups therefore cover 32 rows per threadgroup without shared memory or
+// cross-SIMD barriers.
+kernel void moe_gate_up_w8(
+    device const float* x [[buffer(0)]],
+    device const int8_t* w [[buffer(1)]],
+    device float* merged [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]],
+    device const int* idx [[buffer(5)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int row0 = ((int)tg.x * (int)nsg + (int)sg) * 8;
+    const int ktop = (int)tg.y;
+    const int t = (int)tg.z;
+    if (row0 >= 2 * p.intermediate) return;
+    const int expert = idx[t * p.top_k + ktop];
+    device const float* activation =
+        x + p.hidden_offset + (ulong)t * p.hidden_row_stride;
+    float4 total0 = 0.0f;
+    float4 total1 = 0.0f;
+    for (int group = 0; group < p.gu_groups_per_row; ++group) {
+        const int begin = group * p.gu_group_size;
+        const int end = min(begin + p.gu_group_size, p.hidden);
+        const int vector_end = end & ~3;
+        float lane_sums[8] = {
+            0.0f, 0.0f, 0.0f, 0.0f,
+            0.0f, 0.0f, 0.0f, 0.0f};
+        for (int k = begin + (int)lane * 4;
+             k + 3 < end; k += 128) {
+            const float4 av =
+                *(device const float4*)(activation + k);
+            #pragma unroll
+            for (int channel = 0; channel < 8; ++channel) {
+                const int row = row0 + channel;
+                if (row >= 2 * p.intermediate) continue;
+                const ulong flatrow =
+                    (ulong)expert * (2 * p.intermediate) + row;
+                const char4 wv = *(device const char4*)(
+                    w + flatrow * p.hidden + k);
+                lane_sums[channel] += dot(av, float4(wv));
+            }
+        }
+        for (int k = vector_end + (int)lane;
+             k < end; k += 32) {
+            const float av = activation[k];
+            #pragma unroll
+            for (int channel = 0; channel < 8; ++channel) {
+                const int row = row0 + channel;
+                if (row >= 2 * p.intermediate) continue;
+                const ulong flatrow =
+                    (ulong)expert * (2 * p.intermediate) + row;
+                lane_sums[channel] +=
+                    av * (float)w[flatrow * p.hidden + k];
+            }
+        }
+        const float4 reduced0 = simd_sum(float4(
+            lane_sums[0], lane_sums[1],
+            lane_sums[2], lane_sums[3]));
+        const float4 reduced1 = simd_sum(float4(
+            lane_sums[4], lane_sums[5],
+            lane_sums[6], lane_sums[7]));
+        float4 weight_scale0 = 0.0f;
+        float4 weight_scale1 = 0.0f;
+        #pragma unroll
+        for (int channel = 0; channel < 8; ++channel) {
+            const int row = row0 + channel;
+            if (row >= 2 * p.intermediate) continue;
+            const ulong flatrow =
+                (ulong)expert * (2 * p.intermediate) + row;
+            if (channel < 4)
+                weight_scale0[channel] =
+                    scales[flatrow * p.gu_groups_per_row + group];
+            else
+                weight_scale1[channel - 4] =
+                    scales[flatrow * p.gu_groups_per_row + group];
+        }
+        total0 += reduced0 * weight_scale0;
+        total1 += reduced1 * weight_scale1;
+    }
+    if (lane == 0) {
+        device float* output =
+            merged + ((ulong)t * p.top_k + ktop) *
+                         (2 * p.intermediate) + row0;
+        if (row0 + 8 <= 2 * p.intermediate) {
+            *(device float4*)(output + 0) = total0;
+            *(device float4*)(output + 4) = total1;
+        } else {
+            #pragma unroll
+            for (int channel = 0; channel < 8; ++channel)
+                if (row0 + channel < 2 * p.intermediate)
+                    output[channel] = channel < 4
+                        ? total0[channel]
+                        : total1[channel - 4];
+        }
+    }
+}
+
+inline float moe_w8_dot_precise(
+    device const float* activation,
+    device const int8_t* weight,
+    float weight_scale, int K,
+    ushort lane, ushort sg, ushort nsg) {
+    float sum = 0.0f;
+    for (int k = (int)sg * 32 + (int)lane;
+         k < K; k += (int)nsg * 32)
+        sum += activation[k] * (float)weight[k];
+    return simd_sum(sum) * weight_scale;
+}
+
+// Decode retains the original two-level reduction and four-row scheduling
+// exactly so autoregressive numerics remain unchanged.
+kernel void moe_gate_up_w8_precise(
+    device const float* x [[buffer(0)]],
+    device const int8_t* w [[buffer(1)]],
+    device float* merged [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]],
+    device const int* idx [[buffer(5)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint3 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int row0 = (int)tg.x * 4;
+    const int ktop = (int)tg.y;
+    const int t = (int)tg.z;
+    if (row0 >= 2 * p.intermediate) return;
+    const int expert = idx[t * p.top_k + ktop];
+    device const float* activation =
+        x + p.hidden_offset + (ulong)t * p.hidden_row_stride;
+    for (int channel = 0; channel < 4; ++channel) {
+        const int row = row0 + channel;
+        if (row >= 2 * p.intermediate) break;
+        const ulong flatrow =
+            (ulong)expert * (2 * p.intermediate) + row;
+        const float value = moe_w8_dot_precise(
+            activation, w + flatrow * p.hidden,
+            scales[flatrow * p.gu_groups_per_row],
+            p.hidden, lane, sg, nsg);
+        if (lane == 0) scratch[sg] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (sg == 0) {
+            float reduced = lane < nsg ? scratch[lane] : 0.0f;
+            reduced = simd_sum(reduced);
+            if (lane == 0)
+                merged[((ulong)t * p.top_k + ktop) *
+                           (2 * p.intermediate) + row] = reduced;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void moe_swiglu_selected(
     device float* merged [[buffer(0)]], constant MoeW4Params& p [[buffer(3)]],
     uint i [[thread_position_in_grid]]) {
@@ -3947,6 +4552,60 @@ kernel void moe_swiglu_selected(
     if(block>=(uint)(p.seq_len*p.top_k))return;ulong base=(ulong)block*(2*p.intermediate);
     float g=merged[base+j],u=merged[base+p.intermediate+j];
     merged[base+j]=(g/(1.0f+exp(-g)))*u;
+}
+
+// W8PC decode fusion. Compute one selected expert's SwiGLU row, derive a
+// single activation scale, and write int8 directly. This preserves the W8PC
+// per-row quantization contract while avoiding an FP32 activated round trip.
+kernel void moe_swiglu_quantize_row(
+    device const float* merged [[buffer(0)]],
+    device int8_t* quantized [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device float* scales [[buffer(4)]],
+    uint selection [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]],
+    threadgroup float* shmem [[threadgroup(0)]]) {
+    const uint selections = (uint)(p.seq_len * p.top_k);
+    if (selection >= selections) return;
+    const ulong base =
+        (ulong)selection * (ulong)(2 * p.intermediate);
+    float local_amax = 0.0f;
+    for (uint j = (uint)sg * 32u + (uint)lane;
+         j < (uint)p.intermediate;
+         j += (uint)nsg * 32u) {
+        const float gate = merged[base + j];
+        const float up = merged[base + (uint)p.intermediate + j];
+        const float value =
+            (gate / (1.0f + exp(-gate))) * up;
+        local_amax = max(local_amax, fabs(value));
+    }
+    local_amax = simd_max(local_amax);
+    if (lane == 0) shmem[sg] = local_amax;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        float value = lane < nsg ? shmem[lane] : 0.0f;
+        value = simd_max(value);
+        if (lane == 0) shmem[0] = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float amax = shmem[0];
+    const float scale = amax / 127.0f;
+    const float inverse = amax > 0.0f ? 127.0f / amax : 0.0f;
+    if (sg == 0 && lane == 0) scales[selection] = scale;
+    device int8_t* output =
+        quantized + (ulong)selection * (ulong)p.intermediate;
+    for (uint j = (uint)sg * 32u + (uint)lane;
+         j < (uint)p.intermediate;
+         j += (uint)nsg * 32u) {
+        const float gate = merged[base + j];
+        const float up = merged[base + (uint)p.intermediate + j];
+        const float value =
+            (gate / (1.0f + exp(-gate))) * up;
+        output[j] = (int8_t)clamp(
+            (int)rint(value * inverse), -127, 127);
+    }
 }
 
 // Resident BG128 decode fusion: compute SwiGLU and immediately quantize each
@@ -4132,6 +4791,158 @@ kernel void moe_down_combine_w4(
     }
 }
 
+kernel void moe_down_combine_w8(
+    device const float* merged [[buffer(0)]],
+    device const int8_t* w [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]],
+    device const int* idx [[buffer(5)]],
+    device const float* topw [[buffer(6)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int d0 = ((int)tg.x * (int)nsg + (int)sg) * 8;
+    const int t = (int)tg.y;
+    if (d0 >= p.hidden) return;
+    float4 total0 = 0.0f;
+    float4 total1 = 0.0f;
+    for (int q = 0; q < p.top_k; ++q) {
+        const int expert = idx[t * p.top_k + q];
+        const ulong selection = (ulong)t * p.top_k + q;
+        device const float* activation =
+            merged + selection * (2 * p.intermediate);
+        float4 expert0 = 0.0f;
+        float4 expert1 = 0.0f;
+        for (int group = 0; group < p.down_groups_per_row; ++group) {
+            const int begin = group * p.down_group_size;
+            const int end = min(
+                begin + p.down_group_size, p.intermediate);
+            const int vector_end = end & ~3;
+            float lane_sums[8] = {
+                0.0f, 0.0f, 0.0f, 0.0f,
+                0.0f, 0.0f, 0.0f, 0.0f};
+            for (int k = begin + (int)lane * 4;
+                 k + 3 < end; k += 128) {
+                const float4 av =
+                    *(device const float4*)(activation + k);
+                #pragma unroll
+                for (int channel = 0; channel < 8; ++channel) {
+                    const int d = d0 + channel;
+                    if (d >= p.hidden) continue;
+                    const ulong row =
+                        (ulong)expert * p.hidden + d;
+                    const char4 wv = *(device const char4*)(
+                        w + row * p.intermediate + k);
+                    lane_sums[channel] += dot(av, float4(wv));
+                }
+            }
+            for (int k = vector_end + (int)lane;
+                 k < end; k += 32) {
+                const float av = activation[k];
+                #pragma unroll
+                for (int channel = 0; channel < 8; ++channel) {
+                    const int d = d0 + channel;
+                    if (d >= p.hidden) continue;
+                    const ulong row =
+                        (ulong)expert * p.hidden + d;
+                    lane_sums[channel] +=
+                        av * (float)w[row * p.intermediate + k];
+                }
+            }
+            const float4 reduced0 = simd_sum(float4(
+                lane_sums[0], lane_sums[1],
+                lane_sums[2], lane_sums[3]));
+            const float4 reduced1 = simd_sum(float4(
+                lane_sums[4], lane_sums[5],
+                lane_sums[6], lane_sums[7]));
+            float4 weight_scale0 = 0.0f;
+            float4 weight_scale1 = 0.0f;
+            #pragma unroll
+            for (int channel = 0; channel < 8; ++channel) {
+                const int d = d0 + channel;
+                if (d >= p.hidden) continue;
+                const ulong row =
+                    (ulong)expert * p.hidden + d;
+                if (channel < 4)
+                    weight_scale0[channel] =
+                        scales[row * p.down_groups_per_row + group];
+                else
+                    weight_scale1[channel - 4] =
+                        scales[row * p.down_groups_per_row + group];
+            }
+            expert0 += reduced0 * weight_scale0;
+            expert1 += reduced1 * weight_scale1;
+        }
+        const float route_weight = topw[selection];
+        total0 += expert0 * route_weight;
+        total1 += expert1 * route_weight;
+    }
+    if (lane == 0) {
+        device float* output =
+            out + p.output_offset +
+            (ulong)t * p.output_row_stride + d0;
+        if (d0 + 8 <= p.hidden) {
+            *(device float4*)(output + 0) = total0;
+            *(device float4*)(output + 4) = total1;
+        } else {
+            #pragma unroll
+            for (int channel = 0; channel < 8; ++channel)
+                if (d0 + channel < p.hidden)
+                    output[channel] = channel < 4
+                        ? total0[channel]
+                        : total1[channel - 4];
+        }
+    }
+}
+
+kernel void moe_down_combine_w8_precise(
+    device const float* merged [[buffer(0)]],
+    device const int8_t* w [[buffer(1)]],
+    device float* out [[buffer(2)]],
+    constant MoeW4Params& p [[buffer(3)]],
+    device const float* scales [[buffer(4)]],
+    device const int* idx [[buffer(5)]],
+    device const float* topw [[buffer(6)]],
+    threadgroup float* scratch [[threadgroup(0)]],
+    uint2 tg [[threadgroup_position_in_grid]],
+    ushort lane [[thread_index_in_simdgroup]],
+    ushort sg [[simdgroup_index_in_threadgroup]],
+    ushort nsg [[simdgroups_per_threadgroup]]) {
+    const int d0 = (int)tg.x * 4;
+    const int t = (int)tg.y;
+    if (d0 >= p.hidden) return;
+    for (int channel = 0; channel < 4; ++channel) {
+        const int d = d0 + channel;
+        if (d >= p.hidden) break;
+        float total = 0.0f;
+        for (int q = 0; q < p.top_k; ++q) {
+            const int expert = idx[t * p.top_k + q];
+            const ulong selection = (ulong)t * p.top_k + q;
+            const ulong row = (ulong)expert * p.hidden + d;
+            const float value = moe_w8_dot_precise(
+                merged + selection * (2 * p.intermediate),
+                w + row * p.intermediate,
+                scales[row * p.down_groups_per_row],
+                p.intermediate, lane, sg, nsg);
+            if (lane == 0) scratch[sg] = value;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (sg == 0) {
+                float reduced = lane < nsg ? scratch[lane] : 0.0f;
+                reduced = simd_sum(reduced);
+                if (lane == 0)
+                    total += reduced * topw[selection];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+        if (sg == 0 && lane == 0)
+            out[p.output_offset +
+                (ulong)t * p.output_row_stride + d] = total;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 // Per-token int8 quantization of activations for the W8A8 GEMM.
 //   in : fp32 A[M,K], element (m,k) at a_offset + m*a_row_stride + k
 //   out: int8 A_i8[M,K] contiguous (a_i8[m*K + k]) + fp32 scale_a[M]
@@ -4209,6 +5020,96 @@ kernel void quantize_act_i8_block32(
     if (k < (uint)p.K) {
         int q = clamp((int)rint(v * inv), -127, 127);
         A_I8[m * (uint)p.K + k] = (int8_t)q;
+    }
+}
+
+inline float round_fp8_e4m3fn_metal(float value) {
+    const float sign = value < 0.0f ? -1.0f : 1.0f;
+    const float magnitude = min(fabs(value), 448.0f);
+    if (magnitude < (1.0f / 64.0f))
+        return sign * min(rint(magnitude * 512.0f), 8.0f) / 512.0f;
+    const int exponent = (int)((as_type<uint>(magnitude) >> 23) & 0xffu) - 127;
+    int significand = (int)rint(ldexp(magnitude, 3 - exponent));
+    int rounded_exponent = exponent;
+    if (significand == 16) {
+        ++rounded_exponent;
+        significand = 8;
+    }
+    return sign * min(
+        ldexp((float)significand, rounded_exponent - 3), 448.0f);
+}
+
+// DeepSeek-V4 quantizes MXFP4 matmul activations through a 128-value
+// UE8M0-scaled E4M3FN block before the internal K32 Q8 representation. One
+// 128-thread group owns exactly one such block; its four SIMD groups then
+// quantize their K32 slices independently, matching the CPU path.
+kernel void quantize_act_fp8_i8_block32(
+    device const float* A        [[buffer(0)]],
+    device int8_t*      A_I8     [[buffer(2)]],
+    device float*       SCALE_A  [[buffer(4)]],
+    device int8_t*      RESIDUAL_I8 [[buffer(5)]],
+    device float*       RESIDUAL_SCALE [[buffer(6)]],
+    constant QuantActParams& p   [[buffer(3)]],
+    uint group                    [[threadgroup_position_in_grid]],
+    ushort lane                  [[thread_index_in_simdgroup]],
+    ushort sgitg                 [[simdgroup_index_in_threadgroup]],
+    ushort nsg                   [[simdgroups_per_threadgroup]])
+{
+    const uint fp8_blocks = ((uint)p.K + 127u) / 128u;
+    const uint q8_blocks = ((uint)p.K + 31u) / 32u;
+    const uint m = group / fp8_blocks;
+    const uint fp8_block = group - m * fp8_blocks;
+    if (m >= (uint)p.M) return;
+    const uint k = fp8_block * 128u + (uint)sgitg * 32u + (uint)lane;
+    device const float* row =
+        A + p.a_offset + m * (uint)p.a_row_stride;
+    const float input = k < (uint)p.K ? row[k] : 0.0f;
+
+    threadgroup float maxima[4];
+    float maximum = simd_max(fabs(input));
+    if (lane == 0) maxima[sgitg] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sgitg == 0) {
+        maximum = lane < nsg ? maxima[lane] : 0.0f;
+        maximum = simd_max(maximum);
+        if (lane == 0) maxima[0] = max(maximum, 1.0e-4f);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint bits = as_type<uint>(maxima[0]);
+    const int unbiased = (int)((bits >> 23) & 0xffu) - 127;
+    const uint mantissa = bits & 0x7fffffu;
+    const int scale_exponent = clamp(
+        unbiased - 8 + (mantissa > 0x600000u ? 1 : 0), -127, 127);
+    const uint scale_bits = scale_exponent == -127
+        ? (1u << 22)
+        : (uint)(scale_exponent + 127) << 23;
+    const float fp8_scale = as_type<float>(scale_bits);
+    const float fp8_value =
+        round_fp8_e4m3fn_metal(input / fp8_scale) * fp8_scale;
+
+    const float q8_maximum = simd_max(fabs(fp8_value));
+    const float q8_scale = q8_maximum > 0.0f
+        ? q8_maximum / 127.0f : fp8_scale;
+    const uint q8_block = fp8_block * 4u + (uint)sgitg;
+    if (lane == 0 && q8_block < q8_blocks)
+        SCALE_A[m * q8_blocks + q8_block] = q8_scale;
+    const float inverse = q8_maximum > 0.0f
+        ? 127.0f / q8_maximum : 0.0f;
+    const int primary =
+        clamp((int)rint(fp8_value * inverse), -127, 127);
+    const float residual = fp8_value - (float)primary * q8_scale;
+    const float residual_maximum = simd_max(fabs(residual));
+    const float residual_scale = residual_maximum > 0.0f
+        ? residual_maximum / 127.0f : 1.0f;
+    if (lane == 0 && q8_block < q8_blocks)
+        RESIDUAL_SCALE[m * q8_blocks + q8_block] = residual_scale;
+    if (k < (uint)p.K) {
+        A_I8[m * (uint)p.K + k] = (int8_t)primary;
+        const float residual_inverse = residual_maximum > 0.0f
+            ? 127.0f / residual_maximum : 0.0f;
+        RESIDUAL_I8[m * (uint)p.K + k] = (int8_t)clamp(
+            (int)rint(residual * residual_inverse), -127, 127);
     }
 }
 

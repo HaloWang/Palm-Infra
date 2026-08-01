@@ -57,6 +57,11 @@ void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
             inputs, weights, outputs, thread_pool)) {
         return;
     }
+    if (thread_pool && output.shape[1] == 1 &&
+        kernel_matmul_fp32_gemv_batch(
+            inputs, weights, outputs, thread_pool)) {
+        return;
+    }
     for (size_t i = 0; i < batch; ++i)
         kernel_matmul_fp32(inputs[i], weights[i], outputs[i], thread_pool);
 }

@@ -2363,6 +2363,100 @@ int main() {
               "Metal grouped native-BG32 MoE prefill matches CPU");
     }
 
+    // ---- Resident W8 MoE decode and prefill ------------------------------
+    // The production W8PC package stores expert rows and per-channel scales
+    // separately. Register one combined region so this test also exercises
+    // independent Metal buffer offsets for the two scale arrays.
+    if (mb.has_tensor_path()) {
+        constexpr int H = 128;
+        constexpr int I = 64;
+        constexpr int E = 32;
+        constexpr int TOP = 4;
+        constexpr int GU_ROWS = E * 2 * I;
+        constexpr int DOWN_ROWS = E * H;
+        constexpr size_t GU_DATA = (size_t)GU_ROWS * H;
+        constexpr size_t GU_SCALES = (size_t)GU_ROWS * sizeof(float);
+        constexpr size_t DOWN_DATA = (size_t)DOWN_ROWS * I;
+        constexpr size_t DOWN_SCALES = (size_t)DOWN_ROWS * sizeof(float);
+        std::vector<uint8_t> storage(
+            GU_DATA + GU_SCALES + DOWN_DATA + DOWN_SCALES);
+        int8_t* gu_data = reinterpret_cast<int8_t*>(storage.data());
+        float* gu_scales = reinterpret_cast<float*>(
+            storage.data() + GU_DATA);
+        int8_t* down_data = reinterpret_cast<int8_t*>(
+            storage.data() + GU_DATA + GU_SCALES);
+        float* down_scales = reinterpret_cast<float*>(
+            storage.data() + GU_DATA + GU_SCALES + DOWN_DATA);
+        for (size_t i = 0; i < GU_DATA; ++i)
+            gu_data[i] = static_cast<int8_t>((i * 17 + 5) % 31 - 15);
+        for (int row = 0; row < GU_ROWS; ++row)
+            gu_scales[row] = 0.001f * (1 + row % 7);
+        for (size_t i = 0; i < DOWN_DATA; ++i)
+            down_data[i] = static_cast<int8_t>((i * 11 + 3) % 29 - 14);
+        for (int row = 0; row < DOWN_ROWS; ++row)
+            down_scales[row] = 0.0015f * (1 + row % 5);
+
+        CHECK(mb.register_weight_region(storage.data(), storage.size()),
+              "register W8 MoE weight and scale region");
+        auto make_w8 = [&](int rows, int k, int8_t* data,
+                           float* scales) {
+            Tensor weight = Tensor::create(
+                Precision::INT8, MemoryType::EXTERNAL,
+                rows, k, 1, 1, data);
+            weight.scales = scales;
+            weight.group_size = k;
+            weight.groups_per_row = 1;
+            weight.num_groups = static_cast<uint32_t>(rows);
+            mb.wrap_weight(weight);
+            return weight;
+        };
+        Tensor gate_up = make_w8(GU_ROWS, H, gu_data, gu_scales);
+        Tensor down = make_w8(DOWN_ROWS, I, down_data, down_scales);
+        Tensor router = make_dev(mb, Precision::FP16, E, H);
+        auto* router_data = static_cast<__fp16*>(router.data);
+        for (int e = 0; e < E; ++e)
+            for (int h = 0; h < H; ++h)
+                router_data[e * H + h] = (__fp16)(
+                    0.001f * static_cast<float>((e * 13 + h * 7) % 19 - 9));
+
+        GraphNode moe;
+        moe.op_type = OpType::MOE;
+        moe.params.i32 = {
+            H, E, TOP, I, I, 0, 1, 0, 1, 1, 0, -1, -1, -1};
+        moe.params.f32 = {1.0f, 0.0f};
+
+        auto run_w8_case = [&](int seq, const char* label) {
+            Tensor x = make_dev(mb, Precision::FP32, H, seq);
+            Tensor out = make_dev(mb, Precision::FP32, H, seq);
+            fill_rand(static_cast<float*>(x.data), H * seq);
+            std::vector<const Tensor*> inputs = {
+                &x, &router, &gate_up, &down};
+            mb.begin_graph();
+            mb.dispatch(moe, inputs, &out, nullptr);
+            mb.end_graph();
+
+            std::vector<float> ref_data(H * seq);
+            Tensor ref = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                H, seq, 1, 1, ref_data.data());
+            const bool ref_ok = kernel_qwen3_moe(
+                inputs, ref, nullptr, H, E, TOP, I, I,
+                0, true, false, 1, 1, 1.0f,
+                false, -1);
+            CHECK(ref_ok, label);
+            CHECK(close(static_cast<const float*>(out.data),
+                        ref_data.data(), H * seq, 2e-4f, 3e-3f),
+                  seq == 1
+                      ? "Metal resident W8 MoE decode matches CPU"
+                      : seq >= 64
+                          ? "Metal grouped W8 MoE prefill matches CPU"
+                          : "Metal resident W8 MoE prefill matches CPU");
+        };
+        run_w8_case(1, "CPU reference W8 MoE decode");
+        run_w8_case(4, "CPU reference W8 MoE prefill");
+        run_w8_case(64, "CPU reference grouped W8 MoE prefill");
+    }
+
     if (failures == 0) printf("All Metal op parity tests passed.\n");
     return failures ? 1 : 0;
 }
