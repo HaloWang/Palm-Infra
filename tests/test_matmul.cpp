@@ -1065,8 +1065,11 @@ int main() {
             prepare_matmul_weight(
                 weights.back(), "exact_bf16_" + std::to_string(i),
                 weight_data[i].data(), packed);
-            CHECK(weights.back().fp32_bf16_data != nullptr,
-                  "exact BF16 FP32 weight builds a sidecar");
+            const bool expects_bf16_sidecar =
+                mollm::cpu::capabilities().fp16_interleaved_weights;
+            CHECK((weights.back().fp32_bf16_data != nullptr) ==
+                      expects_bf16_sidecar,
+                  "exact BF16 sidecar follows provider capability");
             outputs.push_back(Tensor::create(
                 Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
                 actual[i].data()));
