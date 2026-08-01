@@ -1025,12 +1025,15 @@ bool kernel_matmul_fp32_gemv_batch(const std::vector<Tensor>& inputs,
                 const int local_end = std::min(
                     static_cast<int>(weight.shape[0]),
                     (end - tile_offsets[i]) * 8);
+#if HAS_NEON
                 if (weight.fp32_bf16_data) {
                     matmul_bf16_neon_gemv_range(
                         input.ptr<float>(),
                         static_cast<const uint16_t*>(weight.fp32_bf16_data),
                         output.ptr<float>(), common_k, local_begin, local_end);
-                } else {
+                } else
+#endif
+                {
                     matmul_fp32_range_n(
                         input.ptr<float>(), weight.ptr<float>(),
                         output.ptr<float>(), 1,

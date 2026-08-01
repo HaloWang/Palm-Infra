@@ -465,8 +465,12 @@ inline void mxfp4_q8_dot32_dual_four(
         packed2, packed3, q_even, q_odd,
         residual_even, residual_odd,
         primary2, residual2, primary3, residual3);
-    primary = {primary0, primary1, primary2, primary3};
-    residual = {residual0, residual1, residual2, residual3};
+    const int32_t primary_values[4] = {
+        primary0, primary1, primary2, primary3};
+    const int32_t residual_values[4] = {
+        residual0, residual1, residual2, residual3};
+    primary = vld1q_s32(primary_values);
+    residual = vld1q_s32(residual_values);
     return;
 #endif
     const int8x16_t coefficient_table = {
