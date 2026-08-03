@@ -68,6 +68,7 @@ struct MetalBackend::Impl {
     void*                    weight_base   = nullptr;
     size_t                   weight_size   = 0;
     bool                     copy_weights = false;
+    bool                     dispatch_failed = false;
 
     // persistent device buffers owned by the backend (KV cache)
     std::vector<id<MTLBuffer>> persistent;
@@ -1070,10 +1071,19 @@ MetalBackend::~MetalBackend() {
 
 bool MetalBackend::available() const { return impl_ && impl_->ok; }
 
+void MetalBackend::clear_dispatch_error() {
+    impl_->dispatch_failed = false;
+}
+
+bool MetalBackend::dispatch_failed() const {
+    return impl_->dispatch_failed;
+}
+
 void MetalBackend::lm_head_gemv(const float* a_host, const Tensor& weight,
                                 float* out_host, int N, int K, int activation) {
     @autoreleasepool {
         // Standalone path used by prefill/raw-logit callers.
+        clear_dispatch_error();
         void* abuf = impl_->pool->acquire((size_t)K * 4);
         std::memcpy(MetalBufferPool::contents(abuf), a_host, (size_t)K * 4);
         lm_head_gemv_impl(abuf, 0, weight, out_host, N, K, activation,
@@ -1202,9 +1212,16 @@ void MetalBackend::lm_head_gemv_impl(
             [enc endEncoding];
             [cmd commit];
             [cmd waitUntilCompleted];
+            if (cmd.status == MTLCommandBufferStatusError) {
+                NSError* e = cmd.error;
+                fprintf(stderr, "MetalBackend: lm_head command buffer error: %s\n",
+                        e ? e.localizedDescription.UTF8String : "?");
+                impl_->dispatch_failed = true;
+            }
         }
 
-        std::memcpy(out_host, MetalBufferPool::contents(cbuf), (size_t)N * 4);
+        if (!impl_->dispatch_failed)
+            std::memcpy(out_host, MetalBufferPool::contents(cbuf), (size_t)N * 4);
         impl_->pool->release(cbuf, (size_t)N * 4);
     }
 }
@@ -1597,6 +1614,7 @@ void MetalBackend::synchronize_for_host_read() {
             NSError* e = impl_->cmd.error;
             fprintf(stderr, "MetalBackend: host-read sync failed: %s\n",
                     e ? e.localizedDescription.UTF8String : "?");
+            impl_->dispatch_failed = true;
         }
         impl_->cmd = nil;
     }
@@ -1610,6 +1628,12 @@ void MetalBackend::sync_point() {
     if (impl_->cmd) {
         [impl_->cmd commit];
         [impl_->cmd waitUntilCompleted];
+        if (impl_->cmd.status == MTLCommandBufferStatusError) {
+            NSError* e = impl_->cmd.error;
+            fprintf(stderr, "MetalBackend: sync-point command buffer error: %s\n",
+                    e ? e.localizedDescription.UTF8String : "?");
+            impl_->dispatch_failed = true;
+        }
         impl_->cmd = nil;
     }
     impl_->cmd = [impl_->queue commandBuffer];
@@ -1648,6 +1672,7 @@ void MetalBackend::end_graph() {
             NSError* e = impl_->cmd.error;
             fprintf(stderr, "MetalBackend: command buffer error: %s\n",
                     e ? e.localizedDescription.UTF8String : "?");
+            impl_->dispatch_failed = true;
         }
         if (getenv("MOLLM_METAL_GPU_TIME")) {
             double gpu_ms = (impl_->cmd.GPUEndTime - impl_->cmd.GPUStartTime) * 1000.0;
@@ -3496,7 +3521,8 @@ void MetalBackend::dispatch(const GraphNode& node,
             inputs[3]->scales_device_data;
         const bool resident_quant_prefill =
             moe_seq > 1 && !ssd_w4 && !has_shared;
-        const bool gpu_quant_moe = impl_->has_tensor && supported_router &&
+        const bool gpu_quant_moe =
+            impl_->has_tensor && supported_router &&
             inputs[1]->prec == Precision::FP16 &&
             ((inputs[2]->prec == Precision::INT4 &&
               inputs[3]->prec == Precision::INT4) || resident_w8) &&
@@ -5341,9 +5367,13 @@ void MetalBackend::dispatch(const GraphNode& node,
                 NSError* e = impl_->cmd.error;
                 fprintf(stderr, "MetalBackend: pre-MOE command buffer error: %s\n",
                         e ? e.localizedDescription.UTF8String : "?");
+                impl_->dispatch_failed = true;
             }
             impl_->cmd = nil;
         }
+
+        if (impl_->dispatch_failed)
+            return;
 
         kernel_qwen3_moe(inputs, *output, thread_pool,
                          hidden_size, num_experts, top_k,

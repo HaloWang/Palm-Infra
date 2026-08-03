@@ -228,7 +228,22 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
 
     if (src.prec == Precision::FP32 || src.prec == Precision::FP16) {
         size_t elem = precision_size(src.prec);
-        view.data = static_cast<char*>(src.data) + (size_t)row0 * (size_t)K * elem;
+        if (src.prec == Precision::FP16 && src.is_interleaved) {
+            // CPU FP16 weights are packed in 8-row tiles at load time.  An
+            // aggregate MoE tensor still uses that layout, so selecting one
+            // expert must advance by whole tiles rather than pretending the
+            // packed buffer is row-major.  Production expert widths are
+            // multiples of eight; reject an unaligned slice so callers do not
+            // silently consume scrambled weights.
+            if ((row0 & 7) != 0)
+                return false;
+            view.data = static_cast<char*>(src.data) +
+                        (size_t)(row0 / 8) * (size_t)K * 8 * elem;
+            view.is_interleaved = true;
+        } else {
+            view.data = static_cast<char*>(src.data) +
+                        (size_t)row0 * (size_t)K * elem;
+        }
         return true;
     }
 

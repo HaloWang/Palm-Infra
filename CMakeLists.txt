@@ -352,6 +352,11 @@ if(MOLLM_BUILD_EXAMPLE)
     )
     target_link_libraries(mollm_ppl PRIVATE mollm_lib)
 
+    add_executable(mollm_mcqa
+        examples/mcqa.cpp
+    )
+    target_link_libraries(mollm_mcqa PRIVATE mollm_lib)
+
     if(UNIX)
         add_executable(mollm_server
             examples/server.cpp

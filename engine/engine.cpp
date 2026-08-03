@@ -382,10 +382,12 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
     C.owner_id = graph_prefill_.runtime.pool.id();
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
+    bool lm_head_on_metal = false;
 #ifdef MOLLM_METAL
     if (finish_metal_graph) {
         assert(metal_backend_ && hidden.device_data &&
                lm_head_weight_->device_data);
+        lm_head_on_metal = true;
         as_metal(metal_backend_)
             ->lm_head_gemv_device_and_end_graph(
                 hidden, (size_t)last_pos*(size_t)hidden_dim,
@@ -394,6 +396,7 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
         (lm_head_weight_->prec == Precision::FP16 ||
          lm_head_weight_->prec == Precision::INT8 ||
          lm_head_weight_->prec == Precision::INT4)) {
+        lm_head_on_metal = true;
         as_metal(metal_backend_)
             ->lm_head_gemv(A.ptr<float>(), *lm_head_weight_, C.ptr<float>(),
                            vocab_size, hidden_dim);
@@ -403,6 +406,15 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
         kernel_matmul_fp32(A, *lm_head_weight_, C,
                            exec_ctx_decode_.thread_pool);
     }
+
+#ifdef MOLLM_METAL
+    if (lm_head_on_metal && metal_backend_->dispatch_failed()) {
+        release_pool_tensor(graph_prefill_.runtime.pool, C);
+        return -1;
+    }
+#else
+    (void)lm_head_on_metal;
+#endif
 
     float* scores = C.ptr<float>();
     int token = 0;
@@ -589,6 +601,9 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         if (!defer_metal_end)
             metal_backend_->end_graph();
 #endif
+
+    if (exec_ctx.backend->dispatch_failed())
+        exec_ctx.execution_failed = true;
 
     if (exec_ctx.execution_failed)
         return Tensor();

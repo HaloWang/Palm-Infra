@@ -326,6 +326,7 @@ class Server {
             return;
         }
         std::vector<ChatMessage> messages;
+        bool enable_thinking = true;
         try {
             for (const auto &m : req.at("messages")) {
                 std::string role = m.at("role").get<std::string>();
@@ -334,11 +335,25 @@ class Server {
                                              role);
                 messages.push_back({role, m.at("content").get<std::string>()});
             }
+            if (req.contains("chat_template_kwargs")) {
+                const auto &kwargs = req.at("chat_template_kwargs");
+                if (!kwargs.is_object())
+                    throw std::runtime_error(
+                        "chat_template_kwargs must be an object");
+                if (kwargs.contains("enable_thinking")) {
+                    if (!kwargs.at("enable_thinking").is_boolean())
+                        throw std::runtime_error(
+                            "chat_template_kwargs.enable_thinking must be a boolean");
+                    enable_thinking =
+                        kwargs.at("enable_thinking").get<bool>();
+                }
+            }
         } catch (const std::exception &ex) {
             send_error(fd, 400, ex.what(), "invalid_request_error");
             return;
         }
-        std::vector<int> full = tokenizer.apply_chat(messages);
+        std::vector<int> full =
+            tokenizer.apply_chat(messages, enable_thinking);
         if (full.empty()) {
             send_error(fd, 400, "empty prompt", "invalid_request_error");
             return;

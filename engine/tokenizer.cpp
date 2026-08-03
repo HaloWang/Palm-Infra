@@ -872,7 +872,8 @@ std::vector<int> Tokenizer::apply_chat(const std::string& user_message) const {
     return apply_chat(messages);
 }
 
-std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages) const {
+std::vector<int> Tokenizer::apply_chat(
+    const std::vector<ChatMessage>& messages, bool enable_thinking) const {
     if (format_ == Format::RWKV_WORLD) {
         if (rwkv_legacy_chat_template_) {
             // Match rwkv-mobile's legacy template exactly. Native RWKV .pth
@@ -972,8 +973,9 @@ std::vector<int> Tokenizer::apply_chat(const std::vector<ChatMessage>& messages)
             // Jinja template and are intentionally omitted by the plain chat
             // CLI, matching the tokenizer's no-tools behavior.
         }
-        prompt +=
-            "<｜Assistant｜>assistant<｜im▁middle｜><think>\n";
+        prompt += "<｜Assistant｜>assistant<｜im▁middle｜>";
+        prompt += enable_thinking ? "<think>\n"
+                                  : "<think>\n\n</think>\n\n";
     } else if (style == ChatTemplateStyle::DEEPSEEK_V4) {
         prompt = "<｜begin▁of▁sentence｜>";
         for (const auto& msg : messages) {

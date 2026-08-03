@@ -145,12 +145,30 @@ static std::vector<float> fp16_to_float(const std::vector<__fp16>& src) {
     return dst;
 }
 
+static std::vector<__fp16> interleave_fp16_rows(
+        const std::vector<__fp16>& src, int rows, int cols) {
+    const int padded_rows = ((rows + 7) / 8) * 8;
+    std::vector<__fp16> dst((size_t)padded_rows * cols, (__fp16)0.0f);
+    for (int row_base = 0; row_base < padded_rows; row_base += 8) {
+        for (int col = 0; col < cols; ++col) {
+            for (int lane = 0; lane < 8; ++lane) {
+                const int row = row_base + lane;
+                if (row < rows) {
+                    dst[(size_t)row_base * cols + (size_t)col * 8 + lane] =
+                        src[(size_t)row * cols + col];
+                }
+            }
+        }
+    }
+    return dst;
+}
+
 int main() {
     const int H = 8;
     const int M = 3;
     const int E = 5;
     const int KTOP = 2;
-    const int I = 6;
+    const int I = 8;
     const int SI = 4;
 
     std::vector<float> hidden(H * M);
@@ -226,6 +244,32 @@ int main() {
             fp16_to_float(shared_expert_gate_h),
             ref_h, H, M, E, KTOP, I, SI);
     CHECK(close_enough(out_h, ref_h, 2e-2f), "kernel_qwen3_moe FP16 weights match rounded reference");
+
+    // Model loading replaces row-major FP16 linear weights with an 8-row
+    // interleaved working layout. Aggregate expert tensors must preserve that
+    // layout when kernel_qwen3_moe selects one expert's row range.
+    std::vector<__fp16> experts_gate_up_i = interleave_fp16_rows(
+        experts_gate_up_h, E * 2 * I, H);
+    std::vector<__fp16> experts_down_i = interleave_fp16_rows(
+        experts_down_h, E * H, I);
+    Tensor gu_it = gu_ht;
+    gu_it.data = experts_gate_up_i.data();
+    gu_it.is_interleaved = true;
+    Tensor down_it = down_ht;
+    down_it.data = experts_down_i.data();
+    down_it.is_interleaved = true;
+    std::vector<float> out_i(H * M, 0.0f);
+    Tensor out_it = Tensor::create(Precision::FP32, MemoryType::EXTERNAL,
+                                   H, M, 1, 1, out_i.data());
+    std::vector<const Tensor*> inputs_i = {
+        &hidden_t, &router_ht, &gu_it, &down_it,
+        &sg_ht, &su_ht, &sd_ht, &seg_ht,
+    };
+    CHECK(kernel_qwen3_moe(inputs_i, out_it, nullptr,
+                           H, E, KTOP, I, SI),
+          "kernel_qwen3_moe accepts interleaved FP16 expert weights");
+    CHECK(close_enough(out_i, ref_h, 2e-2f),
+          "interleaved FP16 MoE expert views match rounded reference");
 
     // The SSD route must be numerically identical to the ordinary aggregate
     // expert path. Write the same FP16 expert slices to a temporary package

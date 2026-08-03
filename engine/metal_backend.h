@@ -42,6 +42,8 @@ public:
     bool dispatch_host_moe(
         const GraphNode& node, const std::vector<const Tensor*>& inputs,
         Tensor* output, ThreadPool* thread_pool, bool& success) override;
+    void clear_dispatch_error() override;
+    bool dispatch_failed() const override;
 
     void* alloc_output(Tensor& out, size_t nbytes, BufferPool* pool) override;
     void  free_output(Tensor& t, BufferPool* pool) override;

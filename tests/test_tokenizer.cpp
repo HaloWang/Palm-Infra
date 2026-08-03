@@ -186,6 +186,11 @@ int main() {
             {20, 21, 28, 24, 0, 25, 22, 29, 24, 26, 31},
             "role-middle single-turn chat template");
         check_ids(
+            tok.apply_chat({{"user", "a"}}, false),
+            {20, 21, 28, 24, 0, 25,
+             22, 29, 24, 26, 31, 31, 27, 31, 31},
+            "role-middle chat can disable thinking");
+        check_ids(
             tok.apply_chat({
                 {"system", "b"},
                 {"user", "a"},

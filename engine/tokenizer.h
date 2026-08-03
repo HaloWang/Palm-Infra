@@ -48,7 +48,8 @@ public:
 
     // Build a multi-turn prompt using the loaded model's ChatML, Llama-3, or
     // explicitly enabled legacy RWKV template.
-    std::vector<int> apply_chat(const std::vector<ChatMessage>& messages) const;
+    std::vector<int> apply_chat(const std::vector<ChatMessage>& messages,
+                                bool enable_thinking = true) const;
 
 private:
     enum class Format { HF_BPE, RWKV_WORLD } format_ = Format::HF_BPE;

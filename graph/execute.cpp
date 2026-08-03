@@ -552,8 +552,13 @@ void execute_graph(ExecContext& ctx) {
              ctx.moe_hash_cross_layer_prefetch) &&
             node.op_type == OpType::MOE && inputs.size() >= 4 && inputs[0] &&
             inputs[0]->shape[1] == 1) {
-            if (device_resident)
+            if (device_resident) {
                 ctx.backend->synchronize_for_host_read();
+                if (ctx.backend->dispatch_failed()) {
+                    ctx.execution_failed = true;
+                    return;
+                }
+            }
             const auto next_it = std::find_if(nodes.begin() + static_cast<ptrdiff_t>(i + 1),
                                               nodes.end(),
                                               [](const auto& candidate) {
@@ -683,7 +688,14 @@ void execute_graph(ExecContext& ctx) {
         // environment for every graph node in normal inference.
         static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
         if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
-            const float* d = (const float*)out.data;
+            // Device views keep the allocation base in `data` and carry their
+            // byte displacement separately in `device_offset`. Account for
+            // that here so SLICE/PERMUTE diagnostics inspect the view rather
+            // than repeatedly printing the start of the parent buffer.
+            const auto* bytes = static_cast<const uint8_t*>(out.data);
+            if (device_resident && out.device_data)
+                bytes += out.device_offset;
+            const float* d = reinterpret_cast<const float*>(bytes);
             double sum = 0.0, sum_sq = 0.0;
             float max_abs = 0.0f;
             for (int64_t j = 0; j < out.nelements(); ++j) {
