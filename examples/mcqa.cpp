@@ -45,7 +45,9 @@ void usage(const char* argv0) {
     std::fprintf(
         stderr,
         "Usage: %s --package model.mollm --data questions.jsonl [options]\n"
-        "Each JSONL row needs {\"prompt\": string, \"gold\": \"A\"..\"D\"}.\n"
+        "Each JSONL row needs {\"prompt\": string, \"gold\": \"A\"..\"J\"}.\n"
+        "An optional \"choices\" string selects the allowed labels "
+        "(default: \"ABCD\").\n"
         "Options:\n"
         "  --output results.jsonl\n"
         "  --limit N\n"
@@ -124,10 +126,21 @@ bool parse_args(int argc, char** argv, Options& opts) {
     return true;
 }
 
-char parse_gold(const json& doc) {
+std::string parse_choices(const json& doc) {
+    const std::string choices = doc.value("choices", std::string("ABCD"));
+    if (choices.empty() || choices.size() > 10)
+        return {};
+    for (size_t i = 0; i < choices.size(); ++i) {
+        if (choices[i] != static_cast<char>('A' + i))
+            return {};
+    }
+    return choices;
+}
+
+char parse_gold(const json& doc, const std::string& choices) {
     const std::string gold = doc.at("gold").get<std::string>();
     for (char ch : gold) {
-        if (ch >= 'A' && ch <= 'D')
+        if (choices.find(ch) != std::string::npos)
             return ch;
     }
     return '\0';
@@ -164,6 +177,21 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    size_t max_choice_count = 0;
+    for (size_t index = 0; index < docs.size(); ++index) {
+        const std::string choices = parse_choices(docs[index]);
+        if (choices.empty()) {
+            std::fprintf(stderr, "mcqa: row %zu has invalid choices\n", index);
+            return 1;
+        }
+        if (!parse_gold(docs[index], choices)) {
+            std::fprintf(stderr, "mcqa: row %zu has invalid gold label\n",
+                         index);
+            return 1;
+        }
+        max_choice_count = std::max(max_choice_count, choices.size());
+    }
+
     LLMEngine engine;
     EngineConfig cfg;
     cfg.package_path = opts.package_path;
@@ -191,7 +219,8 @@ int main(int argc, char** argv) {
     }
 
     std::vector<int> choice_ids;
-    for (char label = 'A'; label <= 'D'; ++label) {
+    for (size_t choice = 0; choice < max_choice_count; ++choice) {
+        const char label = static_cast<char>('A' + choice);
         const std::vector<int> ids = tokenizer.encode(std::string(1, label));
         if (ids.size() != 1) {
             std::fprintf(stderr,
@@ -201,8 +230,12 @@ int main(int argc, char** argv) {
         }
         choice_ids.push_back(ids[0]);
     }
-    std::printf("choice_token_ids=A:%d,B:%d,C:%d,D:%d\n",
-                choice_ids[0], choice_ids[1], choice_ids[2], choice_ids[3]);
+    std::printf("choice_token_ids=");
+    for (size_t i = 0; i < choice_ids.size(); ++i) {
+        std::printf("%s%c:%d", i ? "," : "",
+                    static_cast<char>('A' + i), choice_ids[i]);
+    }
+    std::printf("\n");
 
     int prefill_chunk = 256;
     const auto prefill_it =
@@ -228,7 +261,12 @@ int main(int argc, char** argv) {
     auto eval_start = std::chrono::steady_clock::now();
     for (size_t index = 0; index < docs.size(); ++index) {
         const json& doc = docs[index];
-        const char gold = parse_gold(doc);
+        const std::string choices = parse_choices(doc);
+        if (choices.empty()) {
+            std::fprintf(stderr, "mcqa: row %zu has invalid choices\n", index);
+            return 1;
+        }
+        const char gold = parse_gold(doc, choices);
         if (!gold) {
             std::fprintf(stderr, "mcqa: row %zu has invalid gold label\n", index);
             return 1;
@@ -267,24 +305,28 @@ int main(int argc, char** argv) {
         }
 
         int selected = 0;
-        std::vector<float> scores(4);
-        for (int choice = 0; choice < 4; ++choice) {
+        std::vector<float> scores(choices.size());
+        std::vector<int> row_choice_ids(choices.size());
+        for (size_t choice = 0; choice < choices.size(); ++choice) {
             const int token = choice_ids[choice];
             if (token < 0 || token >= static_cast<int>(logits.size())) {
                 std::fprintf(stderr, "mcqa: choice token outside vocabulary\n");
                 return 1;
             }
+            row_choice_ids[choice] = token;
             scores[choice] = logits[token];
             if (scores[choice] > scores[selected])
-                selected = choice;
+                selected = static_cast<int>(choice);
         }
         const char answer = static_cast<char>('A' + selected);
         const bool is_correct = answer == gold;
         correct += is_correct ? 1 : 0;
         answered++;
-        std::printf("%3zu gold=%c answer=%c correct=%s scores=%.6f,%.6f,%.6f,%.6f\n",
-                    index, gold, answer, is_correct ? "true" : "false",
-                    scores[0], scores[1], scores[2], scores[3]);
+        std::printf("%3zu gold=%c answer=%c correct=%s scores=",
+                    index, gold, answer, is_correct ? "true" : "false");
+        for (size_t choice = 0; choice < scores.size(); ++choice)
+            std::printf("%s%.6f", choice ? "," : "", scores[choice]);
+        std::printf("\n");
         std::fflush(stdout);
         if (output) {
             json row = {
@@ -292,7 +334,7 @@ int main(int argc, char** argv) {
                 {"gold", std::string(1, gold)},
                 {"answer", std::string(1, answer)},
                 {"correct", is_correct},
-                {"choice_token_ids", choice_ids},
+                {"choice_token_ids", row_choice_ids},
                 {"choice_logits", scores},
                 {"prompt_tokens", tokens.size()},
             };
