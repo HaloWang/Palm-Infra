@@ -14,7 +14,7 @@
 //   ------  ----   -----
 //   0       4      magic   — 0x50414D58 ("XMAP")
 //   4       4      flags
-//                      bit 0: INT4 data is q4dot layout [N/8,K/32,8,16B]
+//                      bit 0: reserved legacy Q4DOT package layout
 //                      bit 1: INT4 data is BG128 layout [N/8,K/128] blocks:
 //                             float scales[8] + q4dot q[4][8][16B]
 //                      bit 2: INT4 data is BG32 layout [N/8,K/32] blocks:
@@ -43,7 +43,7 @@
 class MappedFile {
 public:
     static constexpr uint32_t MAGIC = 0x50414D58; // "XMAP"
-    static constexpr uint32_t FLAG_INT4_Q4DOT = 1u << 0;
+    static constexpr uint32_t FLAG_INT4_Q4DOT_LEGACY = 1u << 0;
     static constexpr uint32_t FLAG_INT4_BG128 = 1u << 1;
     static constexpr uint32_t FLAG_INT4_BG32 = 1u << 2;
     static constexpr uint32_t FLAG_FP8_BLOCK128 = 1u << 3;

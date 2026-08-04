@@ -33,8 +33,8 @@ struct MoeSsdTensorSpec {
     uint64_t data_offset = 0;       // absolute package-file offset
     uint64_t data_bytes = 0;        // per-expert bytes
     uint64_t scales_offset = 0;     // absolute package-file offset
-    // Per-expert sidecar bytes. May be zero for BG128 data, whose blocks
-    // already embed the scales consumed by the direct q4-dot kernels.
+    // Per-expert sidecar bytes. Zero for canonical BG32/BG128 data, whose
+    // blocks already embed their scales.
     uint64_t scales_bytes = 0;
     // Distance between consecutive experts in an interleaved storage tensor.
     // Zero retains the legacy component-major layout, where each component's

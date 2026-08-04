@@ -16,6 +16,7 @@ from transpile import (
     GraphBuilder,
     Precision,
     StreamedWeight,
+    WEIGHT_FLAG_INT4_BG32,
     WeightByteRange,
     _write_weight_file,
     save_package,
@@ -43,45 +44,40 @@ def main():
         gate_up_name = "layer0_experts_gate_up.weights"
         down_name = "layer0_experts_down.weights"
 
-        # Logical gate_up: E=2, rows_per_expert=2, K=4.
-        gate_up_q4 = np.arange(4 * 2, dtype=np.uint8)
-        gate_up_scales = np.arange(4 * 2, dtype=np.float32)
+        # Logical gate_up: E=2, rows_per_expert=8, K=32. Canonical BG32
+        # stores one self-contained 160-byte block per expert.
+        gate_up_q4 = np.arange(2 * 160, dtype=np.uint8)
         _write_weight_file(
             str(weights_dir / gate_up_name),
             gate_up_q4,
-            scales=gate_up_scales,
-            group_size=2,
-            num_groups=gate_up_scales.size,
+            group_size=32,
+            num_groups=16,
             precision=Precision.INT4,
-            logical_shape=(4, 4),
+            logical_shape=(16, 32),
+            flags=WEIGHT_FLAG_INT4_BG32,
         )
 
-        # Logical down: E=2, rows_per_expert=3, K=4.
-        down_q4 = np.arange(6 * 2, dtype=np.uint8)
-        down_scales = np.arange(6 * 2, dtype=np.float32)
+        # Logical down uses the same canonical blocks and is streamed in
+        # expert-major order without a separate scale plane.
+        down_q4 = np.arange(2 * 160, dtype=np.uint8)
         down_source = Path(tmp) / "down-source.bin"
-        down_source.write_bytes(
-            down_q4.tobytes() + down_scales.tobytes())
+        down_source.write_bytes(down_q4.tobytes())
         streamed_down = StreamedWeight(
             precision=Precision.INT4,
-            logical_shape=(6, 4),
+            logical_shape=(16, 32),
             data_ranges=[
                 WeightByteRange(str(down_source), 0, down_q4.nbytes),
             ],
-            scale_ranges=[
-                WeightByteRange(
-                    str(down_source), down_q4.nbytes,
-                    down_scales.nbytes),
-            ],
-            group_size=2,
-            num_groups=down_scales.size,
+            group_size=32,
+            num_groups=16,
+            flags=WEIGHT_FLAG_INT4_BG32,
             expert_interleave_count=2,
         )
 
         g = GraphBuilder()
-        x = g.input("x", (4, 1), prec=Precision.FP32)
-        gate_up = g.weight("./" + gate_up_name, (4, 4), Precision.INT4)
-        down = g.weight("./" + down_name, (6, 4), Precision.INT4)
+        x = g.input("x", (32, 1), prec=Precision.FP32)
+        gate_up = g.weight("./" + gate_up_name, (16, 32), Precision.INT4)
+        down = g.weight("./" + down_name, (16, 32), Precision.INT4)
         g.matmul(x, gate_up)
         g.matmul(x, down)
 
@@ -102,13 +98,13 @@ def main():
                         "num_experts": 2,
                         "gate_up": {
                             "weight": "./" + gate_up_name,
-                            "rows_per_expert": 2,
-                            "cols": 4,
+                            "rows_per_expert": 8,
+                            "cols": 32,
                         },
                         "down": {
                             "weight": "./" + down_name,
-                            "rows_per_expert": 3,
-                            "cols": 4,
+                            "rows_per_expert": 8,
+                            "cols": 32,
                         },
                     }],
                 },
@@ -122,36 +118,32 @@ def main():
         down_meta = layer["down"]
 
         assert gate_up_meta["precision"] == int(Precision.INT4)
-        assert gate_up_meta["shape"][:2] == [4, 4]
+        assert gate_up_meta["shape"][:2] == [16, 32]
         assert gate_up_meta["data_offset"] == 88
-        assert gate_up_meta["scales_offset"] == 88 + gate_up_q4.nbytes
-        assert gate_up_meta["group_size"] == 2
-        assert gate_up_meta["groups_per_row"] == 2
+        assert gate_up_meta["scales_offset"] == 0
+        assert gate_up_meta["group_size"] == 32
+        assert gate_up_meta["groups_per_row"] == 1
         assert gate_up_meta["expert_data_bytes"] == gate_up_q4.nbytes // 2
-        assert gate_up_meta["expert_scales_bytes"] == gate_up_scales.nbytes // 2
+        assert gate_up_meta["expert_scales_bytes"] == 0
 
-        assert down_meta["shape"][:2] == [6, 4]
+        assert down_meta["shape"][:2] == [16, 32]
         assert down_meta["expert_data_bytes"] == down_q4.nbytes // 2
-        assert down_meta["expert_scales_bytes"] == down_scales.nbytes // 2
-        assert down_meta["expert_stride"] == (
-            down_q4.nbytes + down_scales.nbytes) // 2
+        assert down_meta["expert_scales_bytes"] == 0
+        assert "expert_stride" not in down_meta
         assert down_meta["data_offset"] == 88
-        assert down_meta["scales_offset"] == 88 + down_q4.nbytes // 2
+        assert down_meta["scales_offset"] == 0
         assert down_meta["weight_offset"] > gate_up_meta["weight_offset"]
 
         weights_offset = read_package_weights_offset(package_path)
         with open(package_path, "rb") as package:
             package.seek(
                 weights_offset + down_meta["weight_offset"] + 88)
-            payload = package.read(down_q4.nbytes + down_scales.nbytes)
+            payload = package.read(down_q4.nbytes)
         data_per_expert = down_q4.nbytes // 2
-        scales_per_expert = down_scales.nbytes // 2
         expected = bytearray()
         for expert in range(2):
             expected += down_q4.tobytes()[
                 expert * data_per_expert:(expert + 1) * data_per_expert]
-            expected += down_scales.tobytes()[
-                expert * scales_per_expert:(expert + 1) * scales_per_expert]
         assert payload == expected
 
     print("MoE expert storage metadata tests passed")

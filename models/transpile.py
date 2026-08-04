@@ -32,7 +32,11 @@ GRAPH_MAGIC   = 0x4D4C4C47  # "GLLM"
 GRAPH_VERSION = 3  # v3: added per-node dynamic[4] (DynamicKind)
 
 WEIGHT_MAGIC  = 0x50414D58  # "XMAP"
+WEIGHT_FLAG_INT4_Q4DOT_LEGACY = 1 << 0
+WEIGHT_FLAG_INT4_BG128 = 1 << 1
+WEIGHT_FLAG_INT4_BG32 = 1 << 2
 WEIGHT_FLAG_FP8_BLOCK128 = 1 << 3
+WEIGHT_FLAG_EXPERT_INTERLEAVED = 1 << 4
 _CPP_QUANT_HELPER: str | None | bool = None
 _CPP_QUANT_HELPER_ANNOUNCED = False
 _CPP_QUANT_HELPER_MISSING_ANNOUNCED = False
@@ -1427,6 +1431,18 @@ def write_quantized_weight_file_cpp(path: str, data: np.ndarray,
                 pass
             detail = result.stderr.strip() or result.stdout.strip()
             raise RuntimeError(f"C++ quantizer failed for {path}: {detail}")
+        if quant_kind == "w4":
+            try:
+                _validate_package_weight_header(
+                    path, _read_weight_header(path))
+            except ValueError as error:
+                try:
+                    os.remove(path)
+                except FileNotFoundError:
+                    pass
+                raise RuntimeError(
+                    "C++ quantizer emitted an obsolete W4 layout; rebuild "
+                    f"mollm-quantize before conversion: {error}") from error
     finally:
         try:
             os.remove(tmp_path)
@@ -1501,10 +1517,16 @@ class StreamedWeight:
         return 88 + self.data_size + self.scales_size
 
     def header(self) -> dict:
-        interleaved = self.expert_interleave_count > 0
+        # Interleaving is only meaningful when data and an external scale
+        # sidecar must alternate per expert. Canonical BG32/BG128 W4 blocks
+        # embed their scales, so their expert-major data is already directly
+        # consumable by both resident and SSD-backed runtimes.
+        interleaved = (
+            self.expert_interleave_count > 0 and self.scales_size > 0)
         data_size = self.data_size + self.scales_size if interleaved else self.data_size
         scales_size = 0 if interleaved else self.scales_size
-        flags = self.flags | ((1 << 4) if interleaved else 0)
+        flags = self.flags | (
+            WEIGHT_FLAG_EXPERT_INTERLEAVED if interleaved else 0)
         raw = _weight_header_bytes(
             flags=flags, ndim=len(self.logical_shape),
             precision=self.precision, shape=self.logical_shape,
@@ -1556,7 +1578,9 @@ class StreamedWeight:
             precision=self.precision, shape=self.logical_shape,
             data_size=header["data_size"], scales_size=header["scales_size"],
             group_size=self.group_size, num_groups=self.num_groups))
-        if self.expert_interleave_count <= 0:
+        interleaved = (
+            self.expert_interleave_count > 0 and self.scales_size > 0)
+        if not interleaved:
             self._copy_ranges(output, self.data_ranges)
             self._copy_ranges(output, self.scale_ranges)
             return
@@ -1624,6 +1648,32 @@ def _write_weight_file(path: str, data: np.ndarray,
     ndim = len(logical_shape)
     if ndim <= 0 or ndim > 4:
         raise ValueError(f"weights require 1-4 logical dims, got {logical_shape}")
+    if precision == Precision.INT4:
+        layout = flags & (
+            WEIGHT_FLAG_INT4_BG32 | WEIGHT_FLAG_INT4_BG128)
+        if layout not in (WEIGHT_FLAG_INT4_BG32, WEIGHT_FLAG_INT4_BG128):
+            raise ValueError(
+                "INT4 weights must use canonical BG32 or BG128 storage")
+        expected_group = 32 if layout == WEIGHT_FLAG_INT4_BG32 else 128
+        if scales is not None:
+            raise ValueError(
+                "canonical INT4 blocks embed scales; no sidecar is allowed")
+        if (ndim != 2 or group_size != expected_group or
+                logical_shape[1] % expected_group):
+            raise ValueError(
+                f"BG{expected_group} requires a 2-D weight, group="
+                f"{expected_group}, and aligned K")
+        rows, cols = logical_shape
+        groups_per_row = cols // expected_group
+        expected_groups = rows * groups_per_row
+        block_bytes = 160 if expected_group == 32 else 544
+        expected_bytes = (
+            ((rows + 7) // 8) * groups_per_row * block_bytes)
+        if num_groups != expected_groups or data.nbytes != expected_bytes:
+            raise ValueError(
+                f"invalid canonical BG{expected_group} payload: "
+                f"groups={num_groups}/{expected_groups}, "
+                f"bytes={data.nbytes}/{expected_bytes}")
     scales_bytes = b""
     scales_offset = 0
     scales_size = 0
@@ -1655,7 +1705,8 @@ def _write_weight_file(path: str, data: np.ndarray,
         f.write(data.tobytes())
         if scales_bytes:
             f.write(scales_bytes)
-    qinfo = f", group={group_size}, groups={num_groups}" if scales is not None else ""
+    qinfo = (f", group={group_size}, groups={num_groups}"
+             if group_size else "")
     finfo = f", flags=0x{flags:x}" if flags else ""
     sinfo = f", logical={logical_shape}" if tuple(data.shape) != logical_shape else ""
     print(f"  Wrote {path} ({data.shape}, {data.dtype}, prec={precision.name}{sinfo}{qinfo}{finfo})")
@@ -1722,6 +1773,60 @@ def _read_weight_header(path: str) -> dict:
     }
 
 
+def _validate_package_weight_header(ref: str, header: dict):
+    """Enforce the canonical on-disk representation used by .mollm.
+
+    Q4DOT remains an internal CPU packing primitive, but package INT4 tensors
+    are self-contained BG32/BG128 blocks with embedded scales.  Rejecting a
+    stale quantizer here prevents a backend from silently receiving a layout
+    it cannot consume.
+    """
+    if int(header["precision"]) != int(Precision.INT4):
+        return
+
+    flags = int(header["flags"])
+    if flags & WEIGHT_FLAG_INT4_Q4DOT_LEGACY:
+        raise ValueError(
+            f"legacy Q4DOT INT4 storage in {ref}; rebuild mollm-quantize "
+            "and reconvert the model")
+    layout = flags & (WEIGHT_FLAG_INT4_BG32 | WEIGHT_FLAG_INT4_BG128)
+    if layout not in (WEIGHT_FLAG_INT4_BG32, WEIGHT_FLAG_INT4_BG128):
+        raise ValueError(
+            f"INT4 weight {ref} must use canonical BG32 or BG128 storage")
+    unknown_flags = flags & ~(
+        WEIGHT_FLAG_INT4_BG32 | WEIGHT_FLAG_INT4_BG128)
+    if unknown_flags:
+        raise ValueError(
+            f"INT4 weight {ref} has unsupported storage flags "
+            f"0x{unknown_flags:x}")
+
+    rows, cols = map(int, header["shape"][:2])
+    group_size = int(header["group_size"])
+    expected_group = (
+        32 if layout == WEIGHT_FLAG_INT4_BG32 else 128)
+    if group_size != expected_group or cols % expected_group:
+        raise ValueError(
+            f"INT4 weight {ref} has incompatible shape/group for "
+            f"BG{expected_group}: N={rows} K={cols} group={group_size}")
+    if int(header["scales_size"]) != 0:
+        raise ValueError(
+            f"INT4 weight {ref} duplicates scales outside its canonical "
+            f"BG{expected_group} blocks; rebuild mollm-quantize")
+
+    groups_per_row = cols // expected_group
+    expected_groups = rows * groups_per_row
+    if int(header["num_groups"]) != expected_groups:
+        raise ValueError(
+            f"INT4 weight {ref} has {header['num_groups']} groups, "
+            f"expected {expected_groups}")
+    block_bytes = 160 if expected_group == 32 else 544
+    expected_data_size = ((rows + 7) // 8) * groups_per_row * block_bytes
+    if int(header["data_size"]) != expected_data_size:
+        raise ValueError(
+            f"INT4 weight {ref} has {header['data_size']} data bytes, "
+            f"expected {expected_data_size} for canonical BG{expected_group}")
+
+
 def _augment_moe_expert_storage(meta: dict,
                                 weight_files: dict,
                                 weight_paths: dict,
@@ -1775,7 +1880,15 @@ def _augment_moe_expert_storage(meta: dict,
                     f"MoE expert metadata row mismatch for {ref}: "
                     f"shape[0]={header['shape'][0]} expected={expected_rows}"
                 )
-            is_interleaved = bool(header["flags"] & (1 << 4))
+            int4_layout = int(header["flags"]) & (
+                WEIGHT_FLAG_INT4_BG32 | WEIGHT_FLAG_INT4_BG128)
+            if (int(header["precision"]) == int(Precision.INT4) and
+                    int4_layout and rows_per_expert % 8 != 0):
+                raise ValueError(
+                    f"canonical INT4 expert rows must be block-aligned for "
+                    f"{ref}: rows_per_expert={rows_per_expert}")
+            is_interleaved = bool(
+                header["flags"] & WEIGHT_FLAG_EXPERT_INTERLEAVED)
             raw_data_size = int(
                 header.get("expert_raw_data_size", header["data_size"]))
             raw_scales_size = int(
@@ -1881,12 +1994,14 @@ def save_package(output_path: str,
                     continue
                 if ref in streamed_weights:
                     source = streamed_weights[ref]
+                    header = source.header()
+                    _validate_package_weight_header(ref, header)
                     size = source.size
                     offset = weights_len
                     weights_len += size
                     weight_entries.append((source, size))
                     weight_files[ref] = [offset, size]
-                    weight_headers[ref] = source.header()
+                    weight_headers[ref] = header
                     continue
                 # Find the weight file.
                 wpath = os.path.join(weights_dir, ref) if not os.path.isabs(ref) else ref
@@ -1894,16 +2009,22 @@ def save_package(output_path: str,
                     wpath = os.path.join(tmp_dir, ref)
                 if not os.path.exists(wpath):
                     raise FileNotFoundError(f"Weight file not found: {ref}")
+                header = _read_weight_header(wpath)
+                _validate_package_weight_header(ref, header)
                 size = os.path.getsize(wpath)
                 offset = weights_len
                 weights_len += size
                 weight_entries.append((wpath, size))
                 weight_files[ref] = [offset, size]
                 weight_paths[ref] = wpath
+                weight_headers[ref] = header
 
         # Step 4: build metadata
         meta = dict(metadata)
         meta["weights"] = weight_files
+        if any(int(header["precision"]) == int(Precision.INT4)
+               for header in weight_headers.values()):
+            meta["int4_storage"] = "canonical_bg_block_v1"
         _augment_moe_expert_storage(
             meta, weight_files, weight_paths, weight_headers)
         meta_json = json.dumps(meta, ensure_ascii=False).encode('utf-8')

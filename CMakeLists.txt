@@ -429,6 +429,11 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        add_test(
+            NAME test_canonical_w4_storage
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_canonical_w4_storage.py
+                    $<TARGET_FILE:mollm-quantize>)
         add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)
         add_dependencies(test_tiny_cpu_inference mollm-quantize)

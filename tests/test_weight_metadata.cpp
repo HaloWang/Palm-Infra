@@ -88,21 +88,17 @@ int main() {
         Tensor weight = make_weight(Precision::INT4, 2, 4);
         const MappedFile::Header header =
             make_header(4, 4 * sizeof(float), 2, 4);
-        CHECK(mollm::detail::configure_weight_metadata(
-                  weight, header, scales, "int4"),
-              "accept valid plain INT4 metadata");
-        CHECK(!weight.is_q4_repacked && !weight.is_q4_g32_packed &&
-                  !weight.is_q4_g128_packed,
-              "plain INT4 has no packed-layout flags");
-
-        Tensor conflicting = make_weight(Precision::INT4, 8, 128);
-        MappedFile::Header conflicting_header =
-            make_header(544, 8 * sizeof(float), 128, 8,
-                        MappedFile::FLAG_INT4_Q4DOT |
-                            MappedFile::FLAG_INT4_BG128);
         CHECK(!mollm::detail::configure_weight_metadata(
-                  conflicting, conflicting_header, scales, "conflicting"),
-              "reject conflicting INT4 layout flags");
+                  weight, header, scales, "plain-int4"),
+              "reject non-canonical plain INT4 storage");
+
+        Tensor legacy = make_weight(Precision::INT4, 8, 128);
+        MappedFile::Header legacy_header =
+            make_header(512, 8 * sizeof(float), 128, 8,
+                        MappedFile::FLAG_INT4_Q4DOT_LEGACY);
+        CHECK(!mollm::detail::configure_weight_metadata(
+                  legacy, legacy_header, scales, "legacy-q4dot"),
+              "reject legacy package Q4DOT storage");
     }
 
     {
@@ -162,6 +158,30 @@ int main() {
                   weight.scales == nullptr &&
                   weight.groups_per_row == 1,
               "attach BG32 packed metadata");
+    }
+
+    {
+        unsigned char packed[544] = {};
+        Tensor weight = make_weight(Precision::INT4, 8, 128);
+        weight.data = packed;
+        const MappedFile::Header header =
+            make_header(sizeof(packed), 0, 128, 8,
+                        MappedFile::FLAG_INT4_BG128);
+        CHECK(mollm::detail::configure_weight_metadata(
+                  weight, header, nullptr, "bg128"),
+              "accept BG128 with embedded scales");
+        CHECK(weight.is_q4_g128_packed &&
+                  weight.q4_g128_data == packed &&
+                  weight.scales == nullptr &&
+                  weight.groups_per_row == 1,
+              "attach BG128 packed metadata");
+
+        MappedFile::Header duplicate_scales = header;
+        duplicate_scales.scales_size = 8 * sizeof(float);
+        CHECK(!mollm::detail::configure_weight_metadata(
+                  weight, duplicate_scales, scales,
+                  "bg128-duplicate-scales"),
+              "reject BG128 with a duplicate scale sidecar");
     }
 
     {

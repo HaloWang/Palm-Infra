@@ -2,7 +2,6 @@
 #include "kernels/moe_ssd_internal.h"
 
 #include "graph/mmap_file.h"
-#include "kernels/matmul.h"
 #include "kernels/trace.h"
 
 #include <algorithm>
@@ -237,13 +236,43 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
                      spec.weight_ref.c_str());
         return false;
     }
-    const bool has_embedded_scales =
-        spec.precision == Precision::INT4 &&
-        (((spec.flags & MappedFile::FLAG_INT4_BG128) != 0 &&
-          spec.group_size == 128 && spec.cols % 128 == 0) ||
-         ((spec.flags & MappedFile::FLAG_INT4_BG32) != 0 &&
-          spec.group_size == 32 && spec.cols % 32 == 0)) &&
-        matmul_int4_q4dot_kernel_available();
+    bool has_embedded_scales = false;
+    if (spec.precision == Precision::INT4) {
+        constexpr uint32_t layout_flags =
+            MappedFile::FLAG_INT4_BG32 | MappedFile::FLAG_INT4_BG128;
+        const uint32_t layout = spec.flags & layout_flags;
+        const bool bg32 = layout == MappedFile::FLAG_INT4_BG32;
+        const bool bg128 = layout == MappedFile::FLAG_INT4_BG128;
+        const uint32_t group = bg32 ? 32u : 128u;
+        const uint64_t block_bytes = bg32 ? 160u : 544u;
+        const uint64_t groups_per_row =
+            group != 0 ? static_cast<uint64_t>(spec.cols) / group : 0;
+        const uint64_t row_blocks =
+            (static_cast<uint64_t>(spec.rows) + 7) / 8;
+        const bool size_fits =
+            groups_per_row == 0 ||
+            row_blocks <= std::numeric_limits<uint64_t>::max() /
+                              groups_per_row;
+        const uint64_t blocks = size_fits
+            ? row_blocks * groups_per_row : 0;
+        const bool bytes_fit =
+            blocks <= std::numeric_limits<uint64_t>::max() / block_bytes;
+        const uint64_t expected_bytes =
+            bytes_fit ? blocks * block_bytes : 0;
+        if ((!bg32 && !bg128) || (spec.flags & ~layout_flags) != 0 ||
+            spec.group_size != group || spec.cols % group != 0 ||
+            spec.rows % 8 != 0 || spec.groups_per_row != groups_per_row ||
+            !size_fits || !bytes_fit || spec.data_bytes != expected_bytes ||
+            spec.scales_bytes != 0) {
+            std::fprintf(
+                stderr,
+                "MoE SSD: INT4 expert %s is not canonical BG32/BG128; "
+                "reconvert the model\n",
+                spec.weight_ref.c_str());
+            return false;
+        }
+        has_embedded_scales = true;
+    }
     if ((spec.precision == Precision::INT8 ||
          spec.precision == Precision::INT4 ||
          spec.precision == Precision::MXFP4) &&
@@ -740,7 +769,7 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.group_size = s.group_size;
         t.groups_per_row = s.groups_per_row;
         t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
-        t.is_q4_repacked = (s.flags & MappedFile::FLAG_INT4_Q4DOT) != 0;
+        t.is_q4_repacked = false;
         t.is_q4_g32_packed = (s.flags & MappedFile::FLAG_INT4_BG32) != 0;
         t.is_q4_g128_packed = (s.flags & MappedFile::FLAG_INT4_BG128) != 0;
         if (t.is_q4_g32_packed) t.q4_g32_data = t.data;

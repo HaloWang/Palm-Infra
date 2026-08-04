@@ -76,7 +76,7 @@ int main() {
     // a source without a duplicate scale sidecar and expose a tensor that
     // dispatches through the embedded-scale kernels.
     const std::string bg128_path = "/tmp/mollm_test_moe_ssd_bg128.bin";
-    if (matmul_int4_q4dot_kernel_available()) {
+    {
         constexpr size_t block_bytes = 544;
         std::vector<uint8_t> bg128_contents(2 * block_bytes);
         {
@@ -116,6 +116,17 @@ int main() {
               "BG128 expert tensors omit redundant sidecars");
         check(cache.stats().bytes_read == 2 * block_bytes,
               "BG128 cache reads only embedded-scale data");
+
+        auto duplicate_scales = bg128_spec("bg128_duplicate_scales", 0);
+        duplicate_scales.scales_offset = 0;
+        duplicate_scales.scales_bytes = 8 * sizeof(float);
+        check(!cache.add_source(duplicate_scales),
+              "reject BG128 expert with duplicate scale sidecar");
+
+        auto legacy = bg128_spec("legacy_q4dot", 0);
+        legacy.flags = MappedFile::FLAG_INT4_Q4DOT_LEGACY;
+        check(!cache.add_source(legacy),
+              "reject legacy Q4DOT expert storage");
     }
 
     // Native MXFP4 experts keep one raw E8M0 byte per 32-value block.

@@ -116,10 +116,19 @@ bool configure_weight_metadata(Tensor& tensor,
         return true;
     }
 
-    const bool header_embeds_bg32_scales =
+    const bool header_embeds_int4_scales =
         tensor.prec == Precision::INT4 &&
-        (header.flags & MappedFile::FLAG_INT4_BG32) != 0;
-    if ((!scales && !header_embeds_bg32_scales) ||
+        (header.flags & (MappedFile::FLAG_INT4_BG32 |
+                         MappedFile::FLAG_INT4_BG128)) != 0;
+    if (header_embeds_int4_scales && header.scales_size != 0) {
+        std::fprintf(
+            stderr,
+            "Engine: INT4 weight %s duplicates external scales; reconvert "
+            "the model to canonical BG32/BG128 storage\n",
+            label);
+        return false;
+    }
+    if ((!scales && !header_embeds_int4_scales) ||
         header.group_size == 0) {
         std::fprintf(stderr,
                      "Engine: quantized weight %s missing scales/group "
@@ -142,11 +151,15 @@ bool configure_weight_metadata(Tensor& tensor,
     const uint32_t groups_per_row =
         static_cast<uint32_t>(groups_per_row_u);
     constexpr uint32_t supported_flags =
-        MappedFile::FLAG_INT4_Q4DOT | MappedFile::FLAG_INT4_BG128 |
-        MappedFile::FLAG_INT4_BG32;
-    const bool int4_q4dot_layout =
-        tensor.prec == Precision::INT4 &&
-        (header.flags & MappedFile::FLAG_INT4_Q4DOT);
+        MappedFile::FLAG_INT4_BG128 | MappedFile::FLAG_INT4_BG32;
+    if (header.flags & MappedFile::FLAG_INT4_Q4DOT_LEGACY) {
+        std::fprintf(
+            stderr,
+            "Engine: INT4 weight %s uses the legacy Q4DOT package layout; "
+            "reconvert the model to canonical BG32/BG128 storage\n",
+            label);
+        return false;
+    }
     const bool int4_bg128_layout =
         tensor.prec == Precision::INT4 &&
         (header.flags & MappedFile::FLAG_INT4_BG128);
@@ -170,22 +183,13 @@ bool configure_weight_metadata(Tensor& tensor,
         return false;
     }
     const int int4_layout_count =
-        static_cast<int>(int4_q4dot_layout) +
         static_cast<int>(int4_bg32_layout) +
         static_cast<int>(int4_bg128_layout);
-    if (int4_layout_count > 1) {
+    if (tensor.prec == Precision::INT4 && int4_layout_count != 1) {
         std::fprintf(stderr,
-                     "Engine: weight %s has mutually exclusive INT4 layout "
-                     "flags\n",
+                     "Engine: INT4 weight %s must use canonical BG32 or "
+                     "BG128 storage\n",
                      label);
-        return false;
-    }
-    if (int4_q4dot_layout &&
-        (cols % 32 != 0 || header.group_size % 32 != 0)) {
-        std::fprintf(stderr,
-                     "Engine: INT4 q4dot weight %s requires K/group "
-                     "multiple of 32 (K=%lld group=%u)\n",
-                     label, static_cast<long long>(cols), header.group_size);
         return false;
     }
     if (int4_bg128_layout &&
@@ -207,7 +211,7 @@ bool configure_weight_metadata(Tensor& tensor,
     // Packed INT4 is a serialized layout, not an ARM-only model format.  The
     // scalar provider decodes it directly, while the ARM provider retains its
     // historical requirement for the DOTPROD kernel.
-    if ((int4_q4dot_layout || int4_bg32_layout || int4_bg128_layout) &&
+    if ((int4_bg32_layout || int4_bg128_layout) &&
         mollm::cpu::capabilities().arm_neon &&
         !matmul_int4_q4dot_kernel_available()) {
         std::fprintf(stderr,
@@ -226,26 +230,7 @@ bool configure_weight_metadata(Tensor& tensor,
         return false;
     }
     if (tensor.prec == Precision::INT4) {
-        if (int4_q4dot_layout) {
-            if (rows_u > std::numeric_limits<uint64_t>::max() - 7) {
-                std::fprintf(stderr,
-                             "Engine: quantized weight %s dimensions overflow "
-                             "packed data size\n",
-                             label);
-                return false;
-            }
-            const uint64_t padded_rows = ((rows_u + 7) / 8) * 8;
-            const uint64_t col_blocks = 1 + (cols_u - 1) / 32;
-            uint64_t packed_blocks = 0;
-            if (!checked_multiply(padded_rows, col_blocks, packed_blocks) ||
-                !checked_multiply(packed_blocks, 16, expected_data_size)) {
-                std::fprintf(stderr,
-                             "Engine: quantized weight %s dimensions overflow "
-                             "packed data size\n",
-                             label);
-                return false;
-            }
-        } else if (int4_bg32_layout) {
+        if (int4_bg32_layout) {
             if (rows > std::numeric_limits<int>::max() ||
                 cols > std::numeric_limits<int>::max()) {
                 std::fprintf(stderr,
@@ -283,7 +268,7 @@ bool configure_weight_metadata(Tensor& tensor,
     }
 
     uint64_t expected_scales_size = 0;
-    if (!header_embeds_bg32_scales &&
+    if (!header_embeds_int4_scales &&
         !checked_multiply(expected_groups, sizeof(float),
                           expected_scales_size)) {
         std::fprintf(stderr,
@@ -314,7 +299,7 @@ bool configure_weight_metadata(Tensor& tensor,
     tensor.group_size = header.group_size;
     tensor.num_groups = header.num_groups;
     tensor.groups_per_row = groups_per_row;
-    tensor.is_q4_repacked = int4_q4dot_layout;
+    tensor.is_q4_repacked = false;
     tensor.is_q4_g32_packed = int4_bg32_layout;
     tensor.is_q4_g128_packed = int4_bg128_layout;
     if (int4_bg32_layout)
