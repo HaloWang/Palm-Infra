@@ -18,8 +18,15 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
       - name: Verify ARM64 runner
         run: test "$(uname -m)" = arm64
+      - name: Install E2E fixture dependency
+        run: python -m pip install --disable-pip-version-check numpy
+      - name: Verify E2E fixture dependency
+        run: python -c "import numpy"
       - name: Configure
         run: >
           cmake -S . -B build
