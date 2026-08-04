@@ -2368,8 +2368,11 @@ int main() {
     // separately. Register one combined region so this test also exercises
     // independent Metal buffer offsets for the two scale arrays.
     if (mb.has_tensor_path()) {
-        constexpr int H = 128;
-        constexpr int I = 64;
+        // Keep both K dimensions above the K128 activation group so the
+        // grouped prefill test covers multi-group accumulation, not just the
+        // legacy one-scale-per-row special case.
+        constexpr int H = 256;
+        constexpr int I = 256;
         constexpr int E = 32;
         constexpr int TOP = 4;
         constexpr int GU_ROWS = E * 2 * I;
@@ -2429,6 +2432,15 @@ int main() {
             Tensor x = make_dev(mb, Precision::FP32, H, seq);
             Tensor out = make_dev(mb, Precision::FP32, H, seq);
             fill_rand(static_cast<float*>(x.data), H * seq);
+            if (seq >= 64) {
+                // Make adjacent K128 groups differ strongly in magnitude.
+                // A legacy row-wise scale loses most of the first group,
+                // while grouped activation quantization preserves it.
+                auto* x_data = static_cast<float*>(x.data);
+                for (int row = 0; row < seq; ++row)
+                    for (int k = 0; k < H / 2; ++k)
+                        x_data[row * H + k] *= 0.02f;
+            }
             std::vector<const Tensor*> inputs = {
                 &x, &router, &gate_up, &down};
             mb.begin_graph();
@@ -2445,7 +2457,9 @@ int main() {
                 false, -1);
             CHECK(ref_ok, label);
             CHECK(close(static_cast<const float*>(out.data),
-                        ref_data.data(), H * seq, 2e-4f, 3e-3f),
+                        ref_data.data(), H * seq,
+                        seq >= 64 ? 6e-4f : 2e-4f,
+                        seq >= 64 ? 5e-2f : 3e-3f),
                   seq == 1
                       ? "Metal resident W8 MoE decode matches CPU"
                       : seq >= 64

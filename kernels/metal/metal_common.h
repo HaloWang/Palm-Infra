@@ -154,8 +154,8 @@ struct GroupedW4A8Params {
     int activation_by_token;
 };
 
-// Per-token activation quantization: A_f32[M,K] -> A_i8[M,K] + scale_a[M].
-// scale_a[m] = absmax(row m)/127; a_i8[m,k] = round(a[m,k]/scale_a[m]).
+// Activation quantization: A_f32[M,K] -> A_i8[M,K]. With block_size=0,
+// scale_a is [M]; otherwise it is [M, ceil(K/block_size)].
 struct QuantActParams {
     int  M;
     int  K;

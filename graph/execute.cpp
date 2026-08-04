@@ -688,6 +688,16 @@ void execute_graph(ExecContext& ctx) {
         // environment for every graph node in normal inference.
         static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
         if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
+            // Metal dispatch is asynchronous. A diagnostic that reads the
+            // zero-copy backing storage must first complete the command stream;
+            // otherwise it reports stale data from an earlier node/run.
+            if (device_resident) {
+                ctx.backend->synchronize_for_host_read();
+                if (ctx.backend->dispatch_failed()) {
+                    ctx.execution_failed = true;
+                    return;
+                }
+            }
             // Device views keep the allocation base in `data` and carry their
             // byte displacement separately in `device_offset`. Account for
             // that here so SLICE/PERMUTE diagnostics inspect the view rather

@@ -3799,33 +3799,43 @@ void MetalBackend::dispatch(const GraphNode& node,
                     router_mp.act_n_begin = 0;
                     router_mp.act_n_len = -1;
 
-                    const size_t activation_bytes =
-                        (size_t)seq * (size_t)hidden_size *
-                        sizeof(uint16_t);
-                    void* activation_h =
-                        impl_->pool->acquire(activation_bytes);
-                    id<MTLBuffer> activation =
-                        (__bridge id<MTLBuffer>)activation_h;
-                    impl_->pending_free.push_back(
-                        {activation_h, activation_bytes});
-
-                    [enc setComputePipelineState:
-                             impl_->pipeline(
-                                 "matmul_cast_f32_to_f16")];
-                    [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
-                    [enc setBuffer:activation offset:0 atIndex:2];
-                    [enc setBytes:&router_mp
-                           length:sizeof(router_mp) atIndex:3];
-                    grid1d(
-                        (seq * hidden_size + 3) / 4);
-                    [enc memoryBarrierWithScope:
-                             MTLBarrierScopeBuffers];
-
-                    MatmulParams tensor_mp = router_mp;
-                    tensor_mp.a_offset = 0;
-                    tensor_mp.a_row_stride = hidden_size;
                     const bool small_router =
                         num_experts <= 128;
+                    MatmulParams tensor_mp = router_mp;
+                    tensor_mp.a_offset = 0;
+                    id<MTLBuffer> activation = nil;
+                    NSUInteger activation_offset = 0;
+                    if (small_router) {
+                        // Router top-k is unusually sensitive to activation
+                        // rounding. Consume the FP32 residual stream directly
+                        // so near-tied experts do not diverge solely because
+                        // Metal rounded the router input to FP16.
+                        activation = buf_of(&x);
+                        activation_offset = x.device_offset;
+                    } else {
+                        const size_t activation_bytes =
+                            (size_t)seq * (size_t)hidden_size *
+                            sizeof(uint16_t);
+                        void* activation_h =
+                            impl_->pool->acquire(activation_bytes);
+                        activation =
+                            (__bridge id<MTLBuffer>)activation_h;
+                        impl_->pending_free.push_back(
+                            {activation_h, activation_bytes});
+
+                        [enc setComputePipelineState:
+                                 impl_->pipeline(
+                                     "matmul_cast_f32_to_f16")];
+                        [enc setBuffer:buf_of(&x) offset:0 atIndex:0];
+                        [enc setBuffer:activation offset:0 atIndex:2];
+                        [enc setBytes:&router_mp
+                               length:sizeof(router_mp) atIndex:3];
+                        grid1d(
+                            (seq * hidden_size + 3) / 4);
+                        [enc memoryBarrierWithScope:
+                                 MTLBarrierScopeBuffers];
+                        tensor_mp.a_row_stride = hidden_size;
+                    }
                     const NSUInteger router_tile_m =
                         small_router ? 64 : 128;
                     const NSUInteger router_tile_n =
@@ -3833,9 +3843,10 @@ void MetalBackend::dispatch(const GraphNode& node,
                     [enc setComputePipelineState:
                              impl_->pipeline(
                                  small_router
-                                     ? "gemm_tensor_router_f16a_f16b_f32c"
+                                     ? "gemm_tensor_router_f32a_f16b_f32c"
                                      : "gemm_tensor_direct_f16a_f16b_f32c")];
-                    [enc setBuffer:activation offset:0 atIndex:0];
+                    [enc setBuffer:activation
+                            offset:activation_offset atIndex:0];
                     [enc setBuffer:buf_of(&router)
                             offset:router.device_offset atIndex:1];
                     [enc setBuffer:logits offset:0 atIndex:2];
@@ -3914,16 +3925,23 @@ void MetalBackend::dispatch(const GraphNode& node,
                 const bool w8pc =
                     gu.groups_per_row == 1 &&
                     down.groups_per_row == 1;
-                if (w8pc && seq >= 64 && impl_->has_tensor) {
+                constexpr int activation_group = 128;
+                if (w8pc && seq >= 64 && impl_->has_tensor &&
+                    hidden_size % activation_group == 0 &&
+                    intermediate % activation_group == 0) {
                     const int selections = seq * top_k;
                     const size_t qx_bytes =
                         (size_t)seq * hidden_size;
                     const size_t sx_bytes =
-                        (size_t)seq * sizeof(float);
+                        (size_t)seq *
+                        ((hidden_size + activation_group - 1) /
+                         activation_group) * sizeof(float);
                     const size_t qi_bytes =
                         (size_t)selections * intermediate;
                     const size_t si_bytes =
-                        (size_t)selections * sizeof(float);
+                        (size_t)selections *
+                        ((intermediate + activation_group - 1) /
+                         activation_group) * sizeof(float);
                     const size_t selected_bytes =
                         (size_t)selections * hidden_size * sizeof(float);
                     const size_t expert_counts_bytes =
@@ -4024,16 +4042,26 @@ void MetalBackend::dispatch(const GraphNode& node,
                         qp.K = K;
                         qp.a_offset = src_offset;
                         qp.a_row_stride = row_stride;
+                        qp.block_size = activation_group;
                         [enc setComputePipelineState:
-                                 impl_->pipeline("quantize_act_i8")];
+                                 impl_->pipeline(
+                                     "quantize_act_i8_blocks")];
                         [enc setBuffer:src offset:0 atIndex:0];
                         [enc setBuffer:dst offset:0 atIndex:2];
                         [enc setBytes:&qp length:sizeof(qp) atIndex:3];
                         [enc setBuffer:dst_scales offset:0 atIndex:4];
+                        constexpr NSUInteger nsg = 4;
+                        const NSUInteger blocks =
+                            ((NSUInteger)K + activation_group - 1) /
+                            activation_group;
                         [enc setThreadgroupMemoryLength:
-                                 4 * sizeof(float) atIndex:0];
-                        [enc dispatchThreadgroups:MTLSizeMake(rows, 1, 1)
-                            threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                                 nsg * sizeof(float) atIndex:0];
+                        [enc dispatchThreadgroups:
+                                 MTLSizeMake(
+                                     (NSUInteger)rows * blocks,
+                                     1, 1)
+                            threadsPerThreadgroup:
+                                 MTLSizeMake(32, nsg, 1)];
                     };
                     auto grouped_w8 = [&](id<MTLBuffer> activation,
                                            id<MTLBuffer> activation_scales,
@@ -4052,7 +4080,9 @@ void MetalBackend::dispatch(const GraphNode& node,
                         gp.N = output_rows;
                         gp.K = inner;
                         gp.c_row_stride = destination_stride;
-                        gp.groups_per_row = 1;
+                        gp.groups_per_row =
+                            (inner + activation_group - 1) /
+                            activation_group;
                         gp.rows_per_expert = rows_per_expert;
                         gp.activation_by_token =
                             activation_by_token ? 1 : 0;

@@ -113,8 +113,8 @@ kernel void gemm_tensor_direct_f16a_f16b_f32c(
 // Small-output direct GEMM for MoE routers. A 128-column router launches only
 // four threadgroups with the generic M128xN64 tile at S=256; M64xN32 exposes
 // four times as much parallelism while keeping the same K32 FP32 accumulation.
-kernel void gemm_tensor_router_f16a_f16b_f32c(
-    device const half* A [[buffer(0)]],
+kernel void gemm_tensor_router_f32a_f16b_f32c(
+    device const float* A [[buffer(0)]],
     device const half* B [[buffer(1)]],
     device float* C [[buffer(2)]],
     constant MatmulParams& p [[buffer(3)]],
@@ -124,7 +124,7 @@ kernel void gemm_tensor_router_f16a_f16b_f32c(
     const int n0 = (int)tgpig.y * TN;
     const int m0 = (int)tgpig.x * TM;
     auto tA = tensor(
-        (device half*)(A + p.a_offset),
+        (device float*)(A + p.a_offset),
         dextents<int32_t,2>(p.K, p.M),
         array<int,2>({1, p.a_row_stride}));
     auto tW = tensor(
@@ -2294,6 +2294,12 @@ inline void gemm_grouped_experts_w8_impl(
             NRB, projected_rows, NK, false, true, true,
             matmul2d_descriptor::mode::multiply_accumulate),
         execution_simdgroups<MOLLM_GROUPED_MOE_SIMDGROUPS>> mm;
+    constexpr int ACC_PER_THREAD =
+        (projected_rows * NRB + NUM_THREADS - 1) / NUM_THREADS;
+    float accum[ACC_PER_THREAD];
+    #pragma unroll
+    for (int slot = 0; slot < ACC_PER_THREAD; ++slot)
+        accum[slot] = 0.0f;
     auto dot =
         mm.template get_destination_cooperative_tensor<
             decltype(tA), decltype(tW), int32_t>();
@@ -2303,7 +2309,15 @@ inline void gemm_grouped_experts_w8_impl(
         projected_rows * (NK / UNROLL);
     constexpr int activation_work =
         NRB * (NK / UNROLL);
+    const int activation_group_size =
+        (p.K + p.groups_per_row - 1) / p.groups_per_row;
     for (int k0 = 0; k0 < p.K; k0 += NK) {
+        const int activation_group = k0 / activation_group_size;
+        if (k0 == activation_group * activation_group_size) {
+            #pragma unroll
+            for (int slot = 0; slot < ACC_PER_THREAD; ++slot)
+                dot[slot] = 0;
+        }
         for (int work = (int)tid;
              work < weight_work; work += NUM_THREADS) {
             const int projected_row = work / (NK / UNROLL);
@@ -2363,50 +2377,93 @@ inline void gemm_grouped_experts_w8_impl(
         auto activation_tile = tA.slice(0, 0);
         auto weight_tile = tW.slice(0, 0);
         mm.run(activation_tile, weight_tile, dot);
+
+        const int group_end = min(
+            p.K, (activation_group + 1) * activation_group_size);
+        if (k0 + NK >= group_end) {
+            #pragma unroll
+            for (int slot = 0; slot < ACC_PER_THREAD; ++slot) {
+                const auto index =
+                    dot.get_multidimensional_index(slot);
+                const int output_local = index[0];
+                const int route_local = index[1];
+                const int route_slot = route_begin + route_local;
+                if (route_slot >= route_count ||
+                    row_begin + output_local % NRA >= p.N)
+                    continue;
+                const int selection = expert_routes[
+                    (ulong)expert * (ulong)p.max_routes +
+                    (ulong)route_slot];
+                const int activation_row = p.activation_by_token
+                    ? selection / p.top_k
+                    : selection;
+                const float activation_scale = SCALE_A[
+                    (ulong)activation_row *
+                        (ulong)p.groups_per_row +
+                    (ulong)activation_group];
+                const int projection = output_local / NRA;
+                const int local_row = output_local % NRA;
+                const int weight_row =
+                    projection * p.N + row_begin + local_row;
+                const ulong scale_base =
+                    (ulong)expert * (ulong)p.rows_per_expert;
+                accum[slot] +=
+                    (float)dot[slot] * activation_scale *
+                    SCALE_W[scale_base + (ulong)weight_row];
+            }
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 
-    // The staging area is dead once K is complete. Reuse it for the portable
-    // cooperative-tensor store, then dequantize and optionally fuse SwiGLU.
-    threadgroup int32_t* result = (threadgroup int32_t*)shmem;
-    auto tResult = tensor(
-        result, dextents<int32_t,2>(projected_rows, NRB));
-    dot.store(tResult);
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (int work = (int)tid;
-         work < NRA * NRB; work += NUM_THREADS) {
-        const int local_route = work / NRA;
-        const int local_row = work % NRA;
-        const int route_slot = route_begin + local_route;
-        const int output_row = row_begin + local_row;
-        if (route_slot >= route_count || output_row >= p.N) continue;
-        const int selection = expert_routes[
-            (ulong)expert * (ulong)p.max_routes +
-            (ulong)route_slot];
-        const int activation_row = p.activation_by_token
-            ? selection / p.top_k
-            : selection;
-        const float activation_scale = SCALE_A[activation_row];
-        const ulong scale_base =
-            (ulong)expert * (ulong)p.rows_per_expert;
-        const int gate_dot =
-            result[local_route * projected_rows + local_row];
-        const float gate =
-            (float)gate_dot * activation_scale *
-            SCALE_W[scale_base + (ulong)output_row];
-        float value = gate;
-        if constexpr (PAIRED_GATE_UP) {
-            const int up_dot = result[
-                local_route * projected_rows + NRA + local_row];
-            const float up =
-                (float)up_dot * activation_scale *
-                SCALE_W[
-                    scale_base + (ulong)p.N +
-                    (ulong)output_row];
-            value = (gate / (1.0f + exp(-gate))) * up;
+    if constexpr (PAIRED_GATE_UP) {
+        // The staged tiles are dead after the final K32 block. Reuse their
+        // threadgroup storage to pair gate/up accumulators for SwiGLU.
+        threadgroup float* paired =
+            (threadgroup float*)shmem;
+        #pragma unroll
+        for (int slot = 0; slot < ACC_PER_THREAD; ++slot) {
+            const auto index =
+                dot.get_multidimensional_index(slot);
+            paired[index[0] * NRB + index[1]] =
+                accum[slot];
         }
-        C[(ulong)selection * (ulong)p.c_row_stride +
-          (ulong)output_row] = value;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (int work = (int)tid;
+             work < NRA * NRB; work += NUM_THREADS) {
+            const int route_local = work / NRA;
+            const int output_local = work % NRA;
+            const int route_slot = route_begin + route_local;
+            const int output_row = row_begin + output_local;
+            if (route_slot >= route_count || output_row >= p.N)
+                continue;
+            const int selection = expert_routes[
+                (ulong)expert * (ulong)p.max_routes +
+                (ulong)route_slot];
+            const float gate =
+                paired[output_local * NRB + route_local];
+            const float up =
+                paired[(NRA + output_local) * NRB + route_local];
+            C[(ulong)selection * (ulong)p.c_row_stride +
+              (ulong)output_row] =
+                (gate / (1.0f + exp(-gate))) * up;
+        }
+    } else {
+        #pragma unroll
+        for (int slot = 0; slot < ACC_PER_THREAD; ++slot) {
+            const auto index =
+                dot.get_multidimensional_index(slot);
+            const int output_local = index[0];
+            const int route_local = index[1];
+            const int route_slot = route_begin + route_local;
+            const int output_row = row_begin + output_local;
+            if (route_slot >= route_count || output_row >= p.N)
+                continue;
+            const int selection = expert_routes[
+                (ulong)expert * (ulong)p.max_routes +
+                (ulong)route_slot];
+            C[(ulong)selection * (ulong)p.c_row_stride +
+              (ulong)output_row] = accum[slot];
+        }
     }
 }
 
