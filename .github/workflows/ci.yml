@@ -32,6 +32,7 @@ jobs:
           cmake -S . -B build
           -DCMAKE_BUILD_TYPE=Release
           -DMOLLM_BUILD_TESTS=ON
+          -DPython3_EXECUTABLE="$(which python)"
           -DMOLLM_ARM_I8MM=${{ matrix.arm_i8mm }}
       - name: Build
         run: cmake --build build -j 2
