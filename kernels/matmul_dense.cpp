@@ -967,8 +967,14 @@ static void matmul_fp32_range_n(const float* A, const float* B, float* C, int M,
     matmul_fp32_neon_8x8_range(A, B + n_begin * K_weight, C + n_begin, M,
                                n_end - n_begin, K, lda, K_weight, ldc, 0, M);
 #else
-    matmul_fp32_scalar_range(A, B + n_begin * K_weight, C + n_begin, M,
-                             n_end - n_begin, K, lda, K_weight, ldc, 0, M);
+    const float* b_range = B + static_cast<size_t>(n_begin) * K_weight;
+    float* c_range = C + n_begin;
+    if (!mollm::cpu::matmul_dense_fp32_range(
+            A, b_range, c_range, n_end - n_begin, K, lda, K_weight, ldc,
+            0, M)) {
+        matmul_fp32_scalar_range(A, b_range, c_range, M, n_end - n_begin, K,
+                                 lda, K_weight, ldc, 0, M);
+    }
 #endif
 }
 
