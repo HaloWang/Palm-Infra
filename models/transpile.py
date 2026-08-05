@@ -1732,12 +1732,14 @@ def _write_weight_file(path: str, data: np.ndarray,
 #     decode_graph_offset (8) + decode_graph_len (8)
 #     weights_offset (8) + weights_len (8)
 #     vision_graph_offset (8) + vision_graph_len (8)
-#     reserved (8)
+#     mtp_graph_len (8); MTP graph ends immediately before weights
 #   [metadata JSON] — includes "weights" map: {filename: [offset, len]}
 #   [tokenizer.json bytes]
 #   [chat_template.jinja bytes]
 #   [prefill graph bytes]   (standard .graph format, weight refs = "./foo.weights")
 #   [decode graph bytes]    (standard .graph format, weight refs = "./foo.weights")
+#   [vision graph bytes]    (optional)
+#   [MTP graph bytes]       (optional; offset = weights_offset - mtp_graph_len)
 #   [weights region]        — all .weights files concatenated, each self-contained
 
 PACKAGE_MAGIC   = 0x4D4C4F4D  # "MOLM"
@@ -1940,6 +1942,7 @@ def save_package(output_path: str,
                  tokenizer_path: str = "",
                  jinja_path: str = "",
                  g_vision: 'GraphBuilder | None' = None,
+                 g_mtp: 'GraphBuilder | None' = None,
                  remove_weight_files: bool = False,
                  streamed_weights: dict[str, StreamedWeight] | None = None):
     """Pack model graphs + weights + tokenizer + jinja into one .mollm file.
@@ -1961,6 +1964,8 @@ def save_package(output_path: str,
         g_decode.save(os.path.join(tmp_dir, "model_decode"))
         if g_vision is not None:
             g_vision.save(os.path.join(tmp_dir, "model_vision"))
+        if g_mtp is not None:
+            g_mtp.save(os.path.join(tmp_dir, "model_mtp"))
 
         # Step 2: read graph bytes
         with open(os.path.join(tmp_dir, "model_prefill.graph"), 'rb') as f:
@@ -1971,6 +1976,10 @@ def save_package(output_path: str,
         if g_vision is not None:
             with open(os.path.join(tmp_dir, "model_vision.graph"), 'rb') as f:
                 vi_bytes = f.read()
+        mtp_bytes = b""
+        if g_mtp is not None:
+            with open(os.path.join(tmp_dir, "model_mtp.graph"), 'rb') as f:
+                mtp_bytes = f.read()
 
         # Step 3: collect weight files referenced by both graphs
         weight_files = {}  # relative_name -> (offset, size)
@@ -1983,6 +1992,8 @@ def save_package(output_path: str,
         graphs = [g_prefill, g_decode]
         if g_vision is not None:
             graphs.append(g_vision)
+        if g_mtp is not None:
+            graphs.append(g_mtp)
         for g in graphs:
             for node in g._nodes:
                 if node.op_type != OpType.CONSTANT or not node.params_str:
@@ -2076,7 +2087,8 @@ def save_package(output_path: str,
         pf_off = jin_off + len(jinja_bytes)
         dc_off = pf_off + len(pf_bytes)
         vi_off = dc_off + len(dc_bytes) if vi_bytes else 0
-        w_off = dc_off + len(dc_bytes) + len(vi_bytes)
+        mtp_off = dc_off + len(dc_bytes) + len(vi_bytes)
+        w_off = mtp_off + len(mtp_bytes)
 
         with open(output_path, 'wb') as f:
             f.write(struct.pack('<II', PACKAGE_MAGIC, PACKAGE_VERSION))
@@ -2087,13 +2099,14 @@ def save_package(output_path: str,
             f.write(struct.pack('<QQ', dc_off, len(dc_bytes)))
             f.write(struct.pack('<QQ', w_off, weights_len))
             f.write(struct.pack('<QQ', vi_off, len(vi_bytes)))
-            f.write(b'\x00' * 8)  # pad to 128
+            f.write(struct.pack('<Q', len(mtp_bytes)))
             f.write(meta_json)
             f.write(tok_bytes)
             f.write(jinja_bytes)
             f.write(pf_bytes)
             f.write(dc_bytes)
             f.write(vi_bytes)
+            f.write(mtp_bytes)
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
             for source, _ in weight_entries:
@@ -2115,10 +2128,12 @@ def save_package(output_path: str,
                     os.remove(wpath)
 
         total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
-                 + len(pf_bytes) + len(dc_bytes) + len(vi_bytes) + weights_len)
+                 + len(pf_bytes) + len(dc_bytes) + len(vi_bytes)
+                 + len(mtp_bytes) + weights_len)
         print(f"Saved {output_path} ({weights_len} weights + {len(tok_bytes)} tokenizer + "
               f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + "
-              f"{len(dc_bytes)} decode + {len(vi_bytes)} vision = {total} bytes)")
+              f"{len(dc_bytes)} decode + {len(vi_bytes)} vision + "
+              f"{len(mtp_bytes)} MTP = {total} bytes)")
 
     finally:
         shutil.rmtree(tmp_dir)

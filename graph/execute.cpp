@@ -241,7 +241,7 @@ void inject_runtime_shapes(ExecContext& ctx) {
 // embedded CacheMetadata for past_len tracking.
 // ---------------------------------------------------------------------------
 
-void execute_graph(ExecContext& ctx) {
+void execute_graph(ExecContext& ctx, int stop_after_node_index) {
     auto& nodes  = ctx.graph->nodes;
     auto& tensors = ctx.graph->runtime.tensors;
     auto* pool   = ctx.pool;
@@ -789,6 +789,9 @@ void execute_graph(ExecContext& ctx) {
             stat.calls += 1;
             stat.total_ns += elapsed_ns;
         }
+        if (stop_after_node_index >= 0 &&
+            static_cast<int>(i) >= stop_after_node_index)
+            break;
     }
 
     if (ctx.reuse_same_shape_workspace && has_dynamic) {

@@ -434,6 +434,10 @@ if(MOLLM_BUILD_TESTS)
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_canonical_w4_storage.py
                     $<TARGET_FILE:mollm-quantize>)
+        add_test(
+            NAME test_mtp_package
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mtp_package.py)
         add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)
         add_dependencies(test_tiny_cpu_inference mollm-quantize)

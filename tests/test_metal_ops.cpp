@@ -1606,6 +1606,252 @@ int main() {
         unsetenv("MOLLM_METAL_W4_PREFILL_MODE");
     }
 
+    // ---- Small-M W4 projection: one weight scan for M=2..4 ----------------
+    {
+        constexpr int K = 256;
+        constexpr int N = 64;
+        constexpr int GS = 128;
+        constexpr int GPR = K / GS;
+        for (int M : {2, 3, 4}) {
+            std::vector<float> activations(M * K);
+            fill_rand(activations.data(), M * K);
+            std::vector<int8_t> weights(N * K);
+            std::vector<float> scales(N * GPR);
+            for (int n = 0; n < N; ++n) {
+                for (int g = 0; g < GPR; ++g)
+                    scales[n * GPR + g] =
+                        0.0007f + 0.00003f * ((n + g) % 7);
+                for (int k = 0; k < K; ++k)
+                    weights[n * K + k] =
+                        static_cast<int8_t>((n * 7 + k * 5) % 16 - 8);
+            }
+
+            const size_t packed_bytes =
+                static_cast<size_t>(N) * K / 2;
+            std::vector<uint8_t> storage(
+                packed_bytes + scales.size() * sizeof(float));
+            for (int n = 0; n < N; ++n) {
+                for (int k = 0; k < K; k += 2) {
+                    const int lo = weights[n * K + k] + 8;
+                    const int hi = weights[n * K + k + 1] + 8;
+                    storage[static_cast<size_t>(n) * (K / 2) + k / 2] =
+                        static_cast<uint8_t>((hi << 4) | lo);
+                }
+            }
+            std::memcpy(storage.data() + packed_bytes, scales.data(),
+                        scales.size() * sizeof(float));
+            mb.register_weight_region(storage.data(), storage.size());
+
+            Tensor A = make_dev(mb, Precision::FP32, K, M);
+            std::memcpy(A.data, activations.data(),
+                        activations.size() * sizeof(float));
+            Tensor C = make_dev(mb, Precision::FP32, N, M);
+            Tensor B = Tensor::create(
+                Precision::INT4, MemoryType::EXTERNAL,
+                N, K, 1, 1, storage.data());
+            B.scales = reinterpret_cast<const float*>(
+                storage.data() + packed_bytes);
+            B.group_size = GS;
+            B.groups_per_row = GPR;
+            B.num_groups = N * GPR;
+            mb.wrap_weight(B);
+            metal_matmul(mb, A, B, C);
+
+            std::vector<float> reference(M * N, 0.0f);
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    double sum = 0.0;
+                    for (int g = 0; g < GPR; ++g) {
+                        double group_sum = 0.0;
+                        for (int k = g * GS; k < (g + 1) * GS; ++k)
+                            group_sum +=
+                                static_cast<double>(activations[m * K + k]) *
+                                weights[n * K + k];
+                        sum += group_sum * scales[n * GPR + g];
+                    }
+                    reference[m * N + n] = static_cast<float>(sum);
+                }
+            }
+            char label[64];
+            snprintf(label, sizeof(label),
+                     "W4 small-M GEMV M=%d", M);
+            CHECK(close(static_cast<const float*>(C.data), reference.data(),
+                        M * N, 1e-4f, 3e-2f),
+                  label);
+            std::vector<float> batch_output(M * N);
+            const bool batch_ok = mb.lm_head_small_batch(
+                activations.data(), B, batch_output.data(), M, N, K);
+            snprintf(label, sizeof(label),
+                     "W4 small-M lm_head batch M=%d", M);
+            CHECK(batch_ok &&
+                      close(batch_output.data(), reference.data(), M * N,
+                            1e-4f, 3e-2f),
+                  label);
+            std::vector<float> fused_output(M * N);
+            mb.begin_graph();
+            const bool fused_ok =
+                mb.lm_head_small_batch_device_and_end_graph(
+                    A, B, fused_output.data(), M, N, K);
+            snprintf(label, sizeof(label),
+                     "W4 small-M fused lm_head M=%d", M);
+            CHECK(fused_ok &&
+                      close(fused_output.data(), reference.data(), M * N,
+                            1e-4f, 3e-2f),
+                  label);
+            std::vector<int> batch_top1(M, -1);
+            mb.begin_graph();
+            const bool batch_top1_ok =
+                mb.lm_head_small_batch_argmax_device_and_end_graph(
+                    A, B, batch_top1.data(), M, N, K);
+            bool batch_top1_matches = batch_top1_ok;
+            for (int m = 0; m < M; ++m) {
+                const int expected = static_cast<int>(
+                    std::max_element(reference.begin() + m * N,
+                                     reference.begin() + (m + 1) * N) -
+                    (reference.begin() + m * N));
+                batch_top1_matches =
+                    batch_top1_matches && batch_top1[m] == expected;
+            }
+            snprintf(label, sizeof(label),
+                     "W4 small-M batched GPU argmax M=%d", M);
+            CHECK(batch_top1_matches, label);
+            if (M == 2) {
+                mb.begin_graph();
+                const int top1 =
+                    mb.lm_head_argmax_device_and_end_graph(
+                        A, 0, B, N, K);
+                const int expected = static_cast<int>(
+                    std::max_element(reference.begin(),
+                                     reference.begin() + N) -
+                    reference.begin());
+                CHECK(top1 == expected, "W4 fused lm_head GPU argmax");
+            }
+        }
+    }
+
+    // ---- Small-M W8 projection: one weight scan for M=2..4 ----------------
+    {
+        constexpr int K = 256;
+        constexpr int N = 64;
+        constexpr int GS = 128;
+        constexpr int GPR = K / GS;
+        for (int M : {2, 3, 4}) {
+            std::vector<float> activations(M * K);
+            for (int i = 0; i < M * K; ++i)
+                activations[i] =
+                    0.001f * static_cast<float>((i * 29 + 7) % 997 - 498);
+            std::vector<int8_t> weights(N * K);
+            std::vector<float> scales(N * GPR);
+            for (int n = 0; n < N; ++n) {
+                for (int g = 0; g < GPR; ++g)
+                    scales[n * GPR + g] =
+                        0.0007f + 0.00003f * ((n + g) % 7);
+                for (int k = 0; k < K; ++k)
+                    weights[n * K + k] = static_cast<int8_t>(
+                        (n * 17 + k * 11) % 255 - 127);
+            }
+
+            const size_t weight_bytes = weights.size();
+            const size_t scales_offset =
+                (weight_bytes + sizeof(float) - 1) &
+                ~(sizeof(float) - 1);
+            std::vector<uint8_t> storage(
+                scales_offset + scales.size() * sizeof(float));
+            std::memcpy(storage.data(), weights.data(), weight_bytes);
+            std::memcpy(storage.data() + scales_offset, scales.data(),
+                        scales.size() * sizeof(float));
+            mb.register_weight_region(storage.data(), storage.size());
+
+            Tensor A = make_dev(mb, Precision::FP32, K, M);
+            std::memcpy(A.data, activations.data(),
+                        activations.size() * sizeof(float));
+            Tensor C = make_dev(mb, Precision::FP32, N, M);
+            Tensor B = Tensor::create(
+                Precision::INT8, MemoryType::EXTERNAL,
+                N, K, 1, 1, storage.data());
+            B.scales = reinterpret_cast<const float*>(
+                storage.data() + scales_offset);
+            B.group_size = GS;
+            B.groups_per_row = GPR;
+            B.num_groups = N * GPR;
+            mb.wrap_weight(B);
+            metal_matmul(mb, A, B, C);
+
+            std::vector<float> reference(M * N, 0.0f);
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < N; ++n) {
+                    double sum = 0.0;
+                    for (int k = 0; k < K; ++k) {
+                        sum +=
+                            static_cast<double>(activations[m * K + k]) *
+                            weights[n * K + k] *
+                            scales[n * GPR + k / GS];
+                    }
+                    reference[m * N + n] = static_cast<float>(sum);
+                }
+            }
+            char label[64];
+            snprintf(label, sizeof(label),
+                     "W8 small-M GEMV M=%d", M);
+            CHECK(close(static_cast<const float*>(C.data), reference.data(),
+                        M * N, 1e-4f, 3e-2f),
+                  label);
+            std::vector<float> batch_output(M * N);
+            const bool batch_ok = mb.lm_head_small_batch(
+                activations.data(), B, batch_output.data(), M, N, K);
+            snprintf(label, sizeof(label),
+                     "W8 small-M lm_head batch M=%d", M);
+            CHECK(batch_ok &&
+                      close(batch_output.data(), reference.data(), M * N,
+                            1e-4f, 3e-2f),
+                  label);
+            std::vector<float> fused_output(M * N);
+            mb.begin_graph();
+            const bool fused_ok =
+                mb.lm_head_small_batch_device_and_end_graph(
+                    A, B, fused_output.data(), M, N, K);
+            snprintf(label, sizeof(label),
+                     "W8 small-M fused lm_head M=%d", M);
+            CHECK(fused_ok &&
+                      close(fused_output.data(), reference.data(), M * N,
+                            1e-4f, 3e-2f),
+                  label);
+            std::vector<int> batch_top1(M, -1);
+            mb.begin_graph();
+            const bool batch_top1_ok =
+                mb.lm_head_small_batch_argmax_device_and_end_graph(
+                    A, B, batch_top1.data(), M, N, K);
+            bool batch_top1_matches = batch_top1_ok;
+            for (int m = 0; m < M; ++m) {
+                const int expected = static_cast<int>(
+                    std::max_element(reference.begin() + m * N,
+                                     reference.begin() + (m + 1) * N) -
+                    (reference.begin() + m * N));
+                batch_top1_matches =
+                    batch_top1_matches && batch_top1[m] == expected;
+            }
+            snprintf(label, sizeof(label),
+                     "W8 small-M batched GPU argmax M=%d", M);
+            CHECK(batch_top1_matches, label);
+            if (M == 2) {
+                Tensor hidden_copy =
+                    make_dev(mb, Precision::FP32, K, 1);
+                mb.begin_graph();
+                const int top1 =
+                    mb.lm_head_argmax_device_and_end_graph(
+                        A, 0, B, N, K, 0, &hidden_copy);
+                const int expected = static_cast<int>(
+                    std::max_element(reference.begin(),
+                                     reference.begin() + N) -
+                    reference.begin());
+                CHECK(top1 == expected, "W8 fused lm_head GPU argmax");
+                CHECK(close(static_cast<const float*>(hidden_copy.data),
+                            activations.data(), K, 0.0f, 0.0f),
+                      "W8 fused lm_head keeps hidden state on GPU");
+            }
+        }
+    }
+
     // ---- W8A8 prefill GEMM (int8 activations x int8 per-channel weights) ----
     // Guards the int8xint8->int32 tensor path, whose cooperative-tensor layout
     // is compiler-sensitive (must match between offline metallib and runtime).
@@ -2078,6 +2324,50 @@ int main() {
                     2e-3f, 3e-2f),
               "Metal 128-expert native-BG128 MoE matches CPU");
 
+        // MTP verification uses 2..4 token rows. This covers the fused
+        // small-M router/BG128 activation quantizer and the selected-expert
+        // scheduling specialization with repeated GPU-resident weights.
+        for (int small_m : {2, 3, 4}) {
+            Tensor x_small =
+                make_dev(mb, Precision::FP32, H, small_m);
+            Tensor out_small =
+                make_dev(mb, Precision::FP32, H, small_m);
+            fill_rand(
+                static_cast<float*>(x_small.data),
+                static_cast<size_t>(H) * small_m);
+            std::vector<const Tensor*> inputs_small = {
+                &x_small, &router128, &gate_up128, &down128, &bias128};
+            mb.begin_graph();
+            mb.dispatch(moe128, inputs_small, &out_small, nullptr);
+            mb.end_graph();
+
+            std::vector<float> ref_small_data(
+                static_cast<size_t>(H) * small_m);
+            Tensor ref_small = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                H, small_m, 1, 1, ref_small_data.data());
+            ref_ok = kernel_qwen3_moe(
+                inputs_small, ref_small, nullptr,
+                H, E128, TOP, I, I,
+                1, true, false, 1, 1, 1.0f, false, 4);
+            char label[96];
+            std::snprintf(
+                label, sizeof(label),
+                "CPU reference native-BG128 MoE small-M=%d",
+                small_m);
+            CHECK(ref_ok, label);
+            std::snprintf(
+                label, sizeof(label),
+                "Metal native-BG128 MoE small-M=%d matches CPU",
+                small_m);
+            CHECK(close(
+                      static_cast<const float*>(out_small.data),
+                      ref_small_data.data(),
+                      static_cast<size_t>(H) * small_m,
+                      2e-3f, 3e-2f),
+                  label);
+        }
+
         moe.params.i32[8] = 8;
         moe.params.i32[9] = 4;
         mb.begin_graph();
@@ -2467,6 +2757,8 @@ int main() {
                           : "Metal resident W8 MoE prefill matches CPU");
         };
         run_w8_case(1, "CPU reference W8 MoE decode");
+        run_w8_case(2, "CPU reference W8 MoE M=2 prefill");
+        run_w8_case(3, "CPU reference W8 MoE M=3 prefill");
         run_w8_case(4, "CPU reference W8 MoE prefill");
         run_w8_case(64, "CPU reference grouped W8 MoE prefill");
     }

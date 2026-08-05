@@ -39,6 +39,7 @@ struct CliCommonOptions {
     bool ssd_global_cache = true;   // dynamically shared cache capacity across layers
     bool metal_ssd_full = false;    // full-Metal decode with direct Metal I/O
     std::string trace_path;      // optional Chrome Trace / Perfetto JSON output
+    int mtp_draft_tokens = 0;    // >0: use packaged single-head MTP
 
     SamplingParams sampling;
 

@@ -55,6 +55,19 @@ struct MatmulParams {
     int  act_n_len;      // -1=all columns, 0=none, >0=range length
 };
 
+// Two-pass reduction used when a caller needs only the top-1 token from a
+// vocabulary projection.  Keeping this next to MatmulParams makes the host and
+// shader layouts explicit; ArgMaxPair is an intermediate GPU-only buffer.
+struct ArgMaxPair {
+    float value;
+    uint  index;
+};
+
+struct ArgMaxParams {
+    uint count;
+    uint group_count;
+};
+
 // W8 (int8 weight-only) matmul: C[M,N] = A[M,K](fp32) * W_int8[N,K] * scale_w.
 // Weight is int8 row-major [N,K]; per-group fp32 scales at
 // scale[n*groups_per_row + k/group_size]. Weight and scales are bound separately.

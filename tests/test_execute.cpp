@@ -15,6 +15,62 @@ static int failures = 0;
 int main() {
     CPUBackend cpu_backend;  // shared across all ExecContexts below
 
+    // Partial execution is used by MTP synchronization: run through the
+    // stateful cache-update node, but skip an expensive stateless suffix.
+    {
+        Graph partial;
+        for (uint32_t id = 0; id < 2; ++id) {
+            GraphNode input;
+            input.id = id;
+            input.op_type = OpType::INPUT;
+            input.out_shape[0] = 4;
+            input.out_shape[1] = 1;
+            input.out_prec = Precision::FP32;
+            partial.nodes.push_back(input);
+        }
+        GraphNode mul;
+        mul.id = 2;
+        mul.op_type = OpType::MUL;
+        mul.inputs = {0, 1};
+        mul.out_shape[0] = 4;
+        mul.out_shape[1] = 1;
+        mul.out_prec = Precision::FP32;
+        partial.nodes.push_back(mul);
+        GraphNode add;
+        add.id = 3;
+        add.op_type = OpType::ADD;
+        add.inputs = {2, 1};
+        add.out_shape[0] = 4;
+        add.out_shape[1] = 1;
+        add.out_prec = Precision::FP32;
+        partial.nodes.push_back(add);
+        partial.graph_inputs = {0, 1};
+        partial.graph_outputs = {3};
+        partial.runtime.tensors.resize(4);
+        float lhs[4] = {1, 2, 3, 4};
+        float rhs[4] = {2, 3, 4, 5};
+        partial.runtime.tensors[0] = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, lhs);
+        partial.runtime.tensors[1] = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1, rhs);
+        BufferPool partial_pool;
+        ExecContext partial_ctx;
+        partial_ctx.graph = &partial;
+        partial_ctx.pool = &partial_pool;
+        partial_ctx.backend = &cpu_backend;
+        prepare_execution(partial_ctx);
+        execute_graph(partial_ctx, 2);
+        CHECK(partial.runtime.tensors[2].data != nullptr &&
+                  partial.runtime.tensors[2].at<float>(3) == 20.0f,
+              "partial graph executes through requested node");
+        CHECK(partial.runtime.tensors[3].data == nullptr,
+              "partial graph skips suffix");
+        execute_graph(partial_ctx);
+        CHECK(partial.runtime.tensors[3].data != nullptr &&
+                  partial.runtime.tensors[3].at<float>(3) == 25.0f,
+              "full graph remains valid after partial execution");
+    }
+
     // Recurrent decay must use the accurate path: even a small systematic
     // exp error compounds each time the RWKV state is written back.
     {

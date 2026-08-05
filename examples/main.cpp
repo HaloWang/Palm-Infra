@@ -237,7 +237,8 @@ void print_single_shot_header(const LLMEngine& engine) {
 
 // Print an aligned metric block (key 10-wide left, value 12-wide right).
 // Used at the end of each turn (single-shot and multi-turn).
-void print_metric_block(const GenerationMetrics& m, int ctx_len) {
+void print_metric_block(const GenerationMetrics& m, int ctx_len,
+                        const LLMEngine::MtpStats* mtp = nullptr) {
     std::printf("\n");
     std::printf(" %-10s %12.2f s\n",   "ttft",    m.ttft_ms / 1000.0);
     std::printf(" %-10s %12.1f ms\n",  "tpot",    m.tpot_ms);
@@ -245,7 +246,50 @@ void print_metric_block(const GenerationMetrics& m, int ctx_len) {
     std::printf(" %-10s %12.1f t/s\n", "decode",  m.decode_tps);
     std::printf(" %-10s %12d\n",       "tokens",  m.generated_tokens);
     std::printf(" %-10s %12d\n",       "ctx",     ctx_len);
+    if (mtp) {
+        const double acceptance = mtp->drafted
+            ? 100.0 * static_cast<double>(mtp->accepted) / mtp->drafted
+            : 0.0;
+        std::printf(" %-10s %10.1f %% (%llu/%llu)\n", "mtp accept",
+                    acceptance,
+                    static_cast<unsigned long long>(mtp->accepted),
+                    static_cast<unsigned long long>(mtp->drafted));
+    }
     std::printf("\n");
+}
+
+LLMEngine::MtpStats mtp_stats_delta(
+    const LLMEngine::MtpStats& after,
+    const LLMEngine::MtpStats& before) {
+    auto delta = [](uint64_t value, uint64_t base) {
+        return value >= base ? value - base : value;
+    };
+    LLMEngine::MtpStats result;
+    result.steps = delta(after.steps, before.steps);
+    result.draft_calls = delta(after.draft_calls, before.draft_calls);
+    result.drafted = delta(after.drafted, before.drafted);
+    result.accepted = delta(after.accepted, before.accepted);
+    result.fallback_steps =
+        delta(after.fallback_steps, before.fallback_steps);
+    result.verify_tokens = delta(after.verify_tokens, before.verify_tokens);
+    result.sync_tokens = delta(after.sync_tokens, before.sync_tokens);
+    for (size_t depth = 0;
+         depth < LLMEngine::MtpStats::kMaxDraftDepth; ++depth) {
+        result.attempts_by_depth[depth] = delta(
+            after.attempts_by_depth[depth], before.attempts_by_depth[depth]);
+        result.drafted_by_depth[depth] = delta(
+            after.drafted_by_depth[depth], before.drafted_by_depth[depth]);
+        result.accepted_by_depth[depth] = delta(
+            after.accepted_by_depth[depth], before.accepted_by_depth[depth]);
+    }
+    result.total_ms = after.total_ms - before.total_ms;
+    result.draft_ms = after.draft_ms - before.draft_ms;
+    result.draft_model_ms =
+        after.draft_model_ms - before.draft_model_ms;
+    result.verify_ms = after.verify_ms - before.verify_ms;
+    result.sample_ms = after.sample_ms - before.sample_ms;
+    result.sync_ms = after.sync_ms - before.sync_ms;
+    return result;
 }
 
 size_t common_prefix_len(const std::vector<int>& a, const std::vector<int>& b) {
@@ -341,7 +385,9 @@ bool run_prompt_single(LLMEngine& engine, const Tokenizer& tokenizer,
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
     std::printf("\n");
-    print_metric_block(metrics, engine.past_len());
+    const auto* mtp = engine.config().mtp_draft_tokens > 0
+        ? &engine.mtp_stats() : nullptr;
+    print_metric_block(metrics, engine.past_len(), mtp);
     return true;
 }
 
@@ -371,6 +417,7 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
     GenerationResult result;
     std::string error;
     TokenStreamPrinter stream;
+    const auto mtp_before = engine.mtp_stats();
     // reset_context=false: multi-turn, keep the KV cache and prefill only the
     // prompt suffix that was not already consumed by previous turns.
     bool ok = generate_tokens(
@@ -411,7 +458,10 @@ bool run_turn_multi(LLMEngine& engine, const Tokenizer& tokenizer,
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_delta.size(), result);
     std::printf("\n");
-    print_metric_block(metrics, engine.past_len());
+    const auto mtp_turn = mtp_stats_delta(engine.mtp_stats(), mtp_before);
+    const auto* mtp = engine.config().mtp_draft_tokens > 0
+        ? &mtp_turn : nullptr;
+    print_metric_block(metrics, engine.past_len(), mtp);
     return true;
 }
 

@@ -117,18 +117,25 @@ void LLMEngine::clear_model_state() {
     graph_prefill_ = Graph{};
     graph_decode_ = Graph{};
     graph_vision_ = Graph{};
+    graph_mtp_ = Graph{};
     exec_ctx_prefill_ = ExecContext{};
     exec_ctx_decode_ = ExecContext{};
     exec_ctx_vision_ = ExecContext{};
+    exec_ctx_mtp_ = ExecContext{};
     metal_backend_.reset();
 
     caches_.clear();
+    mtp_caches_.clear();
     auxiliary_states_.clear();
     embed_weight_ = nullptr;
     lm_head_weight_ = nullptr;
     vision_pos_embed_ = nullptr;
     persistent_pool_.clear();
     hidden_output_copy_.clear();
+    mtp_hidden_output_copy_.clear();
+    mtp_draft_hidden_device_ = Tensor{};
+    mtp_pending_hidden_.clear();
+    mtp_stats_ = MtpStats{};
 
     for (const auto& range : locked_dense_ranges_) {
         munlock(range.first, range.second);
@@ -161,6 +168,7 @@ void LLMEngine::clear_model_state() {
 
     package_metadata_.clear();
     past_len_ = 0;
+    mtp_past_len_ = 0;
     rope_position_delta_ = 0;
     multimodal_position_ids_.clear();
     active_vision_ = nullptr;
@@ -697,7 +705,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 // allocate_caches — allocate KV cache buffers with metadata header
 // ---------------------------------------------------------------------------
 
-void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
+void LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
+                                std::vector<CachePair>& caches, int n_ctx) {
     // Find persistent INPUT nodes and initialise their tensor shapes.
     // All recurrent state follows this path: KV cache, GDN state, and RWKV
     // state.
@@ -718,16 +727,16 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         // Cache precision is a CPU-provider policy, not a graph-format or
         // loader architecture check.  The scalar provider keeps K/V in FP32;
         // the ARM provider retains the serialized FP16 cache path unchanged.
-        if (exec_ctx_prefill_.backend == &cpu_backend_ &&
+        if (exec_ctx.backend == &cpu_backend_ &&
             !mollm::cpu::capabilities().fp16_kv_cache &&
             (input.kind == PersistentInputKind::KV_KEY ||
              input.kind == PersistentInputKind::KV_VALUE)) {
             tensor.prec = Precision::FP32;
             tensor.compute_strides();
         }
-        if (input.layer >= (int)caches_.size())
-            caches_.resize(input.layer + 1);
-        CachePair& cache = caches_[input.layer];
+        if (input.layer >= (int)caches.size())
+            caches.resize(input.layer + 1);
+        CachePair& cache = caches[input.layer];
 
         switch (input.kind) {
         case PersistentInputKind::KV_KEY:
@@ -788,7 +797,7 @@ void LLMEngine::allocate_caches(Graph& g, int n_ctx) {
         return buf;
     };
 
-    for (auto& cp : caches_) {
+    for (auto& cp : caches) {
         // Standard KV cache
         if (cp.k) {
             int hd = cp.k_head_dim;
@@ -937,11 +946,15 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.thread_pool = &thread_pool_;
     exec_ctx_decode_.thread_pool = &thread_pool_;
     exec_ctx_vision_.thread_pool = &thread_pool_;
+    exec_ctx_mtp_.thread_pool = &thread_pool_;
     exec_ctx_prefill_.trace_label = "prefill";
     exec_ctx_decode_.trace_label = "decode";
     exec_ctx_vision_.trace_label = "vision";
+    exec_ctx_mtp_.trace_label = "mtp";
     exec_ctx_prefill_.moe_cross_layer_prefetch = false;
     exec_ctx_prefill_.moe_hash_cross_layer_prefetch = false;
+    exec_ctx_mtp_.moe_cross_layer_prefetch = false;
+    exec_ctx_mtp_.moe_hash_cross_layer_prefetch = false;
     exec_ctx_decode_.moe_cross_layer_prefetch =
         cfg_.moe_ssd_cache_bytes != 0 &&
         !cfg_.metal_ssd_full && cfg_.moe_ssd_global_cache &&
@@ -951,9 +964,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.backend = &cpu_backend_;
     exec_ctx_decode_.backend = &cpu_backend_;
     exec_ctx_vision_.backend = &cpu_backend_;
+    exec_ctx_mtp_.backend = &cpu_backend_;
     exec_ctx_prefill_.moe_backend = nullptr;
     exec_ctx_decode_.moe_backend = nullptr;
     exec_ctx_vision_.moe_backend = nullptr;
+    exec_ctx_mtp_.moe_backend = nullptr;
     metal_backend_.reset();
     if (cfg_.device == Device::METAL) {
 #ifdef MOLLM_METAL
@@ -974,6 +989,7 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 cfg_.moe_ssd_cache_bytes != 0 && !cfg_.metal_ssd_full
                 ? static_cast<Backend*>(&cpu_backend_)
                 : metal_backend_.get();
+            exec_ctx_mtp_.backend = exec_ctx_decode_.backend;
         }
 #else
         fprintf(stderr,
@@ -985,6 +1001,8 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     exec_ctx_prefill_.reuse_same_shape_workspace = true;
     exec_ctx_decode_.reuse_static_workspace = true;
     exec_ctx_decode_.reuse_same_shape_workspace = false;
+    exec_ctx_mtp_.reuse_static_workspace = false;
+    exec_ctx_mtp_.reuse_same_shape_workspace = true;
 
     // Load the .mollm package (sets up weights mmap, extracts graphs to temp
     // files, parses metadata for weight offset map).
@@ -993,10 +1011,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
                 "Engine: package_path is required (use .mollm package)\n");
         return false;
     }
-    std::string pf_path, dc_path, vi_path;
+    std::string pf_path, dc_path, vi_path, mtp_path;
     {
         std::string tok_tmp, jinja_tmp;
         if (!load_package(cfg.package_path, pf_path, dc_path, vi_path,
+                          mtp_path,
                           tok_tmp, jinja_tmp)) {
             return false;
         }
@@ -1006,6 +1025,11 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         if (!jinja_tmp.empty()) {
             cfg_.chat_template_path = jinja_tmp;
         }
+    }
+    if (cfg_.mtp_draft_tokens > 0 && mtp_path.empty()) {
+        fprintf(stderr,
+                "Engine: --mtp-draft-tokens requires a package with an MTP graph\n");
+        return false;
     }
 
     const auto architecture_it = package_metadata_.find("architecture");
@@ -1150,11 +1174,17 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
     cfg_.rope_dim = get_meta_int("rope_dim", cfg_.rope_dim);
     cfg_.rope_theta = get_meta_float("rope_theta", cfg_.rope_theta);
 
-    allocate_caches(graph_prefill_, cfg.n_ctx);
+    allocate_caches(graph_prefill_, exec_ctx_prefill_, caches_, cfg.n_ctx);
 
     // Load decode graph (reuses shared weights via weight_map_)
     if (!load_graph(graph_decode_, exec_ctx_decode_, dc_path.c_str())) {
         return false;
+    }
+    if (cfg_.mtp_draft_tokens > 0) {
+        if (!load_graph(graph_mtp_, exec_ctx_mtp_, mtp_path.c_str())) {
+            return false;
+        }
+        allocate_caches(graph_mtp_, exec_ctx_mtp_, mtp_caches_, cfg.n_ctx);
     }
     // Graph loading builds the CPU sidecars used by FP8 dense weights and
     // records their source blobs as exclusions. Lock only after both graphs

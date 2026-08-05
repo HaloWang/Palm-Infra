@@ -21,6 +21,8 @@ void test_greedy_and_filters() {
         SamplingParams p;
         p.temperature = 0.0f;
         Sampler sampler(p);
+        expect(sampler.uses_plain_argmax(),
+               "temperature=0 exposes the plain-argmax fast path");
         float logits[] = {0.5f, 3.0f, 2.0f};
         expect(sampler.sample(logits, 3) == 1, "temperature=0 is greedy");
     }
@@ -29,6 +31,8 @@ void test_greedy_and_filters() {
         p.temperature = 1.0f;
         p.top_k = 1;
         Sampler sampler(p);
+        expect(sampler.uses_plain_argmax(),
+               "top_k=1 exposes the plain-argmax fast path");
         float logits[] = {0.5f, 3.0f, 2.0f};
         expect(sampler.sample(logits, 3) == 1, "top_k=1 is greedy");
     }
@@ -61,6 +65,8 @@ void test_penalties_and_logit_restore() {
         p.temperature = 0.0f;
         p.presence_penalty = 1.0f;
         Sampler sampler(p);
+        expect(!sampler.uses_plain_argmax(),
+               "penalties disable the plain-argmax fast path");
         sampler.accept(0);
         float logits[] = {3.0f, 2.5f};
         expect(sampler.sample(logits, 2) == 1,
@@ -156,6 +162,64 @@ void test_seed_and_reset() {
            "reset restores the configured seed");
 }
 
+void test_probability_and_rejection_sampling() {
+    {
+        SamplingParams p;
+        p.temperature = 1.0f;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        Sampler sampler(p);
+        const float logits[] = {0.0f, std::log(2.0f), std::log(3.0f)};
+        std::vector<float> probabilities;
+        sampler.probabilities(logits, 3, {}, probabilities);
+        expect(probabilities.size() == 3,
+               "probability builder returns the complete vocabulary");
+        expect(std::fabs(probabilities[0] - 1.0f / 6.0f) < 1e-5f &&
+                   std::fabs(probabilities[1] - 2.0f / 6.0f) < 1e-5f &&
+                   std::fabs(probabilities[2] - 3.0f / 6.0f) < 1e-5f,
+               "probability builder matches temperature softmax");
+    }
+    {
+        SamplingParams p;
+        p.temperature = 0.0f;
+        p.presence_penalty = 2.0f;
+        Sampler sampler(p);
+        const float logits[] = {3.0f, 2.0f};
+        std::vector<float> probabilities;
+        sampler.probabilities(logits, 2, {0}, probabilities);
+        expect(probabilities[0] == 0.0f && probabilities[1] == 1.0f,
+               "uncommitted proposal history participates in penalties");
+        expect(sampler.history_size() == 0,
+               "probability construction does not commit proposal history");
+    }
+    {
+        SamplingParams p;
+        p.temperature = 1.0f;
+        p.top_k = 0;
+        p.top_p = 1.0f;
+        p.seed = 1234;
+        Sampler sampler(p);
+        const std::vector<float> target = {0.1f, 0.3f, 0.6f};
+        const std::vector<float> proposal = {0.5f, 0.4f, 0.1f};
+        int counts[3] = {0, 0, 0};
+        constexpr int trials = 50000;
+        for (int i = 0; i < trials; ++i) {
+            const int proposed = sampler.sample_probabilities(proposal);
+            bool accepted = false;
+            const int sampled = sampler.speculative_sample(
+                target, proposal, proposed, &accepted);
+            (void)accepted;
+            ++counts[sampled];
+        }
+        for (int token = 0; token < 3; ++token) {
+            const float observed =
+                static_cast<float>(counts[token]) / trials;
+            expect(std::fabs(observed - target[token]) < 0.01f,
+                   "p/q rejection sampling reproduces the target distribution");
+        }
+    }
+}
+
 void test_validation() {
     SamplingParams p;
     std::string error;
@@ -179,6 +243,7 @@ int main() {
     test_greedy_and_filters();
     test_penalties_and_logit_restore();
     test_seed_and_reset();
+    test_probability_and_rejection_sampling();
     test_validation();
     if (failures != 0)
         return 1;

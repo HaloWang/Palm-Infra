@@ -8,6 +8,7 @@
 #include "kernels/threading.h"
 #include "kernels/moe_ssd.h"
 
+#include <array>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -115,6 +116,9 @@ struct EngineConfig {
     bool metal_ssd_full = false;
     // Optional Chrome Trace / Perfetto JSON path. Empty disables tracing.
     std::string trace_path;
+    // Experimental single-head MTP speculation. Zero keeps the ordinary
+    // generation path even when the package contains an MTP graph.
+    int mtp_draft_tokens = 0;
 
     SamplingParams sampling;
 
@@ -173,13 +177,21 @@ public:
 
     /// Like prefill() but returns the raw hidden states instead of the sampled token.
     /// Used by tests for perplexity computation.
-    Tensor prefill_hidden(const std::vector<int>& token_ids);
+    Tensor prefill_hidden(const std::vector<int>& token_ids,
+                          std::vector<float>* all_logits = nullptr,
+                          std::vector<int>* all_top1 = nullptr);
 
     /// Like decode() but returns the raw hidden state instead of the sampled token.
     Tensor decode_hidden(int token_id);
 
     /// Process a single token (decode step).
     int decode(int token_id);
+
+    /// Verify a short MTP draft while processing token_id. Every returned
+    /// token is sampled by the target model; MTP only batches target work.
+    bool speculative_decode(int token_id, std::vector<int>& output_tokens,
+                            int max_output_tokens = 17,
+                            int stop_token_id = -1);
 
     /// Run the packaged Qwen3.5 vision tower on processor-compatible flattened
     /// patches. `pixel_values` is token-major [grid_t*grid_h*grid_w, patch_dim].
@@ -206,6 +218,27 @@ public:
     }
     int past_len() const { return past_len_; }
     bool has_vision_encoder() const { return !graph_vision_.nodes.empty(); }
+    bool has_mtp() const { return !graph_mtp_.nodes.empty(); }
+    struct MtpStats {
+        static constexpr size_t kMaxDraftDepth = 16;
+        uint64_t steps = 0;
+        uint64_t draft_calls = 0;
+        uint64_t drafted = 0;
+        uint64_t accepted = 0;
+        uint64_t fallback_steps = 0;
+        uint64_t verify_tokens = 0;
+        uint64_t sync_tokens = 0;
+        std::array<uint64_t, kMaxDraftDepth> attempts_by_depth{};
+        std::array<uint64_t, kMaxDraftDepth> drafted_by_depth{};
+        std::array<uint64_t, kMaxDraftDepth> accepted_by_depth{};
+        double total_ms = 0.0;
+        double draft_ms = 0.0;
+        double draft_model_ms = 0.0;
+        double verify_ms = 0.0;
+        double sample_ms = 0.0;
+        double sync_ms = 0.0;
+    };
+    const MtpStats& mtp_stats() const { return mtp_stats_; }
     // Package-level metadata fields (model_name, architecture, quantization,
     // num_layers, hidden_size, num_heads, n_ctx, vocab_size, prefill_seq_len).
     // Empty for packages without a metadata JSON section.
@@ -272,15 +305,19 @@ private:
     Graph graph_prefill_;
     Graph graph_decode_;
     Graph graph_vision_;
+    Graph graph_mtp_;
     ExecContext exec_ctx_prefill_;
     ExecContext exec_ctx_decode_;
     ExecContext exec_ctx_vision_;
+    ExecContext exec_ctx_mtp_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
     // Owned Metal backend (as base Backend* so the header needs no ObjC/Metal
     // include). Non-null iff Metal is active; Backend has a virtual destructor.
     std::unique_ptr<Backend> metal_backend_;
     int past_len_ = 0;
+    int mtp_past_len_ = 0;
+    MtpStats mtp_stats_;
 
     // Shared mmap'd weight files (path → MappedFile)
     std::unordered_map<std::string, size_t> weight_map_;  // path → index into shared_weights_
@@ -324,6 +361,9 @@ private:
     // Engine-owned contiguous copy returned by prefill_hidden/decode_hidden.
     // Valid until the next hidden-output call on this engine.
     std::vector<uint8_t> hidden_output_copy_;
+    std::vector<uint8_t> mtp_hidden_output_copy_;
+    Tensor mtp_draft_hidden_device_;
+    std::vector<float> mtp_pending_hidden_;
 
     // Engine-lifetime storage for KV cache and recurrent state. Graph pools
     // are reserved for per-execution temporaries.
@@ -355,6 +395,7 @@ private:
         bool is_linear_attn = false;
     };
     std::vector<CachePair> caches_;
+    std::vector<CachePair> mtp_caches_;
     // Plain model-specific persistent tensors keyed by their serialized
     // `aux_state<N>` input id.
     std::unordered_map<int, Tensor*> auxiliary_states_;
@@ -362,7 +403,8 @@ private:
     /// Embed tokens.
     Tensor embed(const std::vector<int>& token_ids, int pad_to = 0);
 
-    Tensor build_causal_mask(int seq_len, int past_len);
+    Tensor build_causal_mask(int seq_len, int past_len,
+                             bool initialize = true);
     void generate_rope_cache(int seq_len, int start_pos,
                              Tensor& cos, Tensor& sin);
     void generate_multimodal_rope_cache(int seq_len, int token_offset,
@@ -381,7 +423,24 @@ private:
                      const Tensor& hidden, const Tensor& mask,
                      const Tensor& cos, const Tensor& sin,
                      const Tensor* token_ids = nullptr,
-                     bool defer_metal_end = false);
+                     bool defer_metal_end = false,
+                     const Tensor* target_hidden = nullptr,
+                     int graph_position = -1,
+                     int stop_after_node_index = -1);
+
+    Tensor run_mtp_tokens(const std::vector<int>& token_ids,
+                          const Tensor& target_hidden, int position,
+                          int* draft_token = nullptr);
+    bool update_mtp_cache(const std::vector<int>& token_ids,
+                          const Tensor& target_hidden, int position);
+    bool execute_mtp_tokens(const std::vector<int>& token_ids,
+                            const Tensor& target_hidden, int position,
+                            bool cache_only, Tensor* hidden_output,
+                            int* draft_token);
+    bool sync_mtp(const std::vector<int>& token_ids,
+                  const Tensor& verified_hidden, int position,
+                  int preserved_prefix = 0);
+    void set_cache_length(std::vector<CachePair>& caches, int length);
 
     /// Transactional public-load implementation and shared teardown path.
     bool load_impl(const EngineConfig& cfg);
@@ -391,11 +450,13 @@ private:
     bool load_graph(Graph& g, ExecContext& exec_ctx, const char* path);
     bool load_package(const std::string& path, std::string& pf_path,
                       std::string& dc_path, std::string& vi_path,
+                      std::string& mtp_path,
                       std::string& tok_path, std::string& jinja_path);
     size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.
-    void allocate_caches(Graph& g, int n_ctx);
+    void allocate_caches(Graph& g, ExecContext& exec_ctx,
+                         std::vector<CachePair>& caches, int n_ctx);
 
     /// Process a single chunk of tokens (≤ graph_seq_len).
     /// Called by prefill() in a loop for chunked prefill.

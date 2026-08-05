@@ -105,6 +105,10 @@ public:
     void upload_input(Tensor& t, const std::string& key,
                       const void* host_src, size_t nbytes);
 
+    /// Bind a reusable all-zero boundary buffer.  Once cleared, repeated
+    /// single-token causal masks require neither a host fill nor an upload.
+    void upload_zero_input(Tensor& t, const std::string& key, size_t nbytes);
+
     /// Run a single GEMV on the GPU: out[N] = a[K] (fp32) * W[N,K] (fp16),
     /// used for the lm_head projection during decode. `a_host` is a host FP32
     /// vector of length K; `weight` is a device-resident FP16 weight tensor
@@ -113,6 +117,26 @@ public:
     void lm_head_gemv(const float* a_host, const Tensor& weight,
                       float* out_host, int N, int K, int activation = 0);
 
+    /// Project a contiguous MxK host activation batch with a decoded W4/W8
+    /// weight in one Metal submission. Intended for M=2..4 speculative
+    /// verification; returns false for unsupported shapes or dispatch errors.
+    bool lm_head_small_batch(const float* a_host, const Tensor& weight,
+                             float* out_host, int M, int N, int K,
+                             int activation = 0);
+
+    /// Append the small-M lm_head projection to the currently open graph,
+    /// reading the graph output directly and closing/waiting once at the end.
+    bool lm_head_small_batch_device_and_end_graph(
+        const Tensor& a, const Tensor& weight, float* out_host,
+        int M, int N, int K, int activation = 0);
+
+    /// Append a small-M projection and per-row GPU argmax to the open graph.
+    /// Only M token IDs are copied to the host; intended for plain-greedy MTP
+    /// verification. Returns false for unsupported shapes or dispatch errors.
+    bool lm_head_small_batch_argmax_device_and_end_graph(
+        const Tensor& a, const Tensor& weight, int* top1_out,
+        int M, int N, int K, int activation = 0);
+
     /// Append lm_head GEMV to the currently open graph command stream, reading
     /// the graph output directly from its device buffer. This closes and waits
     /// for the graph, then copies logits to `out_host` for sampling.
@@ -120,11 +144,24 @@ public:
         const Tensor& a, size_t a_element_offset, const Tensor& weight,
         float* out_host, int N, int K, int activation = 0);
 
+    /// Append lm_head GEMV and a GPU top-1 reduction to the open graph.  This
+    /// returns only the winning token id instead of copying N logits to CPU.
+    /// Returns -1 when the projection or reduction cannot be dispatched.
+    int lm_head_argmax_device_and_end_graph(
+        const Tensor& a, size_t a_element_offset, const Tensor& weight,
+        int N, int K, int activation = 0,
+        Tensor* hidden_copy = nullptr);
+
 private:
     void lm_head_gemv_impl(void* a_device, size_t a_byte_offset,
                            const Tensor& weight, float* out_host,
                            int N, int K, int activation,
-                           bool finish_open_graph);
+                           bool finish_open_graph, int* top1_out = nullptr,
+                           Tensor* hidden_copy = nullptr);
+    bool lm_head_small_batch_impl(
+        void* a_device, size_t a_byte_offset, const Tensor& weight,
+        float* out_host, int M, int N, int K, int activation,
+        bool finish_open_graph, int* top1_out = nullptr);
 
     /// Debug: flush the current command buffer (commit+wait) so intermediate
     /// device buffers become host-readable. No-op unless MOLLM_METAL_SYNC_EACH.

@@ -90,6 +90,8 @@ void prepare_execution(ExecContext& ctx);
 /// execute_graph() when the graph contains dynamic DimExpr dims.
 void inject_runtime_shapes(ExecContext& ctx);
 
-/// Execute the graph once.  Input tensors must already have data set.
+/// Execute the graph once. Input tensors must already have data set. A
+/// non-negative stop index executes through that node, including its stateful
+/// side effects, then returns without running the unused graph suffix.
 /// Allocates intermediate tensors from the BufferPool.
-void execute_graph(ExecContext& ctx);
+void execute_graph(ExecContext& ctx, int stop_after_node_index = -1);

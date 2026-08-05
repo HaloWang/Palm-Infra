@@ -62,6 +62,17 @@ def _router_score_func(cfg: dict) -> int:
     return ROUTER_SCORE_SIGMOID if _has_router_bias(cfg) else ROUTER_SCORE_SOFTMAX
 
 
+def _mtp_quantization(quant: str, override: str | None = None) -> str:
+    """Resolve the draft-block precision independently of the target."""
+    if override is not None:
+        return _canonical_quant(override)
+    if quant.startswith("w4mixg"):
+        return "w8g" + quant[len("w4mixg"):]
+    if quant.startswith("w4g"):
+        return "w8g" + quant[len("w4g"):]
+    return quant
+
+
 def _prepare_config_for_weights(model_dir: Path, cfg: dict) -> dict:
     cfg = dict(cfg)
     weight_names = set(_weight_map(model_dir))
@@ -253,7 +264,9 @@ def _fallback_model_name(model_dir: Path, cfg: dict, num_layers: int) -> str:
 
 
 def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
-                   num_layers: int, quant: str = "fp16"):
+                   num_layers: int, quant: str = "fp16",
+                   mtp_layers: int = 0,
+                   mtp_quant: str | None = None):
     os.makedirs(weights_dir, exist_ok=True)
     quant = _canonical_quant(quant)
     quant_counts = {"w4": 0, "w8": 0}
@@ -266,17 +279,38 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
     weight_map = _weight_map(model_dir)
     qkv_parts: dict[int, dict[str, np.ndarray]] = {}
     dense_gate_up_parts: dict[int, dict[str, np.ndarray]] = {}
+    mtp_prefix = f"model.layers.{num_layers}." if mtp_layers else ""
+    resolved_mtp_quant = _mtp_quantization(quant, mtp_quant)
+
+    def effective_quant(raw_name: str) -> str:
+        if not mtp_prefix or not raw_name.startswith(mtp_prefix):
+            return quant
+        # Draft-head errors directly reduce the number of target tokens saved.
+        # Keep a W4 target package compact, but give its single MTP block W8
+        # weights so quantization noise does not erase speculative acceptance.
+        return resolved_mtp_quant
 
     def save(name: str, data: np.ndarray, quantizable: bool = False,
              raw_name: str = ""):
         _write_maybe_quantized(
             os.path.join(weights_dir, f"{name}.weights"),
-            data, quant, quantizable, raw_name or name, quant_counts)
+            data, effective_quant(raw_name or name), quantizable,
+            raw_name or name, quant_counts)
 
     print("  Exporting non-expert weights...")
+    total_layers = num_layers + mtp_layers
+    non_expert_names = _non_expert_weight_names(
+        cfg, total_layers, set(weight_map))
+    if mtp_layers:
+        mtp_idx = num_layers
+        non_expert_names.update({
+            f"model.layers.{mtp_idx}.eh_proj.weight",
+            f"model.layers.{mtp_idx}.enorm.weight",
+            f"model.layers.{mtp_idx}.hnorm.weight",
+            f"model.layers.{mtp_idx}.shared_head.norm.weight",
+        })
     for wname, dtype_str, wdata in _selected_safetensors(
-            model_dir, _non_expert_weight_names(cfg, num_layers,
-                                                set(weight_map))):
+            model_dir, non_expert_names):
         if wname == "model.embed_tokens.weight":
             save("embed_tokens", _as_fp16(dtype_str, wdata))
             continue
@@ -350,8 +384,8 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
             "incomplete dense gate/up projection sets for layers: "
             + ", ".join(str(i) for i in sorted(dense_gate_up_parts)))
 
-    for layer_idx in range(dense_until, num_layers):
-        print(f"  Exporting MoE experts layer {layer_idx}/{num_layers - 1}...")
+    for layer_idx in range(dense_until, total_layers):
+        print(f"  Exporting MoE experts layer {layer_idx}/{total_layers - 1}...")
         gate_up = np.empty((num_experts * 2 * moe_intermediate, hidden_size),
                            dtype=np.float16)
         down = np.empty((num_experts * hidden_size, moe_intermediate),
@@ -498,6 +532,95 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     x = x_normed
 
     print(f"  Total: {len(g._nodes)} nodes")
+    return g
+
+
+def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 256,
+                    n_ctx: int = 16384) -> GraphBuilder:
+    """Build the single Qwen3-style next-token prediction decoder block.
+
+    The MTP block consumes the embedding of token t and the target decoder's
+    final hidden state at t-1. It owns an independent KV cache; the runtime
+    periodically replaces speculative hidden inputs with verified target
+    hidden states to keep that cache exact.
+    """
+    from transpile import DimExpr
+
+    g = GraphBuilder()
+    hidden_size = int(cfg["hidden_size"])
+    layer_idx = int(cfg["num_hidden_layers"])
+    num_heads = int(cfg["num_attention_heads"])
+    num_kv_heads = int(cfg.get("num_key_value_heads", num_heads))
+    head_dim = int(cfg.get("head_dim", hidden_size // num_heads))
+    intermediate = int(cfg["intermediate_size"])
+    moe_intermediate = int(cfg["moe_intermediate_size"])
+    num_experts = _num_experts(cfg)
+    top_k = int(cfg["num_experts_per_tok"])
+    dense_until = int(cfg.get("first_k_dense_replace", 0))
+    n_shared = int(cfg.get("n_shared_experts", 0) or 0)
+    shared_intermediate = n_shared * moe_intermediate
+    eps = float(cfg.get("rms_norm_eps", 1e-6))
+    rope_theta = float(cfg.get("rope_theta", 10000.0))
+    rope_interleave = bool(cfg.get("rope_interleave", False))
+
+    g.set_model_config(
+        rope_dim=head_dim, rope_theta=rope_theta,
+        hidden_size=hidden_size, num_layers=1,
+        vocab_size=int(cfg["vocab_size"]), model_type="qwen3_moe_mtp")
+
+    const = DimExpr.const()
+    seq = DimExpr.seq()
+    hidden_dyn = (const, seq, const, const)
+    mask_dyn = (const, seq, const, const)
+    rope_dyn = (const, seq, const, const)
+    target_hidden = g.input(
+        "target_hidden", (hidden_size, seq_len), dynamic=hidden_dyn)
+    token_hidden = g.input(
+        "hidden", (hidden_size, seq_len), dynamic=hidden_dyn)
+    mask = g.input("mask", (1, seq_len), dynamic=mask_dyn)
+    cos = g.input("cos", (head_dim // 2, seq_len), dynamic=rope_dyn)
+    sin = g.input("sin", (head_dim // 2, seq_len), dynamic=rope_dyn)
+    ck = g.input("cache_k0", (head_dim, n_ctx, num_kv_heads),
+                 prec=Precision.FP16)
+    cv = g.input("cache_v0", (head_dim, n_ctx, num_kv_heads),
+                 prec=Precision.FP16)
+
+    pfx = f"model_layers_{layer_idx}"
+    hnorm = g.weight(
+        os.path.join(weights_dir, f"{pfx}_hnorm_weight.weights"),
+        (hidden_size,), Precision.FP32)
+    enorm = g.weight(
+        os.path.join(weights_dir, f"{pfx}_enorm_weight.weights"),
+        (hidden_size,), Precision.FP32)
+    eh_proj = g.weight(
+        os.path.join(weights_dir, f"{pfx}_eh_proj_weight.weights"),
+        (hidden_size, 2 * hidden_size), Precision.FP16)
+    input_norm = g.weight(
+        os.path.join(weights_dir, f"{pfx}_input_layernorm_weight.weights"),
+        (hidden_size,), Precision.FP32)
+    post_norm = g.weight(
+        os.path.join(
+            weights_dir, f"{pfx}_post_attention_layernorm_weight.weights"),
+        (hidden_size,), Precision.FP32)
+    head_norm = g.weight(
+        os.path.join(weights_dir, f"{pfx}_shared_head_norm_weight.weights"),
+        (hidden_size,), Precision.FP32)
+
+    h = g.rms_norm(target_hidden, hnorm, eps=eps)
+    e = g.rms_norm(token_hidden, enorm, eps=eps)
+    x = g.matmul(g.concat([e, h], dim=0), eh_proj)
+    x_normed = g.rms_norm(x, input_norm, eps=eps)
+    _, x_normed = _build_layer(
+        g, x, x_normed, post_norm, head_norm, layer_idx, weights_dir,
+        cos, sin, mask, ck, cv, eps, seq_len, num_heads, num_kv_heads,
+        head_dim, hidden_size, intermediate, moe_intermediate, num_experts,
+        top_k, dense_until, shared_intermediate, n_shared,
+        _has_router_bias(cfg), _router_score_func(cfg),
+        bool(cfg.get("norm_topk_prob", True)), int(cfg.get("n_group", 1)),
+        int(cfg.get("topk_group", 1)),
+        float(cfg.get("routed_scaling_factor", 1.0)),
+        str(cfg.get("_attn_norm_kind", "q_layernorm")), rope_interleave,
+        is_prefill=True)
     return g
 
 
@@ -680,9 +803,11 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
                       num_layers: int | None = None,
                       prefill_seq_len: int = 256,
                       n_ctx: int = 16384,
-                      quant: str = "fp16"):
+                      quant: str = "fp16",
+                      mtp_quant: str | None = None):
     model_dir = Path(model_dir)
     quant = _canonical_quant(quant)
+    resolved_mtp_quant = _mtp_quantization(quant, mtp_quant)
     with open(model_dir / "config.json") as f:
         cfg = json.load(f)
     cfg = _prepare_config_for_weights(model_dir, cfg)
@@ -695,13 +820,32 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
     if num_layers != config_num_layers:
         print(f"Debug: truncating Qwen3-MoE layers to {num_layers}/{config_num_layers}")
     cfg["num_hidden_layers"] = num_layers
+    mtp_layers = int(cfg.get("num_nextn_predict_layers", 0) or 0)
+    if num_layers != config_num_layers:
+        mtp_layers = 0
+    if mtp_layers not in (0, 1):
+        raise ValueError("only one Qwen3-style MTP layer is currently supported")
+    if mtp_layers:
+        available = set(_weight_map(model_dir))
+        required = {
+            f"model.layers.{num_layers}.eh_proj.weight",
+            f"model.layers.{num_layers}.enorm.weight",
+            f"model.layers.{num_layers}.hnorm.weight",
+            f"model.layers.{num_layers}.shared_head.norm.weight",
+        }
+        if not required.issubset(available):
+            print("MTP metadata is present but MTP tensors are incomplete; "
+                  "converting the target model only")
+            mtp_layers = 0
 
     tmp_dir = tempfile.mkdtemp(prefix="mollm_qwen3_moe_weights_")
     weights_dir = tmp_dir
     weights_rel = "."
     try:
         print("Exporting selected Qwen3-MoE weights...")
-        export_weights(model_dir, weights_dir, cfg, num_layers, quant=quant)
+        export_weights(model_dir, weights_dir, cfg, num_layers, quant=quant,
+                       mtp_layers=mtp_layers,
+                       mtp_quant=resolved_mtp_quant)
 
         print(f"\nBuilding prefill graph (seq_len={prefill_seq_len})...")
         g_prefill = build_graph(weights_rel, cfg, seq_len=prefill_seq_len,
@@ -709,6 +853,12 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
 
         print("\nBuilding decode graph (seq_len=1)...")
         g_decode = build_graph(weights_rel, cfg, seq_len=1, n_ctx=n_ctx)
+
+        g_mtp = None
+        if mtp_layers:
+            print("\nBuilding MTP graph...")
+            g_mtp = build_mtp_graph(
+                weights_rel, cfg, seq_len=prefill_seq_len, n_ctx=n_ctx)
 
         fallback_model_name = _fallback_model_name(model_dir, cfg, num_layers)
         metadata = {
@@ -727,14 +877,20 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
             "moe_intermediate_size": cfg["moe_intermediate_size"],
             "first_k_dense_replace": cfg.get("first_k_dense_replace", 0),
             "n_shared_experts": cfg.get("n_shared_experts", 0),
-            "moe_expert_storage": _moe_expert_storage_metadata(weights_rel, cfg, num_layers),
+            "moe_expert_storage": _moe_expert_storage_metadata(
+                weights_rel, cfg, num_layers + mtp_layers),
+            "num_nextn_predict_layers": mtp_layers,
+            "mtp_quantization": (
+                resolved_mtp_quant if mtp_layers else "none"),
             "quantization": quant,
         }
 
         print(f"\nPacking {output_path}...")
         save_package(output_path, g_prefill, g_decode, weights_dir, metadata,
                      tokenizer_path=str(model_dir / "tokenizer.json"),
-                     jinja_path=str(model_dir / "chat_template.jinja"))
+                     jinja_path=str(model_dir / "chat_template.jinja"),
+                     g_mtp=g_mtp,
+                     remove_weight_files=True)
         print(f"\nDone! Output: {output_path}")
     finally:
         shutil.rmtree(tmp_dir)
@@ -751,8 +907,13 @@ if __name__ == "__main__":
                         help="debug-only layer truncation")
     parser.add_argument("--prefill-seq-len", type=int, default=256,
                         help="prefill graph chunk length")
+    parser.add_argument(
+        "--mtp-quant", default=None,
+        help=("MTP block precision (default: W8 with a W4 target, otherwise "
+              "the target precision)"))
     args = parser.parse_args()
     convert_qwen3_moe(args.model_dir, args.output,
                       num_layers=args.layers,
                       prefill_seq_len=args.prefill_seq_len,
-                      quant=args.quant)
+                      quant=args.quant,
+                      mtp_quant=args.mtp_quant)

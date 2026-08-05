@@ -414,6 +414,8 @@ int LLMEngine::prefill_with_image(const std::vector<int>& token_ids,
     };
     if (!has_vision_encoder())
         return reject("package does not contain a vision encoder");
+    if (cfg_.mtp_draft_tokens > 0)
+        return reject("MTP speculation does not yet support image prompts");
     if (past_len_ != 0)
         return reject("image input currently requires an empty context");
     if (!embed_weight_ ||

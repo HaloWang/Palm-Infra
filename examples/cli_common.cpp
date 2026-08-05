@@ -166,6 +166,13 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "--trace path must not be empty";
                 return false;
             }
+        } else if (arg == "--mtp-draft-tokens") {
+            if (!require_value(argc, argv, i, "--mtp-draft-tokens", value, error)) return false;
+            if (!parse_int(value, opts.mtp_draft_tokens) ||
+                opts.mtp_draft_tokens < 0 || opts.mtp_draft_tokens > 16) {
+                error = "invalid value for --mtp-draft-tokens (expected 0..16)";
+                return false;
+            }
         } else if (arg == "--load-warmup") {
             opts.load_warmup = true;
             opts.load_warmup_explicit = true;
@@ -300,6 +307,7 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
     std::printf("  --no-ssd-global-cache   Use legacy equal per-layer cache (also disables prefetch)\n");
     std::printf("  --metal-ssd-full        Experimental full-Metal decode with direct Metal I/O\n");
     std::printf("  --trace <path.json>     Write Chrome Trace / Perfetto timing data\n");
+    std::printf("  --mtp-draft-tokens <int>  Experimental packaged MTP speculation (0..16)\n");
     std::printf("  --load-warmup           Touch mmap'd package weights after load (dense-only with SSD offload)\n");
     std::printf("  --lock-dense-weights    Pin dense mmap weights in RAM (default with SSD offload)\n");
     std::printf("  --no-lock-dense-weights Keep dense mmap weights pageable\n");
@@ -343,6 +351,7 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.moe_ssd_global_cache = opts.ssd_global_cache;
     cfg.metal_ssd_full = opts.metal_ssd_full;
     cfg.trace_path = opts.trace_path;
+    cfg.mtp_draft_tokens = opts.mtp_draft_tokens;
     cfg.lock_dense_weights = opts.lock_dense_weights;
     cfg.lock_moe_ssd_cache = opts.lock_expert_cache;
     return cfg;
@@ -459,17 +468,37 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
         }
         auto decode_start = std::chrono::steady_clock::now();
         while ((int)result.token_ids.size() < max_new_tokens) {
-            next = engine.decode(next);
-            if (next < 0) {
-                error = "engine decode failed";
-                engine.park_workers();
-                return false;
+            std::vector<int> decoded;
+            if (engine.config().mtp_draft_tokens > 0) {
+                const int remaining =
+                    max_new_tokens - static_cast<int>(result.token_ids.size());
+                if (!engine.speculative_decode(
+                        next, decoded, remaining, eos_id)) {
+                    error = "engine MTP decode failed";
+                    engine.park_workers();
+                    return false;
+                }
+            } else {
+                next = engine.decode(next);
+                if (next < 0) {
+                    error = "engine decode failed";
+                    engine.park_workers();
+                    return false;
+                }
+                decoded.push_back(next);
             }
-            append_token(next);
-            if (next == eos_id) {
-                result.hit_eos = true;
+            for (int token : decoded) {
+                next = token;
+                append_token(next);
+                if (next == eos_id) {
+                    result.hit_eos = true;
+                    break;
+                }
+                if ((int)result.token_ids.size() >= max_new_tokens)
+                    break;
+            }
+            if (result.hit_eos)
                 break;
-            }
         }
         auto decode_end = std::chrono::steady_clock::now();
         result.decode_ms = std::chrono::duration<double, std::milli>(decode_end - decode_start).count();

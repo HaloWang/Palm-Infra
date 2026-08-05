@@ -82,14 +82,14 @@ SamplerScratch& sampler_scratch() {
     return scratch;
 }
 
-int sample_token_impl(float* logits, int vocab_size, float temperature,
-                      int top_k, float top_p, float min_p,
-                      unsigned int* seed) {
-    if (vocab_size <= 0)
-        return 0;
-    if (temperature <= 0.0f || top_k == 1)
-        return argmax_token(logits, vocab_size);
+struct PreparedCandidates {
+    int active = 0;
+    float sum = 0.0f;
+};
 
+PreparedCandidates prepare_candidates(const float* logits, int vocab_size,
+                                      float temperature, int top_k,
+                                      float top_p, float min_p) {
     const int k = top_k > 0 ? std::min(top_k, vocab_size) : vocab_size;
     auto& candidates = sampler_scratch().candidates;
     candidates.clear();
@@ -110,7 +110,7 @@ int sample_token_impl(float* logits, int vocab_size, float temperature,
         }
     }
     if (candidates.empty())
-        return 0;
+        return {};
 
     std::sort(candidates.begin(), candidates.end(),
               [](const SamplerCandidate& a, const SamplerCandidate& b) {
@@ -135,8 +135,10 @@ int sample_token_impl(float* logits, int vocab_size, float temperature,
     float sum = 0.0f;
     for (int i = 0; i < active; ++i)
         sum += candidates[i].prob;
-    if (!(sum > 0.0f) || !std::isfinite(sum))
-        return candidates[0].id;
+    if (!(sum > 0.0f) || !std::isfinite(sum)) {
+        candidates[0].prob = 1.0f;
+        return {1, 1.0f};
+    }
 
     if (top_p > 0.0f && top_p < 1.0f) {
         const float cutoff_mass = top_p * sum;
@@ -151,17 +153,64 @@ int sample_token_impl(float* logits, int vocab_size, float temperature,
         }
     }
 
+    return {active, sum};
+}
+
+float next_uniform(unsigned int* seed) {
     unsigned int fallback_seed = 42;
     if (!seed) seed = &fallback_seed;
-    const float r = (float)rand_r(seed) / (float)RAND_MAX;
-    const float target = r * sum;
+    return static_cast<float>(rand_r(seed)) /
+           static_cast<float>(RAND_MAX);
+}
+
+int sample_token_impl(float* logits, int vocab_size, float temperature,
+                      int top_k, float top_p, float min_p,
+                      unsigned int* seed) {
+    if (vocab_size <= 0)
+        return 0;
+    if (temperature <= 0.0f || top_k == 1)
+        return argmax_token(logits, vocab_size);
+
+    const PreparedCandidates prepared = prepare_candidates(
+        logits, vocab_size, temperature, top_k, top_p, min_p);
+    auto& candidates = sampler_scratch().candidates;
+    if (prepared.active <= 0 || candidates.empty())
+        return 0;
+
+    const float target = next_uniform(seed) * prepared.sum;
     float cumulative = 0.0f;
-    for (int i = 0; i < active; i++) {
+    for (int i = 0; i < prepared.active; i++) {
         cumulative += candidates[i].prob;
         if (target <= cumulative)
             return candidates[i].id;
     }
-    return candidates[active - 1].id;
+    return candidates[prepared.active - 1].id;
+}
+
+void probability_distribution_impl(const float* logits, int vocab_size,
+                                   float temperature, int top_k,
+                                   float top_p, float min_p,
+                                   std::vector<float>& output) {
+    output.assign(static_cast<size_t>(std::max(0, vocab_size)), 0.0f);
+    if (vocab_size <= 0)
+        return;
+    if (temperature <= 0.0f || top_k == 1) {
+        output[static_cast<size_t>(argmax_token(logits, vocab_size))] = 1.0f;
+        return;
+    }
+
+    const PreparedCandidates prepared = prepare_candidates(
+        logits, vocab_size, temperature, top_k, top_p, min_p);
+    const auto& candidates = sampler_scratch().candidates;
+    if (prepared.active <= 0 || candidates.empty() ||
+        !(prepared.sum > 0.0f)) {
+        output[0] = 1.0f;
+        return;
+    }
+    const float inv_sum = 1.0f / prepared.sum;
+    for (int i = 0; i < prepared.active; ++i)
+        output[static_cast<size_t>(candidates[i].id)] =
+            candidates[i].prob * inv_sum;
 }
 
 void set_error(std::string* error, const char* message) {
@@ -227,6 +276,8 @@ bool Sampler::configure(const SamplingParams& params, std::string* error,
 void Sampler::reset() {
     history_.clear();
     saved_logits_.clear();
+    adjusted_logits_.clear();
+    correction_probabilities_.clear();
     random_state_ = params_.seed;
 }
 
@@ -238,6 +289,16 @@ void Sampler::accept(int token_id) {
 void Sampler::accept(const std::vector<int>& token_ids) {
     for (int token_id : token_ids)
         accept(token_id);
+}
+
+bool Sampler::uses_plain_argmax() const {
+    const bool penalties_enabled =
+        params_.repeat_last_n != 0 &&
+        (params_.repeat_penalty != 1.0f ||
+         params_.presence_penalty != 0.0f ||
+         params_.frequency_penalty != 0.0f);
+    return !penalties_enabled &&
+        (params_.temperature <= 0.0f || params_.top_k == 1);
 }
 
 int Sampler::sample(float* logits, int vocab_size) {
@@ -286,6 +347,112 @@ int Sampler::sample(float* logits, int vocab_size) {
     for (const auto& [token_id, logit] : saved_logits_)
         logits[token_id] = logit;
     return token;
+}
+
+void Sampler::probabilities(const float* logits, int vocab_size,
+                            const std::vector<int>& extra_history,
+                            std::vector<float>& output) {
+    if (!logits || vocab_size <= 0) {
+        output.clear();
+        return;
+    }
+
+    const bool penalties_enabled =
+        params_.repeat_last_n != 0 &&
+        (params_.repeat_penalty != 1.0f ||
+         params_.presence_penalty != 0.0f ||
+         params_.frequency_penalty != 0.0f);
+    const float* filtered_logits = logits;
+    if (penalties_enabled) {
+        adjusted_logits_.assign(logits, logits + vocab_size);
+        const size_t combined_size = history_.size() + extra_history.size();
+        const size_t window = params_.repeat_last_n < 0
+            ? combined_size
+            : std::min(combined_size,
+                       static_cast<size_t>(params_.repeat_last_n));
+        const size_t begin = combined_size - window;
+        std::unordered_map<int, int> counts;
+        counts.reserve(window);
+        for (size_t i = begin; i < combined_size; ++i) {
+            const int token_id = i < history_.size()
+                ? history_[i]
+                : extra_history[i - history_.size()];
+            if (token_id >= 0 && token_id < vocab_size)
+                ++counts[token_id];
+        }
+        for (const auto& [token_id, count] : counts) {
+            float& logit = adjusted_logits_[static_cast<size_t>(token_id)];
+            if (params_.repeat_penalty != 1.0f) {
+                logit = logit > 0.0f ? logit / params_.repeat_penalty
+                                     : logit * params_.repeat_penalty;
+            }
+            logit -= params_.presence_penalty;
+            logit -= params_.frequency_penalty * count;
+        }
+        filtered_logits = adjusted_logits_.data();
+    }
+
+    probability_distribution_impl(
+        filtered_logits, vocab_size, params_.temperature, params_.top_k,
+        params_.top_p, params_.min_p, output);
+}
+
+int Sampler::sample_probabilities(
+    const std::vector<float>& probabilities) {
+    double sum = 0.0;
+    for (float probability : probabilities) {
+        if (probability > 0.0f && std::isfinite(probability))
+            sum += probability;
+    }
+    if (!(sum > 0.0) || !std::isfinite(sum))
+        return 0;
+
+    const double target = static_cast<double>(random_uniform()) * sum;
+    double cumulative = 0.0;
+    int last = 0;
+    for (size_t i = 0; i < probabilities.size(); ++i) {
+        const float probability = probabilities[i];
+        if (!(probability > 0.0f) || !std::isfinite(probability))
+            continue;
+        cumulative += probability;
+        last = static_cast<int>(i);
+        if (target <= cumulative)
+            return last;
+    }
+    return last;
+}
+
+int Sampler::speculative_sample(
+    const std::vector<float>& target,
+    const std::vector<float>& proposal,
+    int proposed_token, bool* accepted) {
+    if (accepted) *accepted = false;
+    if (target.size() != proposal.size() || target.empty() ||
+        proposed_token < 0 ||
+        static_cast<size_t>(proposed_token) >= target.size()) {
+        return sample_probabilities(target);
+    }
+
+    const float p = target[static_cast<size_t>(proposed_token)];
+    const float q = proposal[static_cast<size_t>(proposed_token)];
+    const float acceptance = q > 0.0f
+        ? std::min(1.0f, p / q)
+        : 0.0f;
+    if (random_uniform() <= acceptance) {
+        if (accepted) *accepted = true;
+        return proposed_token;
+    }
+
+    correction_probabilities_.resize(target.size());
+    for (size_t token = 0; token < target.size(); ++token) {
+        correction_probabilities_[token] =
+            std::max(0.0f, target[token] - proposal[token]);
+    }
+    return sample_probabilities(correction_probabilities_);
+}
+
+float Sampler::random_uniform() {
+    return next_uniform(&random_state_);
 }
 
 int sample_token(float* logits, int vocab_size, float temperature, int top_k,

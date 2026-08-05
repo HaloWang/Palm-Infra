@@ -32,6 +32,29 @@ public:
     void accept(const std::vector<int>& token_ids);
     int sample(float* logits, int vocab_size);
 
+    /// Build the exact categorical distribution produced by the configured
+    /// temperature/top-k/top-p/min-p filters and repetition penalties.  The
+    /// extra history is considered after the committed history without
+    /// mutating either the sampler history or RNG state.
+    void probabilities(const float* logits, int vocab_size,
+                       const std::vector<int>& extra_history,
+                       std::vector<float>& output);
+
+    /// Draw from non-negative (not necessarily normalized) weights using the
+    /// sampler RNG. Returns zero when the distribution has no finite mass.
+    int sample_probabilities(const std::vector<float>& probabilities);
+
+    /// Apply exact speculative rejection sampling for one proposed token.
+    /// Returns the proposal with probability min(1, p(x)/q(x)); otherwise
+    /// samples from normalized max(0, p-q).
+    int speculative_sample(const std::vector<float>& target,
+                           const std::vector<float>& proposal,
+                           int proposed_token, bool* accepted);
+
+    /// True when sampling is exactly an unmodified argmax over model logits.
+    /// Backends may use this to avoid materializing logits on the host.
+    bool uses_plain_argmax() const;
+
     const SamplingParams& params() const { return params_; }
     size_t history_size() const { return history_.size(); }
 
@@ -40,6 +63,10 @@ private:
     unsigned int random_state_ = 42;
     std::vector<int> history_;
     std::vector<std::pair<int, float>> saved_logits_;
+    std::vector<float> adjusted_logits_;
+    std::vector<float> correction_probabilities_;
+
+    float random_uniform();
 };
 
 // Backward-compatible stateless entry point.

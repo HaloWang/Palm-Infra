@@ -108,6 +108,9 @@ void human_row(const char* key, double value, const char* unit) {
 void human_row_int(const char* key, long long value, const char* unit) {
     std::printf(" %-14s %12lld %s\n", key, value, unit);
 }
+void human_row_text(const char* key, const char* value) {
+    std::printf(" %-14s %12s\n", key, value);
+}
 
 // Default machine-parseable output (byte-identical to pre-polish behavior).
 void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_bytes,
@@ -206,6 +209,45 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
         }
         std::printf("\n");
     }
+    if (engine.config().mtp_draft_tokens > 0) {
+        const auto& mtp = engine.mtp_stats();
+        const double acceptance = mtp.drafted
+            ? 100.0 * static_cast<double>(mtp.accepted) / mtp.drafted
+            : 0.0;
+        std::printf(
+            "mtp_steps=%llu mtp_draft_calls=%llu mtp_drafted=%llu "
+            "mtp_accepted=%llu mtp_fallback_steps=%llu "
+            "mtp_verify_tokens=%llu mtp_sync_tokens=%llu "
+            "mtp_acceptance_pct=%.1f mtp_total_ms=%.2f "
+            "mtp_draft_ms=%.2f mtp_draft_model_ms=%.2f "
+            "mtp_verify_ms=%.2f mtp_sample_ms=%.2f mtp_sync_ms=%.2f\n",
+            static_cast<unsigned long long>(mtp.steps),
+            static_cast<unsigned long long>(mtp.draft_calls),
+            static_cast<unsigned long long>(mtp.drafted),
+            static_cast<unsigned long long>(mtp.accepted),
+            static_cast<unsigned long long>(mtp.fallback_steps),
+            static_cast<unsigned long long>(mtp.verify_tokens),
+            static_cast<unsigned long long>(mtp.sync_tokens), acceptance,
+            mtp.total_ms, mtp.draft_ms, mtp.draft_model_ms,
+            mtp.verify_ms, mtp.sample_ms, mtp.sync_ms);
+        std::printf("mtp_depth_stats=");
+        bool first = true;
+        for (size_t depth = 0;
+             depth < LLMEngine::MtpStats::kMaxDraftDepth; ++depth) {
+            if (mtp.attempts_by_depth[depth] == 0)
+                break;
+            std::printf(
+                "%s%zu:%llu/%llu/%llu", first ? "" : ",", depth + 1,
+                static_cast<unsigned long long>(
+                    mtp.attempts_by_depth[depth]),
+                static_cast<unsigned long long>(
+                    mtp.drafted_by_depth[depth]),
+                static_cast<unsigned long long>(
+                    mtp.accepted_by_depth[depth]));
+            first = false;
+        }
+        std::printf("\n");
+    }
     {
         auto pre = engine.prefill_pool_stats();
         auto dec = engine.decode_pool_stats();
@@ -275,6 +317,42 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
         human_row_int("moe_ssd_cross_layer_experts", (long long)ssd.cross_layer_experts, "");
         human_row_int("moe_ssd_cross_layer_used", (long long)ssd.cross_layer_used, "");
         human_row_int("moe_ssd_cross_layer_rejected", (long long)ssd.cross_layer_rejected, "");
+    }
+    if (engine.config().mtp_draft_tokens > 0) {
+        const auto& mtp = engine.mtp_stats();
+        human_row_int("mtp_steps", (long long)mtp.steps, "");
+        human_row_int("mtp_draft_calls", (long long)mtp.draft_calls, "");
+        human_row_int("mtp_drafted", (long long)mtp.drafted, "");
+        human_row_int("mtp_accepted", (long long)mtp.accepted, "");
+        human_row_int("mtp_verify_tokens", (long long)mtp.verify_tokens, "");
+        human_row_int("mtp_sync_tokens", (long long)mtp.sync_tokens, "");
+        human_row("mtp_acceptance_pct",
+                  mtp.drafted ? 100.0 * mtp.accepted / mtp.drafted : 0.0,
+                  "%");
+        human_row("mtp_total_ms", mtp.total_ms, "ms");
+        human_row("mtp_draft_ms", mtp.draft_ms, "ms");
+        human_row("mtp_draft_model_ms", mtp.draft_model_ms, "ms");
+        human_row("mtp_verify_ms", mtp.verify_ms, "ms");
+        human_row("mtp_sample_ms", mtp.sample_ms, "ms");
+        human_row("mtp_sync_ms", mtp.sync_ms, "ms");
+        for (size_t depth = 0;
+             depth < LLMEngine::MtpStats::kMaxDraftDepth; ++depth) {
+            if (mtp.attempts_by_depth[depth] == 0)
+                break;
+            char name[48];
+            std::snprintf(name, sizeof(name), "mtp_depth_%zu_try/draft/accept",
+                          depth + 1);
+            char value[64];
+            std::snprintf(
+                value, sizeof(value), "%llu/%llu/%llu",
+                static_cast<unsigned long long>(
+                    mtp.attempts_by_depth[depth]),
+                static_cast<unsigned long long>(
+                    mtp.drafted_by_depth[depth]),
+                static_cast<unsigned long long>(
+                    mtp.accepted_by_depth[depth]));
+            human_row_text(name, value);
+        }
     }
 
     // prefill section

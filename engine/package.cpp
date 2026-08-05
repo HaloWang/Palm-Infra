@@ -88,6 +88,7 @@ struct PackageHeaderInfo {
     uint64_t pf_off = 0, pf_len = 0;
     uint64_t dc_off = 0, dc_len = 0;
     uint64_t vi_off = 0, vi_len = 0;
+    uint64_t mtp_off = 0, mtp_len = 0;
     uint64_t w_off = 0, w_len = 0;
 };
 
@@ -247,6 +248,12 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
     std::memcpy(&out.w_len, header + 96, 8);
     std::memcpy(&out.vi_off, header + 104, 8);
     std::memcpy(&out.vi_len, header + 112, 8);
+    std::memcpy(&out.mtp_len, header + 120, 8);
+    if (out.mtp_len > out.w_off) {
+        fprintf(stderr, "Engine: package MTP graph has invalid length\n");
+        return false;
+    }
+    out.mtp_off = out.w_off - out.mtp_len;
 
     if (!section_in_file(out.meta_off, out.meta_len, file_size, "metadata") ||
         !section_in_file(out.tok_off, out.tok_len, file_size, "tokenizer") ||
@@ -256,6 +263,7 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
                          "prefill graph") ||
         !section_in_file(out.dc_off, out.dc_len, file_size, "decode graph") ||
         !section_in_file(out.vi_off, out.vi_len, file_size, "vision graph") ||
+        !section_in_file(out.mtp_off, out.mtp_len, file_size, "MTP graph") ||
         !section_in_file(out.w_off, out.w_len, file_size, "weights")) {
         return false;
     }
@@ -265,7 +273,7 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
         out.jin_len > MAX_TEMPLATE_SIZE ||
         out.pf_len == 0 || out.pf_len > MAX_GRAPH_SIZE ||
         out.dc_len == 0 || out.dc_len > MAX_GRAPH_SIZE ||
-        out.vi_len > MAX_GRAPH_SIZE) {
+        out.vi_len > MAX_GRAPH_SIZE || out.mtp_len > MAX_GRAPH_SIZE) {
         fprintf(stderr, "Engine: package contains an empty or oversized section\n");
         return false;
     }
@@ -282,6 +290,7 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
         {out.pf_off, out.pf_len, "prefill graph"},
         {out.dc_off, out.dc_len, "decode graph"},
         {out.vi_off, out.vi_len, "vision graph"},
+        {out.mtp_off, out.mtp_len, "MTP graph"},
         {out.w_off, out.w_len, "weights"},
     };
     sections.erase(
@@ -311,6 +320,7 @@ bool parse_package_header(const uint8_t* header, size_t file_size,
 
 bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& dc_path, std::string& vi_path,
+                             std::string& mtp_path,
                              std::string& tok_path,
                              std::string& jinja_path) {
     ScopedFd package_file(open(path.c_str(), O_RDONLY));
@@ -646,6 +656,9 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
             extract_temp_section(package_file.get(), nullptr, ph.vi_off,
                                  ph.vi_len, "vision graph", vi_path,
                                  temp_files_) &&
+            extract_temp_section(package_file.get(), nullptr, ph.mtp_off,
+                                 ph.mtp_len, "MTP graph", mtp_path,
+                                 temp_files_) &&
             extract_temp_section(package_file.get(), nullptr, ph.tok_off,
                                  ph.tok_len, "tokenizer", tok_path,
                                  temp_files_) &&
@@ -679,6 +692,8 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                               dc_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.vi_off, ph.vi_len, "vision graph",
                               vi_path, temp_files_) ||
+        !extract_temp_section(-1, base, ph.mtp_off, ph.mtp_len, "MTP graph",
+                              mtp_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.tok_off, ph.tok_len, "tokenizer",
                               tok_path, temp_files_) ||
         !extract_temp_section(-1, base, ph.jin_off, ph.jin_len,
