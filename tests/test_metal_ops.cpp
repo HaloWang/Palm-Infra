@@ -1610,9 +1610,11 @@ int main() {
     {
         constexpr int K = 256;
         constexpr int N = 64;
-        constexpr int GS = 128;
-        constexpr int GPR = K / GS;
-        for (int M : {2, 3, 4}) {
+        for (const auto [GS, M] : {
+                 std::pair{32, 2}, std::pair{32, 3}, std::pair{32, 4},
+                 std::pair{128, 2}, std::pair{128, 3},
+                 std::pair{128, 4}}) {
+            const int GPR = K / GS;
             std::vector<float> activations(M * K);
             fill_rand(activations.data(), M * K);
             std::vector<int8_t> weights(N * K);
@@ -1674,7 +1676,7 @@ int main() {
             }
             char label[64];
             snprintf(label, sizeof(label),
-                     "W4 small-M GEMV M=%d", M);
+                     "W4 G%d small-M GEMV M=%d", GS, M);
             CHECK(close(static_cast<const float*>(C.data), reference.data(),
                         M * N, 1e-4f, 3e-2f),
                   label);
@@ -1682,7 +1684,7 @@ int main() {
             const bool batch_ok = mb.lm_head_small_batch(
                 activations.data(), B, batch_output.data(), M, N, K);
             snprintf(label, sizeof(label),
-                     "W4 small-M lm_head batch M=%d", M);
+                     "W4 G%d small-M lm_head batch M=%d", GS, M);
             CHECK(batch_ok &&
                       close(batch_output.data(), reference.data(), M * N,
                             1e-4f, 3e-2f),
@@ -1693,7 +1695,7 @@ int main() {
                 mb.lm_head_small_batch_device_and_end_graph(
                     A, B, fused_output.data(), M, N, K);
             snprintf(label, sizeof(label),
-                     "W4 small-M fused lm_head M=%d", M);
+                     "W4 G%d small-M fused lm_head M=%d", GS, M);
             CHECK(fused_ok &&
                       close(fused_output.data(), reference.data(), M * N,
                             1e-4f, 3e-2f),
@@ -1713,7 +1715,7 @@ int main() {
                     batch_top1_matches && batch_top1[m] == expected;
             }
             snprintf(label, sizeof(label),
-                     "W4 small-M batched GPU argmax M=%d", M);
+                     "W4 G%d small-M batched GPU argmax M=%d", GS, M);
             CHECK(batch_top1_matches, label);
             if (M == 2) {
                 mb.begin_graph();
@@ -2619,6 +2621,42 @@ int main() {
                   static_cast<const float*>(out.data),
                   ref_data.data(), H, 2e-4f, 3e-3f),
               "Metal resident native-BG32 MoE matches CPU");
+
+        for (int small_m : {2, 3, 4}) {
+            Tensor small_x =
+                make_dev(mb, Precision::FP32, H, small_m);
+            Tensor small_out =
+                make_dev(mb, Precision::FP32, H, small_m);
+            fill_rand(
+                static_cast<float*>(small_x.data), H * small_m);
+            std::vector<const Tensor*> small_inputs = {
+                &small_x, &router, &gate_up, &down, &bias};
+            mb.begin_graph();
+            mb.dispatch(moe, small_inputs, &small_out, nullptr);
+            mb.end_graph();
+
+            std::vector<float> small_ref_data(H * small_m);
+            Tensor small_ref = Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL,
+                H, small_m, 1, 1, small_ref_data.data());
+            ref_ok = kernel_qwen3_moe(
+                small_inputs, small_ref, nullptr,
+                H, E, TOP, I, I,
+                1, true, false, 8, 4, 1.0f, false, 4);
+            char label[96];
+            std::snprintf(
+                label, sizeof(label),
+                "CPU reference native-BG32 MoE small-M=%d", small_m);
+            CHECK(ref_ok, label);
+            std::snprintf(
+                label, sizeof(label),
+                "Metal native-BG32 MoE small-M=%d matches CPU", small_m);
+            CHECK(close(
+                      static_cast<const float*>(small_out.data),
+                      small_ref_data.data(), H * small_m,
+                      2e-4f, 3e-3f),
+                  label);
+        }
 
         constexpr int PREFILL_S = 64;
         Tensor prefill_x =

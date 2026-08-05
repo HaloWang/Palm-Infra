@@ -1617,63 +1617,66 @@ kernel void gemv_selected_experts_bg32_i8a_i4b_f32c(
     const ulong row_tile = (ulong)(row0 / 8);
     device const int8_t* activation =
         A + (ulong)activation_row * (ulong)p.K;
-    float4 accum0 = 0.0f;
-    float4 accum1 = 0.0f;
+    float lane_sums[8] = {
+        0.0f, 0.0f, 0.0f, 0.0f,
+        0.0f, 0.0f, 0.0f, 0.0f};
 
-    for (int group = 0; group < p.groups_per_row; ++group) {
-        const int k = group * 32 + (int)lane;
-        const int av = k < p.K ? (int)activation[k] : 0;
+    // Eight four-lane teams process eight independent G32 blocks at once.
+    // Each lane consumes four packed bytes (eight K values), matching the
+    // vectorized BG128 kernel's work per lane while applying the finer G32
+    // scale before the final, single SIMD reduction.
+    const int group_lane = (int)lane >> 2;
+    const int lane_in_group = (int)lane & 3;
+    for (int group_base = 0;
+         group_base < p.groups_per_row;
+         group_base += 8) {
+        const int group = group_base + group_lane;
+        if (group >= p.groups_per_row) continue;
+        const int k = group * 32 + lane_in_group * 8;
+        const char4 av0 =
+            *(device const char4*)(activation + k);
+        const char4 av1 =
+            *(device const char4*)(activation + k + 4);
+        const int4 ae =
+            int4(av0.x, av0.z, av1.x, av1.z);
+        const int4 ao =
+            int4(av0.y, av0.w, av1.y, av1.w);
         device const uint8_t* block =
             B + ((expert_row_tile + row_tile) *
                      (ulong)p.groups_per_row +
                  (ulong)group) *
                     160ul;
-        int4 products0 = 0;
-        int4 products1 = 0;
-        #pragma unroll
-        for (int channel = 0; channel < 8; ++channel) {
-            const int row = row0 + channel;
-            int product = 0;
-            if (row < p.N && k < p.K) {
-                const uchar packed =
-                    block[32 + channel * 16 + (int)lane / 2];
-                const int nibble =
-                    (lane & 1) ? (int)(packed >> 4)
-                               : (int)(packed & 15);
-                const int quantized =
-                    (nibble ^ 8) - 8;
-                product = av * quantized;
-            }
-            if (channel < 4)
-                products0[channel] = product;
-            else
-                products1[channel - 4] = product;
-        }
-        const int4 dots0 = simd_sum(products0);
-        const int4 dots1 = simd_sum(products1);
+        const float activation_scale =
+            SCALE_A[(ulong)activation_row *
+                        (ulong)p.groups_per_row +
+                    (ulong)group];
         device const float* weight_scales =
             (device const float*)block;
         #pragma unroll
-        for (int channel = 0; channel < 4; ++channel) {
+        for (int channel = 0; channel < 8; ++channel) {
             const int row = row0 + channel;
-            if (row < p.N)
-                accum0[channel] +=
-                    (float)dots0[channel] * weight_scales[channel] *
-                    SCALE_A[(ulong)activation_row *
-                                (ulong)p.groups_per_row +
-                            (ulong)group];
-        }
-        #pragma unroll
-        for (int channel = 0; channel < 4; ++channel) {
-            const int row = row0 + 4 + channel;
-            if (row < p.N)
-                accum1[channel] +=
-                    (float)dots1[channel] * weight_scales[4 + channel] *
-                    SCALE_A[(ulong)activation_row *
-                                (ulong)p.groups_per_row +
-                            (ulong)group];
+            if (row < p.N) {
+                const uchar4 packed =
+                    *(device const uchar4*)(
+                        block + 32 + channel * 16 +
+                        lane_in_group * 4);
+                const int4 lo =
+                    int4((packed & uchar4(15)) ^ uchar4(8)) - 8;
+                const int4 hi =
+                    int4((packed >> 4) ^ uchar4(8)) - 8;
+                const int4 products = ae * lo + ao * hi;
+                lane_sums[channel] +=
+                    (float)(products.x + products.y +
+                            products.z + products.w) *
+                    weight_scales[channel] * activation_scale;
+            }
         }
     }
+
+    const float4 accum0 = simd_sum(float4(
+        lane_sums[0], lane_sums[1], lane_sums[2], lane_sums[3]));
+    const float4 accum1 = simd_sum(float4(
+        lane_sums[4], lane_sums[5], lane_sums[6], lane_sums[7]));
 
     if (lane == 0) {
         device float* out =
@@ -4080,6 +4083,37 @@ kernel void gemv_w4_f32a_i4b_f32c(
                 sumf[r] += dotv*sc[r][g];
             }
         }
+    } else if (gs == 32) {
+        // Eight four-lane teams cover eight independent G32 groups. Each lane
+        // handles four packed bytes and reuses the group scale for eight K
+        // values, avoiding the generic path's division and scalar loads.
+        const int group_lane = (int)lane >> 2;
+        const int lane_in_group = (int)lane & 3;
+        for (int g = group_lane; g < gpr; g += 8) {
+            const int ke = g * 32 + lane_in_group * 8;
+            const int kb = g * 16 + lane_in_group * 4;
+            const float4 av0 =
+                *((device const float4*)(a + ke));
+            const float4 av1 =
+                *((device const float4*)(a + ke + 4));
+            const float4 ae = float4(av0.xz, av1.xz);
+            const float4 ao = float4(av0.yw, av1.yw);
+            const float activation_sum =
+                dot(av0, float4(1.0f)) +
+                dot(av1, float4(1.0f));
+            for (short r = 0; r < NR0; ++r) {
+                const uchar4 q =
+                    *((device const uchar4*)(bx[r] + kb));
+                const float4 lo =
+                    float4(int4(q & uchar4(15)));
+                const float4 hi =
+                    float4(int4(q >> 4));
+                sumf[r] +=
+                    (dot(ae, lo) + dot(ao, hi) -
+                     8.0f * activation_sum) *
+                    sc[r][g];
+            }
+        }
     } else {
         // Generic even-sized groups.
         for (int kb = (int)lane; kb < (int)row_bytes; kb += NW) {
@@ -4172,6 +4206,37 @@ kernel void gemv_w4_small_m_f32a_i4b_f32c(
                         dot(ae1, lo1) + dot(ao1, hi1) -
                         8.0f * activation_sum;
                     sumf[m] += dotv * scale;
+            }
+        }
+    } else if (gs == 32) {
+        const int group_lane = (int)lane >> 2;
+        const int lane_in_group = (int)lane & 3;
+        for (int g = group_lane; g < gpr; g += 8) {
+            const int ke = g * 32 + lane_in_group * 8;
+            const int kb = g * 16 + lane_in_group * 4;
+            const uchar4 q =
+                *((device const uchar4*)(weights + kb));
+            const float4 lo =
+                float4(int4(q & uchar4(15)));
+            const float4 hi =
+                float4(int4(q >> 4));
+            const float scale = scales[g];
+            for (short m = 0; m < M; ++m) {
+                device const float* a =
+                    A + p.a_offset +
+                    (uint)m * (uint)p.a_row_stride;
+                const float4 av0 =
+                    *((device const float4*)(a + ke));
+                const float4 av1 =
+                    *((device const float4*)(a + ke + 4));
+                const float4 ae = float4(av0.xz, av1.xz);
+                const float4 ao = float4(av0.yw, av1.yw);
+                const float activation_sum =
+                    dot(av0, float4(1.0f)) +
+                    dot(av1, float4(1.0f));
+                sumf[m] +=
+                    (dot(ae, lo) + dot(ao, hi) -
+                     8.0f * activation_sum) * scale;
             }
         }
     } else {

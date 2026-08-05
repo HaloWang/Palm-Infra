@@ -5611,7 +5611,7 @@ void MetalBackend::dispatch(const GraphNode& node,
                         [enc setBytes:&sp length:sizeof(sp) atIndex:3];
                         [enc setBuffer:sa offset:0 atIndex:4];
                         [enc setBuffer:idx offset:0 atIndex:6];
-                        constexpr NSUInteger nsg = 2;
+                        const NSUInteger nsg = seq <= 4 ? 2 : 4;
                         const NSUInteger rows_per_tg = nsg * 8;
                         [enc dispatchThreadgroups:
                                  MTLSizeMake(
