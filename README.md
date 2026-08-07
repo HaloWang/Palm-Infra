@@ -1,6 +1,6 @@
 # palm-infra
 
-AI Infra projects from Palm Team. Currently includes `mollm`.
+AI Infra projects from [PalmAI](https://palm.tencent.com/) Team. Currently includes `mollm`.
 
 [中文文档](README_zh.md)
 
