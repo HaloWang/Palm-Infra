@@ -179,7 +179,17 @@ void LLMEngine::clear_model_state() {
 size_t LLMEngine::cpu_weight_sidecar_bytes() const {
     size_t bytes = 0;
     for (const auto& [key, buffer] : packed_weights_) {
-        (void)key;
+        // Expert-interleaved MXFP4 package storage is normalized into the
+        // backend-neutral resident layout before either CPU or CUDA consumes
+        // it. That staging is serialized-layout adaptation, not a CPU matmul
+        // sidecar, so do not report it as accelerator-side duplication.
+        constexpr const char* normalized_suffix = "#expert_native";
+        constexpr size_t normalized_suffix_size = 14;
+        if (key.size() >= normalized_suffix_size &&
+            key.compare(
+                key.size() - normalized_suffix_size,
+                normalized_suffix_size, normalized_suffix) == 0)
+            continue;
         bytes += buffer.size();
     }
     for (const auto& [key, prepared] : prepared_weights_) {

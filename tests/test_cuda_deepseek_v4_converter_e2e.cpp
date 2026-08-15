@@ -50,10 +50,18 @@ bool run(const char* package, Device device, InferenceResult& result) {
     config.weight_loading = WeightLoadingMode::MMAP;
     if (!engine.load(config) || engine.config().device != device ||
         !engine.package_weights_mmap_backed()) {
+        std::fprintf(
+            stderr, "%s DeepSeek load/device/mmap contract failed\n",
+            device == Device::CUDA ? "CUDA" : "CPU");
         return false;
     }
-    if (device == Device::CUDA && engine.cpu_weight_sidecar_bytes() != 0)
+    if (device == Device::CUDA && engine.cpu_weight_sidecar_bytes() != 0) {
+        std::fprintf(
+            stderr, "CUDA DeepSeek unexpectedly prepared %zu CPU sidecar "
+                    "bytes\n",
+            engine.cpu_weight_sidecar_bytes());
         return false;
+    }
     const auto& metadata = engine.package_metadata();
     const auto architecture = metadata.find("architecture");
     const auto quantization = metadata.find("quantization");

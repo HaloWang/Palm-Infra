@@ -815,7 +815,8 @@ bool LLMEngine::execute_mtp_tokens(
             device_hidden_copy->device_data)
             copied = *device_hidden_copy;
         else
-            copied = copy_tensor_contiguous(out, mtp_hidden_output_copy_);
+            copied = copy_tensor_contiguous(
+                out, mtp_hidden_output_copy_, exec_ctx_mtp_.backend);
     }
     const bool succeeded = out.data &&
         !exec_ctx_mtp_.backend->dispatch_failed() &&
