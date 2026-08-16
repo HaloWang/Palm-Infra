@@ -174,6 +174,9 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         lock_expert_pages_ = lock_expert_pages;
         resident_bytes_ = 0;
         clock_ = hits_ = misses_ = evictions_ = bytes_read_ = 0;
+        demand_load_bytes_ = prefetch_load_bytes_ = 0;
+        useful_prefetch_bytes_ = unused_prefetch_bytes_ = 0;
+        expert_bytes_acquired_ = 0;
         cross_layer_tasks_count_ = cross_layer_dropped_ = 0;
         cross_layer_experts_ = cross_layer_used_ = cross_layer_rejected_ = 0;
         cross_layer_rank_attempts_.clear();
@@ -473,8 +476,10 @@ std::unique_ptr<MoeSsdCache::Entry> MoeSsdCache::remove_entry_locked(
     if (count_eviction) {
         ++evictions_;
         LayerCounters& counters = layer_stats_[layer];
-        if (entry->speculative)
+        if (entry->speculative) {
             ++counters.unused_prefetch_evictions;
+            unused_prefetch_bytes_ += bytes;
+        }
         const uint64_t key =
             (static_cast<uint64_t>(static_cast<uint32_t>(layer)) << 32) |
             static_cast<uint32_t>(entry->expert);
@@ -568,6 +573,7 @@ MoeSsdCache::Entry* MoeSsdCache::reserve_entry_locked(
     entry->pending_reads = 0;
     entry->fresh_miss = true;
     entry->speculative = speculative;
+    entry->load_origin_speculative = speculative;
     const auto retained = retained_experts_.find(layer);
     entry->retained =
         retained != retained_experts_.end() &&
@@ -1145,10 +1151,12 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         return false;
     }
     const bool fresh_miss = entry->fresh_miss;
+    expert_bytes_acquired_ += entry->bytes();
     entry->used_at = ++clock_;
     entry->forward_epoch = forward_epoch_;
     if (entry->speculative) {
         ++cross_layer_used_;
+        useful_prefetch_bytes_ += entry->bytes();
         entry->speculative = false;
     }
     entry->prediction_epoch = 0;
@@ -1188,6 +1196,11 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
     result.misses = misses_;
     result.evictions = evictions_;
     result.bytes_read = bytes_read_;
+    result.demand_load_bytes = demand_load_bytes_;
+    result.prefetch_load_bytes = prefetch_load_bytes_;
+    result.useful_prefetch_bytes = useful_prefetch_bytes_;
+    result.unused_prefetch_bytes = unused_prefetch_bytes_;
+    result.expert_bytes_acquired = expert_bytes_acquired_;
     result.cross_layer_tasks = cross_layer_tasks_count_;
     result.cross_layer_dropped = cross_layer_dropped_;
     result.cross_layer_experts = cross_layer_experts_;
@@ -1227,6 +1240,11 @@ void MoeSsdCache::reset_stats() {
     misses_ = 0;
     evictions_ = 0;
     bytes_read_ = 0;
+    demand_load_bytes_ = 0;
+    prefetch_load_bytes_ = 0;
+    useful_prefetch_bytes_ = 0;
+    unused_prefetch_bytes_ = 0;
+    expert_bytes_acquired_ = 0;
     cross_layer_tasks_count_ = 0;
     cross_layer_dropped_ = 0;
     cross_layer_experts_ = 0;
@@ -1235,7 +1253,9 @@ void MoeSsdCache::reset_stats() {
     cross_layer_rank_attempts_.clear();
     cross_layer_rank_hits_.clear();
     cross_layer_rank_confidence_sum_.clear();
-    pending_predictions_.clear();
+    // Do not clear pending_predictions_: benchmarks reset counters at the
+    // prefill/decode boundary, and prediction records are live cache-policy
+    // state that may be consumed by the following decode layer.
     layer_stats_.clear();
     last_evicted_epoch_.clear();
 }

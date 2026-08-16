@@ -112,11 +112,80 @@ void human_row_text(const char* key, const char* value) {
     std::printf(" %-14s %12s\n", key, value);
 }
 
-// Default machine-parseable output (byte-identical to pre-polish behavior).
+uint64_t ssd_wait_ns(const MoeSsdCache::Stats& stats) {
+    uint64_t total = 0;
+    for (const auto& layer : stats.layers) total += layer.acquire_wait_ns;
+    return total;
+}
+
+void print_kv_ssd_phase(const char* phase, const MoeSsdCache::Stats& stats,
+                        int tokens, const char* token_kind) {
+    const double divisor = tokens > 0 ? static_cast<double>(tokens) : 0.0;
+    auto mb_per_token = [&](uint64_t bytes) {
+        return divisor > 0.0 ? bytes / 1e6 / divisor : 0.0;
+    };
+    std::printf("moe_ssd_%s_hits=%llu\n", phase,
+                static_cast<unsigned long long>(stats.hits));
+    std::printf("moe_ssd_%s_misses=%llu\n", phase,
+                static_cast<unsigned long long>(stats.misses));
+    std::printf("moe_ssd_%s_evictions=%llu\n", phase,
+                static_cast<unsigned long long>(stats.evictions));
+    std::printf("moe_ssd_%s_logical_load_mb=%.3f\n", phase,
+                stats.bytes_read / 1e6);
+    std::printf("moe_ssd_%s_demand_origin_load_mb=%.3f\n", phase,
+                stats.demand_load_bytes / 1e6);
+    std::printf("moe_ssd_%s_prefetch_origin_load_mb=%.3f\n", phase,
+                stats.prefetch_load_bytes / 1e6);
+    std::printf("moe_ssd_%s_useful_prefetch_mb=%.3f\n", phase,
+                stats.useful_prefetch_bytes / 1e6);
+    std::printf("moe_ssd_%s_unused_prefetch_evicted_mb=%.3f\n", phase,
+                stats.unused_prefetch_bytes / 1e6);
+    std::printf("moe_ssd_%s_expert_bytes_acquired_mb=%.3f\n", phase,
+                stats.expert_bytes_acquired / 1e6);
+    std::printf("moe_ssd_%s_wait_ms=%.3f\n", phase,
+                ssd_wait_ns(stats) / 1e6);
+    std::printf("moe_ssd_%s_logical_load_mb_per_%s=%.6f\n", phase,
+                token_kind, mb_per_token(stats.bytes_read));
+    std::printf("moe_ssd_%s_demand_origin_load_mb_per_%s=%.6f\n", phase,
+                token_kind, mb_per_token(stats.demand_load_bytes));
+    std::printf("moe_ssd_%s_prefetch_origin_load_mb_per_%s=%.6f\n", phase,
+                token_kind, mb_per_token(stats.prefetch_load_bytes));
+    std::printf("moe_ssd_%s_expert_bytes_acquired_mb_per_%s=%.6f\n", phase,
+                token_kind, mb_per_token(stats.expert_bytes_acquired));
+    std::printf("moe_ssd_%s_wait_ms_per_%s=%.6f\n", phase,
+                token_kind,
+                divisor > 0.0 ? ssd_wait_ns(stats) / 1e6 / divisor : 0.0);
+}
+
+void print_human_ssd_phase(const MoeSsdCache::Stats& stats, int tokens,
+                           const char* token_kind) {
+    const double divisor = tokens > 0 ? static_cast<double>(tokens) : 0.0;
+    auto mb_per_token = [&](uint64_t bytes) {
+        return divisor > 0.0 ? bytes / 1e6 / divisor : 0.0;
+    };
+    human_row_int("ssd_hits", static_cast<long long>(stats.hits), "");
+    human_row_int("ssd_misses", static_cast<long long>(stats.misses), "");
+    human_row("ssd_load_mb", stats.bytes_read / 1e6, "logical MB");
+    human_row("ssd_demand_mb", stats.demand_load_bytes / 1e6, "logical MB");
+    human_row("ssd_prefetch_mb", stats.prefetch_load_bytes / 1e6, "logical MB");
+    human_row("ssd_useful_pf_mb", stats.useful_prefetch_bytes / 1e6, "MB");
+    human_row("ssd_unused_pf_mb", stats.unused_prefetch_bytes / 1e6, "MB");
+    human_row("ssd_acquired_mb", stats.expert_bytes_acquired / 1e6, "logical MB");
+    human_row("ssd_wait_ms", ssd_wait_ns(stats) / 1e6, "ms");
+    char key[48];
+    std::snprintf(key, sizeof(key), "ssd_load_mb/%s", token_kind);
+    human_row(key, mb_per_token(stats.bytes_read), "MB");
+    std::snprintf(key, sizeof(key), "ssd_acq_mb/%s", token_kind);
+    human_row(key, mb_per_token(stats.expert_bytes_acquired), "MB");
+}
+
+// Default machine-parseable key/value output.
 void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_bytes,
                       const GenerationMetrics& m,
                       const GenerationResult& result, double total_ms,
                       const LLMEngine& engine, const CliCommonOptions& opts,
+                      const MoeSsdCache::Stats& prefill_ssd,
+                      const MoeSsdCache::Stats& decode_ssd,
                       double pack_ms, long long pack_calls,
                       double q8_quant_a_ms, long long q8_quant_a_calls,
                       double mm_ms) {
@@ -136,20 +205,21 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
     std::printf("total_ms=%.2f\n", total_ms);
     std::printf("peak_rss_mb=%.1f\n", peak_rss_mb());
     if (engine.moe_ssd_offload_enabled()) {
-        auto ssd = engine.moe_ssd_stats();
         std::printf("moe_ssd_cache_mb=%.1f\n", engine.config().moe_ssd_cache_bytes / 1e6);
         std::printf("moe_ssd_io_workers=%d\n", engine.config().moe_ssd_io_workers);
-        std::printf("moe_ssd_hits=%llu moe_ssd_misses=%llu moe_ssd_evictions=%llu moe_ssd_read_mb=%.1f moe_ssd_resident_mb=%.1f\n",
-                    (unsigned long long)ssd.hits, (unsigned long long)ssd.misses,
-                    (unsigned long long)ssd.evictions, ssd.bytes_read / 1e6,
-                    ssd.resident_bytes / 1e6);
-        std::printf("moe_ssd_cross_layer_tasks=%llu moe_ssd_cross_layer_dropped=%llu moe_ssd_cross_layer_experts=%llu moe_ssd_cross_layer_used=%llu moe_ssd_cross_layer_rejected=%llu\n",
+        std::printf("moe_ssd_resident_mb=%.1f\n", decode_ssd.resident_bytes / 1e6);
+        print_kv_ssd_phase("prefill", prefill_ssd, m.prompt_tokens,
+                           "prompt_token");
+        print_kv_ssd_phase("decode", decode_ssd, m.decode_tokens,
+                           "decode_token");
+        const auto& ssd = decode_ssd;
+        std::printf("moe_ssd_decode_cross_layer_tasks=%llu moe_ssd_decode_cross_layer_dropped=%llu moe_ssd_decode_cross_layer_experts=%llu moe_ssd_decode_cross_layer_used=%llu moe_ssd_decode_cross_layer_rejected=%llu\n",
                     (unsigned long long)ssd.cross_layer_tasks,
                     (unsigned long long)ssd.cross_layer_dropped,
                     (unsigned long long)ssd.cross_layer_experts,
                     (unsigned long long)ssd.cross_layer_used,
                     (unsigned long long)ssd.cross_layer_rejected);
-        std::printf("moe_ssd_cross_layer_rank_accuracy=");
+        std::printf("moe_ssd_decode_cross_layer_rank_accuracy=");
         for (size_t rank = 0; rank < ssd.cross_layer_rank_attempts.size(); ++rank) {
             if (rank != 0) std::printf(",");
             const uint64_t attempts = ssd.cross_layer_rank_attempts[rank];
@@ -158,7 +228,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                                                : static_cast<double>(hits) / attempts);
         }
         std::printf("\n");
-        std::printf("moe_ssd_cross_layer_rank_confidence=");
+        std::printf("moe_ssd_decode_cross_layer_rank_confidence=");
         for (size_t i = 0; i < ssd.cross_layer_rank_attempts.size(); ++i) {
             if (i != 0) std::printf(",");
             const double sum = i < ssd.cross_layer_rank_confidence_sum.size()
@@ -180,7 +250,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
             total_short_term_reloads += layer.short_term_reloads;
         }
         std::printf(
-            "moe_ssd_layer_summary_wait_ms=%.3f prediction_accuracy=%.3f "
+            "moe_ssd_decode_layer_summary_wait_ms=%.3f prediction_accuracy=%.3f "
             "unused_prefetch_evictions=%llu short_term_reloads=%llu\n",
             total_wait_ns / 1e6,
             total_prediction_attempts == 0
@@ -189,7 +259,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
                       total_prediction_attempts,
             (unsigned long long)total_unused_prefetch_evictions,
             (unsigned long long)total_short_term_reloads);
-        std::printf("moe_ssd_layer_stats=");
+        std::printf("moe_ssd_decode_layer_stats=");
         for (size_t index = 0; index < ssd.layers.size(); ++index) {
             if (index != 0) std::printf(";");
             const auto& layer = ssd.layers[index];
@@ -289,6 +359,8 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
                          const GenerationMetrics& m,
                          const GenerationResult& result, double total_ms,
                          const LLMEngine& engine, const CliCommonOptions& opts,
+                         const MoeSsdCache::Stats& prefill_ssd,
+                         const MoeSsdCache::Stats& decode_ssd,
                          double pack_ms, long long pack_calls,
                          double q8_quant_a_ms, long long q8_quant_a_calls,
                          double mm_ms) {
@@ -305,18 +377,9 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row("load_warmup_mb", load_warmup_bytes / 1e6,  "MB");
     human_row_int("threads", engine.config().num_threads, "");
     if (engine.moe_ssd_offload_enabled()) {
-        auto ssd = engine.moe_ssd_stats();
         human_row("moe_ssd_cache_mb", engine.config().moe_ssd_cache_bytes / 1e6, "MB");
         human_row_int("moe_ssd_io_workers", engine.config().moe_ssd_io_workers, "");
-        human_row_int("moe_ssd_hits", (long long)ssd.hits, "");
-        human_row_int("moe_ssd_misses", (long long)ssd.misses, "");
-        human_row_int("moe_ssd_evictions", (long long)ssd.evictions, "");
-        human_row("moe_ssd_read_mb", ssd.bytes_read / 1e6, "MB");
-        human_row_int("moe_ssd_cross_layer_tasks", (long long)ssd.cross_layer_tasks, "");
-        human_row_int("moe_ssd_cross_layer_dropped", (long long)ssd.cross_layer_dropped, "");
-        human_row_int("moe_ssd_cross_layer_experts", (long long)ssd.cross_layer_experts, "");
-        human_row_int("moe_ssd_cross_layer_used", (long long)ssd.cross_layer_used, "");
-        human_row_int("moe_ssd_cross_layer_rejected", (long long)ssd.cross_layer_rejected, "");
+        human_row("moe_ssd_resident_mb", decode_ssd.resident_bytes / 1e6, "MB");
     }
     if (engine.config().mtp_draft_tokens > 0) {
         const auto& mtp = engine.mtp_stats();
@@ -362,6 +425,8 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row_int("prompt_tokens", m.prompt_tokens,    "");
     human_row("prefill_ms",    result.prefill_ms,      "ms");
     human_row("prefill_tps",   m.prefill_tps,          "t/s");
+    if (engine.moe_ssd_offload_enabled())
+        print_human_ssd_phase(prefill_ssd, m.prompt_tokens, "prompt_tok");
 
     // decode section
     std::printf("%s\n", kSepLight);
@@ -374,6 +439,8 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row("ttft_ms",       m.ttft_ms,               "ms");
     human_row("tpot_ms",       m.tpot_ms,               "ms");
     human_row("total_ms",      total_ms,                "ms");
+    if (engine.moe_ssd_offload_enabled())
+        print_human_ssd_phase(decode_ssd, m.decode_tokens, "decode_tok");
 
     // memory section
     std::printf("%s\n", kSepLight);
@@ -527,9 +594,15 @@ int main(int argc, char** argv) {
     }
 
     GenerationResult result;
+    MoeSsdCache::Stats prefill_ssd;
     auto total_start = std::chrono::steady_clock::now();
     if (!generate_tokens(engine, tokenizer, prompt_ids, opts.max_new_tokens,
-                         benchmark_eos_id, result, error)) {
+                         benchmark_eos_id, result, error, {}, true, nullptr, -1,
+                         [&] {
+                             if (!engine.moe_ssd_offload_enabled()) return;
+                             prefill_ssd = engine.moe_ssd_stats();
+                             engine.reset_moe_ssd_stats();
+                         })) {
         std::fprintf(stderr, "bench: %s\n", error.c_str());
         return 1;
     }
@@ -538,6 +611,7 @@ int main(int argc, char** argv) {
 
     GenerationMetrics metrics = compute_generation_metrics(prompt_ids.size(), result);
     metrics.total_ms = total_ms;
+    const MoeSsdCache::Stats decode_ssd = engine.moe_ssd_stats();
 
     // Pack-A profiling counters.
     double pack_ms = mollm_pack_a_total_ms();
@@ -551,10 +625,12 @@ int main(int argc, char** argv) {
     if (opts.output_format == "human") {
         print_human_summary(load_ms, load_warmup_ms, load_warmup_bytes,
                             metrics, result, total_ms, engine, opts,
+                            prefill_ssd, decode_ssd,
                             pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
     } else {
         print_kv_summary(load_ms, load_warmup_ms, load_warmup_bytes,
                          metrics, result, total_ms, engine, opts,
+                         prefill_ssd, decode_ssd,
                          pack_ms, pack_calls, q8_quant_a_ms, q8_quant_a_calls, mm_ms);
     }
 

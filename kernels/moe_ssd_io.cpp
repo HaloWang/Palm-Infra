@@ -275,8 +275,14 @@ void MoeSsdCache::io_worker_main(int worker_index) {
                     entry->state = entry->state == Entry::State::LoadingFailed
                                        ? Entry::State::Failed
                                        : Entry::State::Ready;
-                    if (entry->is_ready())
-                        bytes_read_ += entry->bytes();
+                    if (entry->is_ready()) {
+                        const uint64_t bytes = entry->bytes();
+                        bytes_read_ += bytes;
+                        if (entry->load_origin_speculative)
+                            prefetch_load_bytes_ += bytes;
+                        else
+                            demand_load_bytes_ += bytes;
+                    }
                 }
             }
         }

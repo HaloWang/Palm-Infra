@@ -113,7 +113,18 @@ public:
         uint64_t hits = 0;
         uint64_t misses = 0;
         uint64_t evictions = 0;
+        // Logical cache-entry bytes whose asynchronous load completed during
+        // the statistics interval. This is not physical device traffic.
         uint64_t bytes_read = 0;
+        uint64_t demand_load_bytes = 0;
+        uint64_t prefetch_load_bytes = 0;
+        // Prefetched entry bytes first consumed or evicted unused during the
+        // interval. Loads and consumption may fall in different intervals.
+        uint64_t useful_prefetch_bytes = 0;
+        uint64_t unused_prefetch_bytes = 0;
+        // Logical routed-expert bytes returned by acquire(), including hits.
+        // For decode this is a closer weight-traffic numerator than misses.
+        uint64_t expert_bytes_acquired = 0;
         uint64_t cross_layer_tasks = 0;
         uint64_t cross_layer_dropped = 0;
         uint64_t cross_layer_experts = 0;
@@ -310,6 +321,11 @@ private:
     uint64_t misses_ = 0;
     uint64_t evictions_ = 0;
     uint64_t bytes_read_ = 0;
+    uint64_t demand_load_bytes_ = 0;
+    uint64_t prefetch_load_bytes_ = 0;
+    uint64_t useful_prefetch_bytes_ = 0;
+    uint64_t unused_prefetch_bytes_ = 0;
+    uint64_t expert_bytes_acquired_ = 0;
     uint64_t cross_layer_tasks_count_ = 0;
     uint64_t cross_layer_dropped_ = 0;
     uint64_t cross_layer_experts_ = 0;

@@ -58,6 +58,9 @@ struct MoeSsdCache::Entry {
     int pending_reads = 0;
     bool fresh_miss = false;  // first acquire after a queued miss is not a hit
     bool speculative = false;
+    // Immutable for one residency lifetime. Unlike speculative, this remains
+    // true after a demand promotes or consumes an in-flight prefetch.
+    bool load_origin_speculative = false;
     bool retained = false;
     uint64_t forward_epoch = 0;
     uint64_t prediction_epoch = 0;

@@ -419,7 +419,8 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
                      int eos_id, GenerationResult& result, std::string& error,
                      const std::function<void(int, const std::string&)>& on_token,
                      bool reset_context, const VisionEmbedding* vision,
-                     int image_token_id) {
+                     int image_token_id,
+                     const std::function<void()>& on_prefill_complete) {
     result = GenerationResult();
     if (prompt_ids.empty()) {
         error = "prompt is empty after tokenization";
@@ -448,6 +449,7 @@ bool generate_tokens(LLMEngine& engine, const Tokenizer& tokenizer,
         engine.park_workers();
         return false;
     }
+    if (on_prefill_complete) on_prefill_complete();
 
     const std::vector<std::string> stop_sequences = tokenizer.stop_sequences();
     // Keep the normal Transformer path exactly token-based. This is the hot

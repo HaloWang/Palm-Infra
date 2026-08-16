@@ -50,10 +50,30 @@ Ten GiB is within 2.1% of the 16 GiB throughput while using about 6 GiB less
 peak RSS. The 1 GiB configuration demonstrates that the 122B package can run
 at about 6 GiB peak RSS, at the cost of substantially more SSD I/O.
 
-SSD reads are logical routed-expert bytes successfully loaded by demand or
-prefetch, divided by generated tokens. The value amortizes prompt prefill over
-the generated output and excludes dense-weight and CPU-sidecar loading; it is
-not a direct measurement of filesystem or physical-device traffic.
+The tables above use the original combined-run counter: logical routed-expert
+bytes successfully loaded by demand or prefetch across both prompt prefill and
+decode, divided by generated tokens. It excludes dense-weight and CPU-sidecar
+loading and is not a direct measurement of filesystem or physical-device
+traffic. In particular, it must not be combined with decode-only throughput to
+estimate a bandwidth roofline.
+
+Current `mollm_bench` output takes a statistics snapshot after prefill and
+resets counters before timed decode. It reports separate `moe_ssd_prefill_*`
+and `moe_ssd_decode_*` keys. Within each phase:
+
+- `logical_load` is the logical size of cache entries whose load completed;
+- `demand_origin_load` and `prefetch_origin_load` split entries by the request
+  that originally created their residency;
+- `useful_prefetch` counts prefetched entries when first consumed;
+- `unused_prefetch_evicted` counts prefetched entries evicted before use;
+- `expert_bytes_acquired` counts routed-expert bytes handed to compute,
+  including cache hits;
+- `wait_ms` is foreground time blocked in expert acquisition.
+
+Loads and usefulness can occur in different phases. For example, a prefetch
+completed near the end of prefill appears in prefill load bytes, while its
+first use can appear in decode useful-prefetch bytes. All byte counters remain
+logical application-level quantities rather than physical NAND traffic.
 
 Cache capacity must leave room for dense weights, KV cache, runtime buffers, and
 other applications.

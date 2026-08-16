@@ -37,9 +37,10 @@ cache 容量可配置，并不要求把模型完整常驻内存。在下面的�
 该 sweep 使用 16-token 真实 prompt、生成 256 tokens、greedy decoding、
 `warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-29 重新运行。
 10 GiB cache 的 decode 吞吐与 16 GiB 相差约 2.1%，同时峰值 RSS 少约
-6 GiB；1 GiB 则展示了低内存运行能力。SSD 读取量统计 demand 或 prefetch
-实际装入的路由 expert 逻辑字节，并除以生成 token 数；该摊销值包含 prompt
-prefill，但不包含稠密权重和 CPU sidecar 的加载。
+6 GiB；1 GiB 则展示了低内存运行能力。SSD 一列沿用历史 combined-run 口径：
+demand 或 prefetch 实际装入的路由 expert 逻辑字节除以生成 token 数，其中包含
+prompt prefill，不包含稠密权重和 CPU sidecar。当前 `mollm_bench` 另行输出
+prefill/decode 分段统计，定义见 SSD offload 文档。
 
 cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
 [122B MoE SSD offload](docs/ssd-offload.md)。
@@ -69,7 +70,8 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 该实验使用 20-token 中文真实 prompt、生成 64 tokens、greedy decoding、
 6 个 CPU 线程、`warmup=0`，每档 cache 取三个独立进程的中位数。由于测试
 协议不同，这组真实 prompt 数据不与标准 `pp256 + tg64` 性能图混排。SSD
-读取量采用与上方 122B 表格相同的摊销逻辑 expert 字节定义。
+读取量采用与上方 122B 表格相同的历史 combined-run 逻辑 expert 字节定义，
+并不是 decode-only 的设备读取量。
 
 ## 已支持的模型
 

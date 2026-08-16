@@ -52,9 +52,11 @@ This sweep uses a 16-token real prompt, 256 generated tokens, greedy decoding,
 `warmup=0`, and three independent process runs per cache size. The rows were
 rerun on 2026-07-29. The 10 GiB cache is within 2.1% of the 16 GiB decode
 throughput while using about 6 GiB less peak RSS; 1 GiB demonstrates the
-low-memory operating point. SSD reads are logical routed-expert bytes loaded
-by demand or prefetch, divided by generated tokens; prompt prefill is included
-in the amortized value, while dense-weight and CPU-sidecar loading is excluded.
+low-memory operating point. The SSD column is the historical combined-run
+metric: logical routed-expert bytes loaded by demand or prefetch, divided by
+generated tokens. Prompt prefill is included, while dense-weight and CPU-sidecar
+loading is excluded. Current `mollm_bench` also reports phase-separated prefill
+and decode counters; see the SSD-offload document for their definitions.
 
 See [Running 122B MoE models with SSD offload](docs/ssd-offload.md) for cache
 policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
@@ -86,7 +88,8 @@ This experimental sweep uses a 20-token real Chinese prompt, 64 generated
 tokens, greedy decoding, six CPU threads, `warmup=0`, and three independent
 processes per cache size. These real-prompt numbers are reported separately
 from the standard `pp256 + tg64` performance chart. SSD reads use the same
-amortized logical-expert-byte definition as the 122B table above.
+historical combined-run logical-expert-byte definition as the 122B table above;
+they are not decode-only device traffic.
 
 ## What Works
 

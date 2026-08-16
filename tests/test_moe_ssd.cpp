@@ -256,6 +256,19 @@ int main() {
         check(stats.evictions == 1, "LRU eviction accounting");
         check(stats.resident_bytes == 16, "cache capacity accounting");
         check(stats.bytes_read == 24, "pread byte accounting");
+        check(stats.demand_load_bytes == 24 &&
+                  stats.prefetch_load_bytes == 0,
+              "demand and prefetch load bytes are separated");
+        check(stats.expert_bytes_acquired == 32,
+              "expert acquire bytes include cache hits");
+
+        cache.reset_stats();
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "acquire resident expert after statistics reset");
+        stats = cache.stats();
+        check(stats.bytes_read == 0 && stats.expert_bytes_acquired == 8 &&
+                  stats.hits == 1,
+              "statistics interval counts resident weight use without a load");
     }
 
     // A bounded route window can release a consumed pair and immediately make
@@ -801,6 +814,30 @@ int main() {
               "statistics reset preserves learned prefetch policy");
     }
 
+    // Logical load origin and eventual usefulness are independent events: a
+    // prefill-interval prefetch can be consumed during a later decode interval.
+    {
+        MoeSsdCache cache;
+        check(cache.open(path, 8, 1), "open useful-prefetch cache");
+        check(cache.add_source(spec("useful_gate", 0)) &&
+                  cache.add_source(spec("useful_down", 6 * sizeof(uint16_t))),
+              "add useful-prefetch sources");
+        const MoeSsdTensorSource* gate = cache.find_source("useful_gate");
+        const MoeSsdTensorSource* down = cache.find_source("useful_down");
+        check(cache.prefetch_many(gate, down, {0}, {1.0f}),
+              "queue useful speculative expert");
+        for (int spin = 0; spin < 100 && cache.stats().bytes_read < 8; ++spin)
+            std::this_thread::yield();
+        Tensor gu, dw;
+        check(cache.acquire(gate, down, 0, gu, dw),
+              "consume useful speculative expert");
+        const auto stats = cache.stats();
+        check(stats.prefetch_load_bytes == 8 &&
+                  stats.useful_prefetch_bytes == 8 &&
+                  stats.expert_bytes_acquired == 8,
+              "useful prefetch bytes are counted on first consumption");
+    }
+
     // Track cache pollution separately from useful demand residency, and flag
     // an expert which has to be reloaded immediately after eviction.
     {
@@ -827,6 +864,10 @@ int main() {
         check(cache.acquire(gate, down, 0, gu, dw),
               "reload recently evicted expert");
         const auto stats = cache.stats();
+        check(stats.prefetch_load_bytes >= 8,
+              "speculative-origin load bytes are counted separately");
+        check(stats.unused_prefetch_bytes >= 8,
+              "unused speculative bytes are counted on eviction");
         check(!stats.layers.empty() &&
               stats.layers[0].unused_prefetch_evictions >= 1,
               "unused speculative eviction is counted");
