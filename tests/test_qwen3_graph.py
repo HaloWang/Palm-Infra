@@ -40,14 +40,15 @@ def main():
         check(node.params_i32[3] == 2, "SDPA num_kv_heads")
         check(node.params_i32[4] == 4, "SDPA head_dim")
 
-    q_proj = [
+    qkv_proj = [
         n for n in g._nodes
         if n.op_type == OpType.CONSTANT
         and n.params_str
-        and n.params_str[0].endswith("model_layers_0_self_attn_q_proj_weight.weights")
+        and n.params_str[0].endswith(
+            "model_layers_0_self_attn_qkv_proj_weight.weights")
     ][0]
-    check(tuple(q_proj.out_shape[:2]) == (16, 16),
-          "Qwen3 q_proj is [num_heads*head_dim, hidden], not gated 2x")
+    check(tuple(qkv_proj.out_shape[:2]) == (32, 16),
+          "Qwen3 fused qkv_proj is [q_dim+2*kv_dim, hidden]")
 
     cache_k = [
         n for n in g._nodes

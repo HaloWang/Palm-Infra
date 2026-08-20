@@ -429,6 +429,33 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_thread_pool_stress tests/test_thread_pool_stress.cpp)
     find_package(Python3 COMPONENTS Interpreter QUIET)
     if(Python3_Interpreter_FOUND)
+        function(add_mollm_python_test name script)
+            add_test(
+                NAME ${name}
+                COMMAND ${Python3_EXECUTABLE}
+                        ${CMAKE_CURRENT_SOURCE_DIR}/tests/${script})
+        endfunction()
+
+        add_mollm_python_test(test_shape_propagation
+                              test_shape_propagation.py)
+        add_mollm_python_test(test_qwen3_graph
+                              test_qwen3_graph.py)
+        add_mollm_python_test(test_qwen3_moe_graph
+                              test_qwen3_moe_graph.py)
+        add_mollm_python_test(test_qwen35_graph
+                              test_qwen35_graph.py)
+        add_mollm_python_test(test_qwen35_quant_policy
+                              test_qwen35_quant_policy.py)
+        add_mollm_python_test(test_qwen35_moe_quant_policy
+                              test_qwen35_moe_quant_policy.py)
+        add_mollm_python_test(test_qwen35_moe_projection_fusion
+                              test_qwen35_moe_projection_fusion.py)
+        add_mollm_python_test(test_youtu_quant_policy
+                              test_youtu_quant_policy.py)
+        add_mollm_python_test(test_rwkv7_quant_policy
+                              test_rwkv7_quant_policy.py)
+        add_mollm_python_test(test_moe_expert_storage_metadata
+                              test_moe_expert_storage_metadata.py)
         add_test(
             NAME test_canonical_w4_storage
             COMMAND ${Python3_EXECUTABLE}
