@@ -144,6 +144,10 @@ void print_kv_ssd_phase(const char* phase, const MoeSsdCache::Stats& stats,
                 stats.expert_bytes_acquired / 1e6);
     std::printf("moe_ssd_%s_wait_ms=%.3f\n", phase,
                 ssd_wait_ns(stats) / 1e6);
+    std::printf("moe_ssd_%s_slot_waits=%llu\n", phase,
+                static_cast<unsigned long long>(stats.slot_waits));
+    std::printf("moe_ssd_%s_slot_wait_ms=%.3f\n", phase,
+                stats.slot_wait_ns / 1e6);
     std::printf("moe_ssd_%s_logical_load_mb_per_%s=%.6f\n", phase,
                 token_kind, mb_per_token(stats.bytes_read));
     std::printf("moe_ssd_%s_demand_origin_load_mb_per_%s=%.6f\n", phase,
@@ -172,6 +176,9 @@ void print_human_ssd_phase(const MoeSsdCache::Stats& stats, int tokens,
     human_row("ssd_unused_pf_mb", stats.unused_prefetch_bytes / 1e6, "MB");
     human_row("ssd_acquired_mb", stats.expert_bytes_acquired / 1e6, "logical MB");
     human_row("ssd_wait_ms", ssd_wait_ns(stats) / 1e6, "ms");
+    human_row_int("ssd_slot_waits",
+                  static_cast<long long>(stats.slot_waits), "");
+    human_row("ssd_slot_wait_ms", stats.slot_wait_ns / 1e6, "ms");
     char key[48];
     std::snprintf(key, sizeof(key), "ssd_load_mb/%s", token_kind);
     human_row(key, mb_per_token(stats.bytes_read), "MB");

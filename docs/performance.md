@@ -90,7 +90,12 @@ W4G32 package reaches `7.020762` PPL on the complete
 |---|---:|---:|---|
 | Qwen3.6-35B-A3B | **139.63** / **65.32** | 116.93 / 43.73 | mollm 1.19x prefill, 1.49x decode |
 | Qwen3-30B-A3B | **143.50** / **63.85** | 110.34 / 60.77 | mollm 1.30x prefill, 1.05x decode |
+| Hy-MT2-30B-A3B | **158.30** / **70.44** | — | mollm only |
 | Qwen3.5-122B-A10B (SSD offload) | **51.06** / **16.53** † | OOM | runs on a 48GB Mac |
+| Hy3-295B-A21B (SSD offload) | **10.57** / **3.41** | OOM | runs on a 48GB Mac |
+
+The Hy-MT2 row was measured on 2026-08-20 with the same five-process protocol;
+no matched llama.cpp package was available.
 
 † Prefill was refreshed on 2026-07-27 and is the five-process
 `pp256 + tg64`, `warmup=3` median with a 16 GiB expert RAM cache. Decode is the
@@ -154,6 +159,10 @@ empty-context decode path. Both runtimes keep model weights on Metal.
 | Qwen3.5-4B | **2373.40** / **90.21** | 2211.84 / 76.11 | +18.5% |
 | RWKV7-1.5B mixed W4G32 | 2299.03 / 131.07 | **3775.16** / **132.54** | -1.1% |
 | Qwen3-30B-A3B W4G128 | **3585.93** / **109.57** | 1710.91 / 94.47 | +16.0% |
+| Hy-MT2-30B-A3B W4G128 | **3289.40** / **98.09** | — | mollm only |
+
+The Hy-MT2 Metal row was measured on 2026-08-20 with the resident
+shared-expert GPU package; no matched llama.cpp package was available.
 
 Qwen3.5 row-concatenates projections that consume the same activation: MLP
 gate/up, full-attention Q/K/V, and linear-attention QKV/A/B/Z. The graph

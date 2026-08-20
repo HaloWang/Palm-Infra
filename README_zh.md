@@ -17,61 +17,20 @@ mobile-oriented LLM inference engine.
 
 项目当前聚焦 Apple Silicon 和其他现代 ARM 处理器上的高性能本地推理：FP16 使用 NEON FP16FML kernel；CPU 量化模型使用针对 ARM dot-product 指令优化的 weight-only int8/int4 kernel。Linux x86_64 将 scalar、AVX2/FMA/F16C 与 AVX-512 provider 编译为相互隔离的单元，覆盖 FP32、FP16、W8 以及 packed W4G32/W4G128 matmul；启动时通过 CPUID 选择当前 CPU 支持的最宽指令集，旧 CPU 不会执行新指令。设置 `MOLLM_X86_ISA=scalar|avx2|avx512|auto` 可以限制分派层级，便于正确性验证或针对具体机器调优；原有的 `MOLLM_X86_DISABLE_AVX2=1` scalar override 仍然可用。
 
-## 现在，48GB Mac 也能运行 122B 模型
+## 使用 SSD offload 运行大规模 MoE 模型
 
-`mollm` 可以在 48GB Apple Silicon Mac 上运行 W4 量化的
-Qwen3.5-122B-A10B：稠密权重保留在 RAM 中，仅从 SSD 读取被路由到的 MoE
-expert。在当前 256-token cache sweep 中，通过有界的 16 GiB 共享 expert
-cache 和跨层预取，decode 达到 16.53 t/s。
+`mollm` 将稠密权重保留在 RAM 中，只把命中的路由 expert 从 SSD 装入有界的
+共享 cache。同一套异步 offload 路径同时支持 W4 模型和
+DeepSeek-V4-Flash 的原生 FP8/MXFP4 权重。
 
-cache 容量可配置，并不要求把模型完整常驻内存。在下面的真实 prompt sweep
-中，1 GiB expert cache 配置的峰值 RSS 仅 5.90 GiB；增大 cache 可以用更多内存
-换取更少的 SSD 读取和更高吞吐。
+| 模型 | Expert cache | Prefill | Decode |
+|---|---:|---:|---:|
+| Qwen3.5-122B-A10B W4 | 16 GiB | **51.06 t/s** | **16.53 t/s** |
+| DeepSeek-V4-Flash | 16 GiB | **9.52 t/s** | **5.71 t/s** |
+| Hy3-295B-A21B W4G128 | 16 GiB | **10.57 t/s** | **3.41 t/s** |
 
-| Expert RAM cache | Decode | Peak RSS | Cache 命中率 | 每个生成 token 的平均 SSD 读取量 |
-|---:|---:|---:|---:|---:|
-| **1 GiB** | 12.38 t/s | **5.90 GiB** | 47.9% | 1.72 GB/token |
-| **10 GiB** | 16.19 t/s | 14.64 GiB | 83.5% | 0.75 GB/token |
-| **16 GiB** | **16.53 t/s** | 20.60 GiB | **88.6%** | **0.51 GB/token** |
-
-该 sweep 使用 16-token 真实 prompt、生成 256 tokens、greedy decoding、
-`warmup=0`，每档 cache 取三个独立进程的中位数，并于 2026-07-29 重新运行。
-10 GiB cache 的 decode 吞吐与 16 GiB 相差约 2.1%，同时峰值 RSS 少约
-6 GiB；1 GiB 则展示了低内存运行能力。SSD 一列沿用历史 combined-run 口径：
-demand 或 prefetch 实际装入的路由 expert 逻辑字节除以生成 token 数，其中包含
-prompt prefill，不包含稠密权重和 CPU sidecar。当前 `mollm_bench` 另行输出
-prefill/decode 分段统计，定义见 SSD offload 文档。
-
-cache 策略、内存/吞吐 sweep、I/O 行为和 Perfetto trace 详见
-[122B MoE SSD offload](docs/ssd-offload.md)。
-
-## 实验性 DeepSeek-V4-Flash 支持
-
-`mollm` 可以直接转换 DeepSeek-V4-Flash 原生 checkpoint，无需先展开成 FP16。
-其中量化的稠密权重和共享 expert 权重保留原生 FP8 E4M3 数据，路由 expert
-则保留 OCP MXFP4 格式，即 packed E2M1 数值和每 32 个数值一个 E8M0 scale。
-生成的约 157 GB 模型包沿用大 MoE 模型的有界异步 SSD expert offload 路径。
-
-Apple M5 Pro 上当前的纯 CPU 实验结果：
-
-| 标准吞吐 | Expert RAM cache | 结果 |
-|---|---:|---:|
-| `pp256 + tg64` | 16 GiB | **9.52 pp / 5.71 tg** |
-
-该标准样本使用 4 个 CPU 线程和 `warmup=3`。目前只完成了一个独立进程，
-并非通常采用的五进程中位数，因此暂作 provisional 数据。
-
-| Expert RAM cache | Decode | Peak RSS | 每个生成 token 的平均 SSD 读取量 |
-|---:|---:|---:|---:|
-| **1 GiB** | 4.95 t/s | **19.66 GiB** | 3.57 GB/token |
-| **10 GiB** | 5.57 t/s | 26.57 GiB | 1.77 GB/token |
-| **16 GiB** | **5.59 t/s** | 27.03 GiB | **1.49 GB/token** |
-
-该实验使用 20-token 中文真实 prompt、生成 64 tokens、greedy decoding、
-6 个 CPU 线程、`warmup=0`，每档 cache 取三个独立进程的中位数。由于测试
-协议不同，这组真实 prompt 数据不与标准 `pp256 + tg64` 性能图混排。SSD
-读取量采用与上方 122B 表格相同的历史 combined-run 逻辑 expert 字节定义，
-并不是 decode-only 的设备读取量。
+[Cache sweep、I/O 行为与 tracing](docs/ssd-offload.md) ·
+[完整性能表与测试协议](docs/performance.md)
 
 ## 已支持的模型
 
@@ -81,7 +40,8 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 | Qwen3-30B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.6-35B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
-| Tencent HY-V3 / Hy-MT2-30B-A3B | 仅文本 MoE，支持 SSD expert offload |
+| Tencent Hy-MT2-30B-A3B | 仅文本 W4 MoE；支持 CPU 与 Metal |
+| Tencent Hy3-295B-A21B | 仅文本 W4 MoE，支持 CPU SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |

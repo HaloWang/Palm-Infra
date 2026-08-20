@@ -177,6 +177,7 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         demand_load_bytes_ = prefetch_load_bytes_ = 0;
         useful_prefetch_bytes_ = unused_prefetch_bytes_ = 0;
         expert_bytes_acquired_ = 0;
+        slot_waits_ = slot_wait_ns_ = 0;
         cross_layer_tasks_count_ = cross_layer_dropped_ = 0;
         cross_layer_experts_ = cross_layer_used_ = cross_layer_rejected_ = 0;
         cross_layer_rank_attempts_.clear();
@@ -1141,7 +1142,12 @@ bool MoeSsdCache::acquire(const MoeSsdTensorSource* gate_up,
         // All slots are loading. Let one complete, then evict it if needed
         // and submit this deferred expert.
         begin_wait();
+        const auto slot_wait_start = SteadyClock::now();
         ready_cv_.wait(lock);
+        slot_wait_ns_ += static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                SteadyClock::now() - slot_wait_start).count());
+        ++slot_waits_;
         entry = find_entry_locked(gate_up, down, expert);
     }
     if (entry && entry->is_loading()) begin_wait();
@@ -1201,6 +1207,8 @@ MoeSsdCache::Stats MoeSsdCache::stats() const {
     result.useful_prefetch_bytes = useful_prefetch_bytes_;
     result.unused_prefetch_bytes = unused_prefetch_bytes_;
     result.expert_bytes_acquired = expert_bytes_acquired_;
+    result.slot_waits = slot_waits_;
+    result.slot_wait_ns = slot_wait_ns_;
     result.cross_layer_tasks = cross_layer_tasks_count_;
     result.cross_layer_dropped = cross_layer_dropped_;
     result.cross_layer_experts = cross_layer_experts_;
@@ -1245,6 +1253,7 @@ void MoeSsdCache::reset_stats() {
     useful_prefetch_bytes_ = 0;
     unused_prefetch_bytes_ = 0;
     expert_bytes_acquired_ = 0;
+    slot_waits_ = slot_wait_ns_ = 0;
     cross_layer_tasks_count_ = 0;
     cross_layer_dropped_ = 0;
     cross_layer_experts_ = 0;

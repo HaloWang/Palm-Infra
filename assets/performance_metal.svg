@@ -1,7 +1,7 @@
-<svg width="1500" height="900" viewBox="0 0 1500 900" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+<svg width="1500" height="946" viewBox="0 0 1500 946" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">mollm Metal throughput comparison</title>
-  <desc id="desc">Median pp256 and tg64 from context 256 on Apple M5 Pro, comparing mollm with llama.cpp Metal across four dense or recurrent models and Qwen3-30B-A3B MoE.</desc>
-  <rect width="1500" height="900" fill="#fff"/>
+  <desc id="desc">Median pp256 and tg64 from context 256 on Apple M5 Pro, comparing mollm with llama.cpp Metal across dense, recurrent, and MoE models, including Hy-MT2-30B-A3B.</desc>
+  <rect width="1500" height="946" fill="#fff"/>
   <style>
     .title{font:700 26px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#101828}.subtitle{font:13px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#667085}.head{font:700 17px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#101828}.section{font:700 14px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#101828}.label{font:12px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#344054}.value{font:10px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#344054}.tick{font:10px -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;fill:#667085}.m{fill:#2563eb}.l{fill:#94a3b8}.grid{stroke:#eaecf0;stroke-width:1}.axis{stroke:#cbd5e1;stroke-width:1}
   </style>
@@ -12,11 +12,11 @@
 
   <text x="260" y="105" class="head">Prefill pp256</text><text x="850" y="105" class="head">Decode tg64 @ context 256</text>
   <text x="260" y="125" class="subtitle">0–11000 tokens/s</text><text x="850" y="125" class="subtitle">0–300 tokens/s</text>
-  <line x1="260" y1="140" x2="260" y2="822" class="axis"/><line x1="850" y1="140" x2="850" y2="822" class="axis"/>
-  <line x1="470" y1="140" x2="470" y2="822" class="grid"/><line x1="680" y1="140" x2="680" y2="822" class="grid"/>
-  <line x1="1060" y1="140" x2="1060" y2="822" class="grid"/><line x1="1270" y1="140" x2="1270" y2="822" class="grid"/>
-  <text x="256" y="840" class="tick">0</text><text x="457" y="840" class="tick">5500</text><text x="663" y="840" class="tick">11000</text>
-  <text x="846" y="840" class="tick">0</text><text x="1048" y="840" class="tick">150</text><text x="1258" y="840" class="tick">300</text>
+  <line x1="260" y1="140" x2="260" y2="868" class="axis"/><line x1="850" y1="140" x2="850" y2="868" class="axis"/>
+  <line x1="470" y1="140" x2="470" y2="868" class="grid"/><line x1="680" y1="140" x2="680" y2="868" class="grid"/>
+  <line x1="1060" y1="140" x2="1060" y2="868" class="grid"/><line x1="1270" y1="140" x2="1270" y2="868" class="grid"/>
+  <text x="256" y="886" class="tick">0</text><text x="457" y="886" class="tick">5500</text><text x="663" y="886" class="tick">11000</text>
+  <text x="846" y="886" class="tick">0</text><text x="1048" y="886" class="tick">150</text><text x="1258" y="886" class="tick">300</text>
 
   <text x="38" y="158" class="section">FP16</text>
   <text x="38" y="188" class="label">Qwen3.5-0.8B</text>
@@ -63,5 +63,9 @@
   <rect x="260" y="787" width="136.9" height="8" rx="2" class="m"/><rect x="260" y="799" width="65.9" height="8" rx="2" class="l"/><text x="404" y="795" class="value">3585.93</text><text x="333" y="807" class="value">1710.91</text>
   <rect x="850" y="787" width="153.4" height="8" rx="2" class="m"/><rect x="850" y="799" width="132.3" height="8" rx="2" class="l"/><text x="1010" y="795" class="value">109.57</text><text x="989" y="807" class="value">94.47</text>
 
-  <text x="38" y="875" class="subtitle">Independent scales keep both phases readable. Complete tables, deltas, protocol, and long-context scaling: docs/performance.md</text>
+  <text x="38" y="850" class="label">Hy-MT2-30B-A3B W4G128</text>
+  <rect x="260" y="833" width="125.6" height="8" rx="2" class="m"/><text x="393" y="841" class="value">3289.40</text><text x="260" y="853" class="value">—</text>
+  <rect x="850" y="833" width="137.3" height="8" rx="2" class="m"/><text x="994" y="841" class="value">98.09</text><text x="850" y="853" class="value">—</text>
+
+  <text x="38" y="921" class="subtitle">Hy-MT2 has no matched llama.cpp package. Complete tables, deltas, protocol, and long-context scaling: docs/performance.md</text>
 </svg>

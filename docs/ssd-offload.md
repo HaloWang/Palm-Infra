@@ -1,9 +1,10 @@
-# Running 122B MoE models with SSD offload
+# Running Large MoE models with SSD offload
 
-mollm runs Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac without keeping the
-complete model resident. Always-used dense weights stay locked in RAM, while
-asynchronous `pread` workers fetch only the routed MoE expert pairs from the
-package. A bounded RAM cache, configured with `--ssd-cache-mb`, retains recently
+mollm runs Qwen3.5-122B-A10B, DeepSeek-V4-Flash, and Hy3-295B-A21B on a 48GB
+Apple Silicon Mac without keeping the complete model resident. Always-used
+dense weights stay locked in RAM, while asynchronous `pread` workers fetch only
+the routed MoE expert pairs from the package. A bounded RAM cache, configured
+with `--ssd-cache-mb`, retains recently
 used expert pairs.
 
 ## Cache policy
@@ -69,6 +70,9 @@ and `moe_ssd_decode_*` keys. Within each phase:
 - `expert_bytes_acquired` counts routed-expert bytes handed to compute,
   including cache hits;
 - `wait_ms` is foreground time blocked in expert acquisition.
+- `slot_waits` and `slot_wait_ms` isolate waits caused by every eviction
+  candidate still loading; zero means foreground time was spent waiting for
+  the requested expert itself rather than for cache capacity.
 
 Loads and usefulness can occur in different phases. For example, a prefetch
 completed near the end of prefill appears in prefill load bytes, while its

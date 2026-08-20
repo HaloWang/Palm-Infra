@@ -30,66 +30,20 @@ Set `MOLLM_X86_ISA=scalar|avx2|avx512|auto` to cap the selected tier for
 testing or machine-specific tuning. The legacy
 `MOLLM_X86_DISABLE_AVX2=1` scalar override remains supported.
 
-## Now it runs a 122B model on a 48GB Mac (Or even 16GB)
+## Large MoE models with SSD offload
 
-`mollm` can run Qwen3.5-122B-A10B W4 on a 48GB Apple Silicon Mac by keeping
-dense weights in RAM and fetching only routed MoE experts from SSD. In the
-current 256-token cache sweep, a bounded, shared 16 GiB expert cache and
-cross-layer prefetching provide 16.53 t/s interactive decode.
+`mollm` keeps dense weights in RAM and loads only routed experts from SSD into
+a bounded shared cache. The same asynchronous offload path supports W4 models
+as well as DeepSeek-V4-Flash's native FP8/MXFP4 weights.
 
-The cache is configurable rather than tied to a resident copy of the model. In
-the following real-prompt sweep, the 1 GiB expert-cache configuration runs with
-only 5.90 GiB peak RSS; larger caches trade memory for fewer SSD reads and
-higher throughput.
+| Model | Expert cache | Prefill | Decode |
+|---|---:|---:|---:|
+| Qwen3.5-122B-A10B W4 | 16 GiB | **51.06 t/s** | **16.53 t/s** |
+| DeepSeek-V4-Flash | 16 GiB | **9.52 t/s** | **5.71 t/s** |
+| Hy3-295B-A21B W4G128 | 16 GiB | **10.57 t/s** | **3.41 t/s** |
 
-| Expert RAM cache | Decode | Peak RSS | Cache hit rate | Avg. SSD reads / generated token |
-|---:|---:|---:|---:|---:|
-| **1 GiB** | 12.38 t/s | **5.90 GiB** | 47.9% | 1.72 GB/token |
-| **10 GiB** | 16.19 t/s | 14.64 GiB | 83.5% | 0.75 GB/token |
-| **16 GiB** | **16.53 t/s** | 20.60 GiB | **88.6%** | **0.51 GB/token** |
-
-This sweep uses a 16-token real prompt, 256 generated tokens, greedy decoding,
-`warmup=0`, and three independent process runs per cache size. The rows were
-rerun on 2026-07-29. The 10 GiB cache is within 2.1% of the 16 GiB decode
-throughput while using about 6 GiB less peak RSS; 1 GiB demonstrates the
-low-memory operating point. The SSD column is the historical combined-run
-metric: logical routed-expert bytes loaded by demand or prefetch, divided by
-generated tokens. Prompt prefill is included, while dense-weight and CPU-sidecar
-loading is excluded. Current `mollm_bench` also reports phase-separated prefill
-and decode counters; see the SSD-offload document for their definitions.
-
-See [Running 122B MoE models with SSD offload](docs/ssd-offload.md) for cache
-policy, memory/throughput sweeps, I/O behavior, and Perfetto tracing.
-
-## Experimental DeepSeek-V4-Flash support
-
-`mollm` can convert the native DeepSeek-V4-Flash checkpoint without first
-expanding it to FP16. Quantized dense and shared-expert weights retain their
-native FP8 E4M3 data, while routed experts retain OCP MXFP4: packed E2M1 values
-with one E8M0 scale per 32 values. The 157 GB package uses the same bounded,
-asynchronous SSD expert offload path as other large MoE models.
-
-Current CPU-only results on an Apple M5 Pro:
-
-| Standard throughput | Expert RAM cache | Result |
-|---|---:|---:|
-| `pp256 + tg64` | 16 GiB | **9.52 pp / 5.71 tg** |
-
-This standard sample uses four CPU threads and `warmup=3`. It is one completed
-process run rather than the usual five-process median, so it is provisional.
-
-| Expert RAM cache | Decode | Peak RSS | Avg. SSD reads / generated token |
-|---:|---:|---:|---:|
-| **1 GiB** | 4.95 t/s | **19.66 GiB** | 3.57 GB/token |
-| **10 GiB** | 5.57 t/s | 26.57 GiB | 1.77 GB/token |
-| **16 GiB** | **5.59 t/s** | 27.03 GiB | **1.49 GB/token** |
-
-This experimental sweep uses a 20-token real Chinese prompt, 64 generated
-tokens, greedy decoding, six CPU threads, `warmup=0`, and three independent
-processes per cache size. These real-prompt numbers are reported separately
-from the standard `pp256 + tg64` performance chart. SSD reads use the same
-historical combined-run logical-expert-byte definition as the 122B table above;
-they are not decode-only device traffic.
+[Cache sweeps, I/O behavior, and tracing](docs/ssd-offload.md) ·
+[Complete performance tables and protocols](docs/performance.md)
 
 ## What Works
 
@@ -99,7 +53,8 @@ they are not decode-only device traffic.
 | Qwen3-30B-A3B MoE | text-only W4 path |
 | Qwen3.6-35B-A3B MoE | text-only W4 path |
 | Qwen3.5-122B-A10B MoE | CPU W4 with SSD expert offload |
-| Tencent HY-V3 / Hy-MT2-30B-A3B | text-only MoE, including SSD expert offload |
+| Tencent Hy-MT2-30B-A3B | text-only W4 MoE; CPU and Metal |
+| Tencent Hy3-295B-A21B | text-only W4 MoE with CPU SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 | RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |

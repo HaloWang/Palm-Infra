@@ -125,6 +125,10 @@ public:
         // Logical routed-expert bytes returned by acquire(), including hits.
         // For decode this is a closer weight-traffic numerator than misses.
         uint64_t expert_bytes_acquired = 0;
+        // Time spent unable to reserve a demand entry because every
+        // eviction candidate was still loading.
+        uint64_t slot_waits = 0;
+        uint64_t slot_wait_ns = 0;
         uint64_t cross_layer_tasks = 0;
         uint64_t cross_layer_dropped = 0;
         uint64_t cross_layer_experts = 0;
@@ -326,6 +330,8 @@ private:
     uint64_t useful_prefetch_bytes_ = 0;
     uint64_t unused_prefetch_bytes_ = 0;
     uint64_t expert_bytes_acquired_ = 0;
+    uint64_t slot_waits_ = 0;
+    uint64_t slot_wait_ns_ = 0;
     uint64_t cross_layer_tasks_count_ = 0;
     uint64_t cross_layer_dropped_ = 0;
     uint64_t cross_layer_experts_ = 0;

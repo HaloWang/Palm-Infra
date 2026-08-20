@@ -1,7 +1,7 @@
-<svg width="1180" height="1185" viewBox="0 0 1180 1185" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+<svg width="1180" height="1280" viewBox="0 0 1180 1280" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
   <title id="title">mollm CPU throughput comparison</title>
-  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp CPU FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro, plus separate real-prompt SSD-offload results for Qwen3.5-122B and DeepSeek-V4-Flash.</desc>
-  <rect width="1180" height="1185" fill="#ffffff"/>
+  <desc id="desc">Horizontal bar charts comparing mollm and llama.cpp CPU FP16, W8, and W4 prompt prefill and decode throughput on Apple M5 Pro, including Hy-MT2 and SSD-offload results for Qwen3.5-122B, DeepSeek-V4-Flash, and Hy3-295B.</desc>
+  <rect width="1180" height="1280" fill="#ffffff"/>
   <style>
     .title { font: 700 26px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #101828; }
     .subtitle { font: 13px -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #667085; }
@@ -91,8 +91,8 @@
   <text x="200" y="686" class="panel">Prompt / prefill pp256 tokens/s</text>
   <text x="700" y="686" class="panel">Decode tg64 tokens/s</text>
   <line x1="40" y1="700" x2="1140" y2="700" class="rule"/>
-  <line x1="200" y1="706" x2="200" y2="1088" class="grid"/><line x1="305" y1="706" x2="305" y2="1088" class="grid"/><line x1="410" y1="706" x2="410" y2="1088" class="grid"/><line x1="515" y1="706" x2="515" y2="1088" class="grid"/><line x1="620" y1="706" x2="620" y2="1088" class="grid"/>
-  <line x1="700" y1="706" x2="700" y2="1088" class="grid"/><line x1="805" y1="706" x2="805" y2="1088" class="grid"/><line x1="910" y1="706" x2="910" y2="1088" class="grid"/><line x1="1015" y1="706" x2="1015" y2="1088" class="grid"/><line x1="1120" y1="706" x2="1120" y2="1088" class="grid"/>
+  <line x1="200" y1="706" x2="200" y2="1180" class="grid"/><line x1="305" y1="706" x2="305" y2="1180" class="grid"/><line x1="410" y1="706" x2="410" y2="1180" class="grid"/><line x1="515" y1="706" x2="515" y2="1180" class="grid"/><line x1="620" y1="706" x2="620" y2="1180" class="grid"/>
+  <line x1="700" y1="706" x2="700" y2="1180" class="grid"/><line x1="805" y1="706" x2="805" y2="1180" class="grid"/><line x1="910" y1="706" x2="910" y2="1180" class="grid"/><line x1="1015" y1="706" x2="1015" y2="1180" class="grid"/><line x1="1120" y1="706" x2="1120" y2="1180" class="grid"/>
   <text x="40" y="733" class="label">Qwen3.5-0.8B</text>
   <rect x="200" y="712" width="364.8" height="13" rx="2" class="mollm"/><text x="572" y="723" class="value">868.62</text>
   <rect x="200" y="730" width="335.1" height="13" rx="2" class="llama"/><text x="542" y="741" class="value">797.85</text>
@@ -123,20 +123,30 @@
   <rect x="200" y="960" width="46.3" height="13" rx="2" class="llama"/><text x="253" y="971" class="value">110.34</text>
   <rect x="700" y="942" width="67.0" height="13" rx="2" class="mollm"/><text x="774" y="953" class="value">63.85</text>
   <rect x="700" y="960" width="63.8" height="13" rx="2" class="llama"/><text x="771" y="971" class="value">60.77</text>
-  <text x="40" y="1009" class="label">Qwen3.5-122B SSD</text>
-  <rect x="200" y="988" width="21.4" height="13" rx="2" class="mollm"/><text x="228" y="999" class="value">51.06</text>
-  <text x="200" y="1017" class="value">0 (OOM)</text>
-  <rect x="700" y="988" width="17.4" height="13" rx="2" class="mollm"/><text x="725" y="999" class="value">16.53</text>
-  <text x="700" y="1017" class="value">0 (OOM)</text>
-  <text x="40" y="1055" class="label">DeepSeek-V4-Flash</text>
-  <rect x="200" y="1034" width="4.0" height="13" rx="2" class="mollm"/><text x="211" y="1045" class="value">9.52</text>
+  <text x="40" y="1009" class="label">Hy-MT2-30B-A3B</text>
+  <rect x="200" y="988" width="66.5" height="13" rx="2" class="mollm"/><text x="274" y="999" class="value">158.30</text>
+  <text x="200" y="1017" class="value">—</text>
+  <rect x="700" y="988" width="74.0" height="13" rx="2" class="mollm"/><text x="781" y="999" class="value">70.44</text>
+  <text x="700" y="1017" class="value">—</text>
+  <text x="40" y="1055" class="label">Qwen3.5-122B SSD</text>
+  <rect x="200" y="1034" width="21.4" height="13" rx="2" class="mollm"/><text x="228" y="1045" class="value">51.06</text>
   <text x="200" y="1063" class="value">0 (OOM)</text>
-  <rect x="700" y="1034" width="6.0" height="13" rx="2" class="mollm"/><text x="713" y="1045" class="value">5.71</text>
+  <rect x="700" y="1034" width="17.4" height="13" rx="2" class="mollm"/><text x="725" y="1045" class="value">16.53</text>
   <text x="700" y="1063" class="value">0 (OOM)</text>
-  <line x1="200" y1="1088" x2="620" y2="1088" class="axis"/>
-  <text x="196" y="1106" class="tick">0</text><text x="292" y="1106" class="tick">250</text><text x="397" y="1106" class="tick">500</text><text x="502" y="1106" class="tick">750</text><text x="603" y="1106" class="tick">1000</text>
-  <line x1="700" y1="1088" x2="1120" y2="1088" class="axis"/>
-  <text x="696" y="1106" class="tick">0</text><text x="793" y="1106" class="tick">100</text><text x="898" y="1106" class="tick">200</text><text x="1003" y="1106" class="tick">300</text><text x="1108" y="1106" class="tick">400</text>
-  <text x="40" y="1144" class="subtitle">122B prefill uses the standard median; decode uses a 16-token prompt / 256-token output, 16 GiB cache, 3-run median.</text>
-  <text x="40" y="1166" class="subtitle">DeepSeek-V4 uses 16 GiB cache, 4 threads, pp256 + tg64, warmup=3, single process run (provisional). llama.cpp: OOM.</text>
+  <text x="40" y="1101" class="label">DeepSeek-V4-Flash SSD</text>
+  <rect x="200" y="1080" width="4.0" height="13" rx="2" class="mollm"/><text x="211" y="1091" class="value">9.52</text>
+  <text x="200" y="1109" class="value">0 (OOM)</text>
+  <rect x="700" y="1080" width="6.0" height="13" rx="2" class="mollm"/><text x="713" y="1091" class="value">5.71</text>
+  <text x="700" y="1109" class="value">0 (OOM)</text>
+  <text x="40" y="1147" class="label">Hy3-295B-A21B SSD</text>
+  <rect x="200" y="1126" width="4.4" height="13" rx="2" class="mollm"/><text x="212" y="1137" class="value">10.57</text>
+  <text x="200" y="1155" class="value">0 (OOM)</text>
+  <rect x="700" y="1126" width="3.6" height="13" rx="2" class="mollm"/><text x="711" y="1137" class="value">3.41</text>
+  <text x="700" y="1155" class="value">0 (OOM)</text>
+  <line x1="200" y1="1180" x2="620" y2="1180" class="axis"/>
+  <text x="196" y="1198" class="tick">0</text><text x="292" y="1198" class="tick">250</text><text x="397" y="1198" class="tick">500</text><text x="502" y="1198" class="tick">750</text><text x="603" y="1198" class="tick">1000</text>
+  <line x1="700" y1="1180" x2="1120" y2="1180" class="axis"/>
+  <text x="696" y="1198" class="tick">0</text><text x="793" y="1198" class="tick">100</text><text x="898" y="1198" class="tick">200</text><text x="1003" y="1198" class="tick">300</text><text x="1108" y="1198" class="tick">400</text>
+  <text x="40" y="1236" class="subtitle">Standard rows use 5-process medians; Hy-MT2 has no matched llama.cpp package.</text>
+  <text x="40" y="1258" class="subtitle">SSD rows: Qwen uses real-prompt decode; DeepSeek is a provisional fixed-route run. See docs/performance.md.</text>
 </svg>
