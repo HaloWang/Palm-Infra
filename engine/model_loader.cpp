@@ -534,9 +534,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     ? blob + weight_header.scales_offset : nullptr;
                 const Precision precision =
                     static_cast<Precision>(weight_header.precision);
-                const bool cpu_weight =
-                    !metal_backend_ ||
-                    exec_ctx.backend != metal_backend_.get();
+                const bool cpu_weight = build_cpu_weight_sidecars;
                 auto align_package_region =
                     [&](const void* source, uint64_t size, size_t alignment,
                         const char* suffix) -> void* {
