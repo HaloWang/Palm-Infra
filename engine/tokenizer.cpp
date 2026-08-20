@@ -118,6 +118,9 @@ bool Tokenizer::configure_chat_template(const std::string& path,
     } else if (source.find("<｜User｜>") != std::string::npos &&
                source.find("<｜Assistant｜>") != std::string::npos) {
         chat_template_style_ = ChatTemplateStyle::DEEPSEEK_V4;
+    } else if (source.find("hy_User") != std::string::npos &&
+               source.find("hy_Assistant") != std::string::npos) {
+        chat_template_style_ = ChatTemplateStyle::HY_V3;
     } else if (!source.empty()) {
         fprintf(stderr,
                 "tokenizer: unrecognized packaged chat template; using "
@@ -131,6 +134,8 @@ bool Tokenizer::configure_chat_template(const std::string& path,
             chat_template_style_ = ChatTemplateStyle::CHATML_PLAIN;
         } else if (architecture == "deepseek-v4") {
             chat_template_style_ = ChatTemplateStyle::DEEPSEEK_V4;
+        } else if (architecture == "hy-v3") {
+            chat_template_style_ = ChatTemplateStyle::HY_V3;
         }
     }
     return true;
@@ -247,6 +252,10 @@ bool Tokenizer::load_impl(const std::string& path) {
         bos_id_ = added_tokens_["<|im_start|>"];
     else if (added_tokens_.count("<｜begin▁of▁sentence｜>"))
         bos_id_ = added_tokens_["<｜begin▁of▁sentence｜>"];
+    else if (added_tokens_.count("<｜hy_begin▁of▁sentence｜>"))
+        bos_id_ = added_tokens_["<｜hy_begin▁of▁sentence｜>"];
+    else if (added_tokens_.count("<｜hy_begin_of_sentence:opensource｜>"))
+        bos_id_ = added_tokens_["<｜hy_begin_of_sentence:opensource｜>"];
 
     if (added_tokens_.count("<|end_of_text|>"))
         eos_id_ = added_tokens_["<|end_of_text|>"];
@@ -256,6 +265,10 @@ bool Tokenizer::load_impl(const std::string& path) {
         eos_id_ = added_tokens_["<｜im▁end｜>"];
     else if (added_tokens_.count("<｜end▁of▁sentence｜>"))
         eos_id_ = added_tokens_["<｜end▁of▁sentence｜>"];
+    else if (added_tokens_.count("<eos:6124c78e>"))
+        eos_id_ = added_tokens_["<eos:6124c78e>"];
+    else if (added_tokens_.count("<｜hy_eos:opensource｜>"))
+        eos_id_ = added_tokens_["<｜hy_eos:opensource｜>"];
 
     return true;
 }
@@ -850,7 +863,8 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
         const auto& piece = id_to_piece_[id];
         if (!piece.empty() && piece[0] == '<' && piece.back() == '>' &&
             (piece.find('|') != std::string::npos ||
-             piece.find("｜") != std::string::npos))
+             piece.find("｜") != std::string::npos ||
+             piece.rfind("<eos:", 0) == 0))
             continue;
         out += unicode_to_bytes(piece);
     }
@@ -920,6 +934,9 @@ std::vector<int> Tokenizer::apply_chat(
             style = ChatTemplateStyle::DEEPSEEK_V4;
         } else if (added_tokens_.count("<|im_start|>") > 0) {
             style = ChatTemplateStyle::CHATML_THINKING;
+        } else if (added_tokens_.count("<｜hy_User｜>") > 0 &&
+                   added_tokens_.count("<｜hy_Assistant｜>") > 0) {
+            style = ChatTemplateStyle::HY_V3;
         } else {
             style = ChatTemplateStyle::LLAMA3_HEADERS;
         }
@@ -976,6 +993,44 @@ std::vector<int> Tokenizer::apply_chat(
         prompt += "<｜Assistant｜>assistant<｜im▁middle｜>";
         prompt += enable_thinking ? "<think>\n"
                                   : "<think>\n\n</think>\n\n";
+    } else if (style == ChatTemplateStyle::HY_V3) {
+        // Plain no-tools branch of the official HY-V3 template. Hy-MT2 uses
+        // no_think by default, including its documented translation example.
+        // Tool calls and reasoning_effort are intentionally outside the
+        // plain chat API exposed by this runtime.
+        const bool opensource =
+            added_tokens_.count("<｜hy_User:opensource｜>") > 0;
+        const std::string bos = opensource
+            ? "<｜hy_begin_of_sentence:opensource｜>"
+            : "<｜hy_begin▁of▁sentence｜>";
+        const std::string user = opensource
+            ? "<｜hy_User:opensource｜>" : "<｜hy_User｜>";
+        const std::string assistant = opensource
+            ? "<｜hy_Assistant:opensource｜>" : "<｜hy_Assistant｜>";
+        const std::string think_begin = opensource
+            ? "<think:opensource>" : "<think>";
+        const std::string think_end = opensource
+            ? "</think:opensource>" : "</think>";
+        const std::string reasoning_mode = opensource
+            ? "<｜reasoning_mode:opensource｜>" : "<｜reasoning_mode｜>";
+        const std::string eos = opensource
+            ? "<｜hy_eos:opensource｜>" : "<eos:6124c78e>";
+        prompt = bos;
+        for (const auto& msg : messages) {
+            if (msg.role == "system") prompt += msg.content;
+        }
+        prompt += reasoning_mode + "reasoning_effort:no_think";
+        for (size_t i = 0; i < messages.size(); ++i) {
+            const auto& msg = messages[i];
+            if (msg.role == "user") {
+                prompt += user + msg.content;
+            } else if (msg.role == "assistant") {
+                prompt += assistant + think_begin + think_end + msg.content;
+                if (i + 1 < messages.size()) prompt += eos;
+            }
+        }
+        if (!messages.empty() && messages.back().role != "assistant")
+            prompt += assistant + think_begin + think_end;
     } else if (style == ChatTemplateStyle::DEEPSEEK_V4) {
         prompt = "<｜begin▁of▁sentence｜>";
         for (const auto& msg : messages) {

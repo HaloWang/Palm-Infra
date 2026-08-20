@@ -53,6 +53,41 @@ def _has_router_bias(cfg: dict) -> bool:
     return bool(cfg.get("_has_router_correction_bias", False))
 
 
+def _num_shared_experts(cfg: dict) -> int:
+    if "n_shared_experts" in cfg:
+        return int(cfg["n_shared_experts"] or 0)
+    return int(cfg.get("num_shared_experts", 0) or 0)
+
+
+def _router_weight_suffix(cfg: dict) -> str:
+    return str(cfg.get("_router_weight_suffix", "gate.weight"))
+
+
+def _router_bias_suffix(cfg: dict) -> str:
+    return str(cfg.get(
+        "_router_bias_suffix", "gate.e_score_correction_bias"))
+
+
+def _shared_expert_stem(cfg: dict) -> str:
+    return str(cfg.get("_shared_expert_stem", "shared_experts"))
+
+
+def _canonical_non_expert_name(wname: str, cfg: dict) -> str:
+    """Map checkpoint-specific HY-V3 names to the graph's stable ABI."""
+    wname = wname.replace(
+        ".mlp." + _router_weight_suffix(cfg), ".mlp.gate.weight")
+    wname = wname.replace(
+        "." + _router_bias_suffix(cfg),
+        ".gate.e_score_correction_bias")
+    mtp_head_norm = str(cfg.get(
+        "_mtp_head_norm_suffix", "shared_head.norm.weight"))
+    wname = wname.replace(
+        "." + mtp_head_norm, ".shared_head.norm.weight")
+    return wname.replace(
+        ".mlp." + _shared_expert_stem(cfg) + ".",
+        ".mlp.shared_experts.")
+
+
 def _router_score_func(cfg: dict) -> int:
     scoring_func = cfg.get("scoring_func")
     if scoring_func == "sigmoid":
@@ -85,10 +120,45 @@ def _prepare_config_for_weights(model_dir: Path, cfg: dict) -> dict:
     else:
         raise KeyError("missing Q/K attention norm weights")
     first_moe_layer = int(cfg.get("first_k_dense_replace", 0))
-    cfg["_has_router_correction_bias"] = (
-        f"model.layers.{first_moe_layer}.mlp.gate.e_score_correction_bias"
-        in weight_names
-    )
+    mlp = f"model.layers.{first_moe_layer}.mlp"
+    router_candidates = ("gate.weight", "router.gate.weight")
+    cfg["_router_weight_suffix"] = next(
+        (suffix for suffix in router_candidates
+         if f"{mlp}.{suffix}" in weight_names), router_candidates[0])
+    bias_candidates = ("gate.e_score_correction_bias", "expert_bias")
+    matched_bias = next(
+        (suffix for suffix in bias_candidates
+         if f"{mlp}.{suffix}" in weight_names), None)
+    cfg["_has_router_correction_bias"] = matched_bias is not None
+    if matched_bias is not None:
+        cfg["_router_bias_suffix"] = matched_bias
+
+    shared_candidates = ("shared_experts", "shared_mlp")
+    cfg["_shared_expert_stem"] = next(
+        (stem for stem in shared_candidates
+         if f"{mlp}.{stem}.gate_proj.weight" in weight_names),
+        shared_candidates[0])
+
+    mtp_idx = int(cfg.get("num_hidden_layers", 0))
+    mtp_norm_candidates = (
+        "shared_head.norm.weight", "final_layernorm.weight")
+    cfg["_mtp_head_norm_suffix"] = next(
+        (suffix for suffix in mtp_norm_candidates
+         if f"model.layers.{mtp_idx}.{suffix}" in weight_names),
+        mtp_norm_candidates[0])
+
+    # HY-V3 uses Qwen-style full attention, but names several MoE config
+    # fields differently. Normalize only the semantic aliases consumed by the
+    # graph builder; retain model_type so package metadata remains accurate.
+    if cfg.get("model_type") == "hy_v3":
+        if not bool(cfg.get("moe_router_use_sigmoid", True)):
+            raise ValueError("HY-V3 softmax routing is not supported")
+        cfg["scoring_func"] = "sigmoid"
+        cfg["norm_topk_prob"] = bool(cfg.get("route_norm", True))
+        cfg["routed_scaling_factor"] = float(
+            cfg.get("router_scaling_factor", 1.0))
+        cfg["n_shared_experts"] = int(
+            cfg.get("num_shared_experts", 0) or 0)
     return cfg
 
 
@@ -223,14 +293,15 @@ def _non_expert_weight_names(cfg: dict, num_layers: int,
                 f"{mlp}.down_proj.weight",
             })
         else:
-            names.add(f"{mlp}.gate.weight")
+            names.add(f"{mlp}.{_router_weight_suffix(cfg)}")
             if has_router_bias:
-                names.add(f"{mlp}.gate.e_score_correction_bias")
-            if int(cfg.get("n_shared_experts", 0) or 0) > 0:
+                names.add(f"{mlp}.{_router_bias_suffix(cfg)}")
+            if _num_shared_experts(cfg) > 0:
+                shared = _shared_expert_stem(cfg)
                 names.update({
-                    f"{mlp}.shared_experts.gate_proj.weight",
-                    f"{mlp}.shared_experts.up_proj.weight",
-                    f"{mlp}.shared_experts.down_proj.weight",
+                    f"{mlp}.{shared}.gate_proj.weight",
+                    f"{mlp}.{shared}.up_proj.weight",
+                    f"{mlp}.{shared}.down_proj.weight",
                 })
     return {name for name in names if name in available}
 
@@ -258,7 +329,7 @@ def _model_name_from_config(cfg: dict, fallback: str) -> str:
 
 
 def _fallback_model_name(model_dir: Path, cfg: dict, num_layers: int) -> str:
-    if cfg.get("model_type") == "qwen3_moe" and model_dir.name:
+    if cfg.get("model_type") in ("qwen3_moe", "hy_v3") and model_dir.name:
         return model_dir.name
     return f"Qwen3-MoE-{num_layers}L"
 
@@ -275,10 +346,11 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
     moe_intermediate = int(cfg["moe_intermediate_size"])
     num_experts = _num_experts(cfg)
     dense_until = int(cfg.get("first_k_dense_replace", 0))
-    n_shared = int(cfg.get("n_shared_experts", 0) or 0)
+    n_shared = _num_shared_experts(cfg)
     weight_map = _weight_map(model_dir)
     qkv_parts: dict[int, dict[str, np.ndarray]] = {}
     dense_gate_up_parts: dict[int, dict[str, np.ndarray]] = {}
+    shared_gate_up_parts: dict[int, dict[str, np.ndarray]] = {}
     mtp_prefix = f"model.layers.{num_layers}." if mtp_layers else ""
     resolved_mtp_quant = _mtp_quantization(quant, mtp_quant)
 
@@ -307,7 +379,8 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
             f"model.layers.{mtp_idx}.eh_proj.weight",
             f"model.layers.{mtp_idx}.enorm.weight",
             f"model.layers.{mtp_idx}.hnorm.weight",
-            f"model.layers.{mtp_idx}.shared_head.norm.weight",
+            f"model.layers.{mtp_idx}."
+            f"{cfg.get('_mtp_head_norm_suffix', 'shared_head.norm.weight')}",
         })
     for wname, dtype_str, wdata in _selected_safetensors(
             model_dir, non_expert_names):
@@ -322,13 +395,18 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
             save("final_norm", _as_fp32(dtype_str, wdata))
             continue
         if "norm" in wname.lower() or "layernorm" in wname.lower():
-            save(wname.replace(".", "_"), _as_fp32(dtype_str, wdata))
+            canonical = _canonical_non_expert_name(wname, cfg)
+            save(canonical.replace(".", "_"),
+                 _as_fp32(dtype_str, wdata))
             continue
-        if wname.endswith(".gate.e_score_correction_bias"):
-            save(wname.replace(".", "_"), _as_fp32(dtype_str, wdata))
+        if wname.endswith("." + _router_bias_suffix(cfg)):
+            canonical = _canonical_non_expert_name(wname, cfg)
+            save(canonical.replace(".", "_"),
+                 _as_fp32(dtype_str, wdata))
             continue
-        if wname.endswith(".mlp.gate.weight"):
-            save(wname.replace(".", "_"), _as_fp16(dtype_str, wdata),
+        if wname.endswith(".mlp." + _router_weight_suffix(cfg)):
+            canonical = _canonical_non_expert_name(wname, cfg)
+            save(canonical.replace(".", "_"), _as_fp16(dtype_str, wdata),
                  quantizable=False, raw_name=wname)
             continue
         qkv_match = re.match(
@@ -372,8 +450,32 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
                         "mlp.gate_up_proj.weight"))
                 del dense_gate_up_parts[layer_idx]
             continue
+        shared_match = re.match(
+            r"^model\.layers\.(\d+)\.mlp\."
+            + re.escape(_shared_expert_stem(cfg))
+            + r"\.(gate_proj|up_proj)\.weight$",
+            wname)
+        if shared_match:
+            layer_idx = int(shared_match.group(1))
+            kind = shared_match.group(2)
+            parts = shared_gate_up_parts.setdefault(layer_idx, {})
+            parts[kind] = _as_fp16(dtype_str, wdata)
+            if len(parts) == 2:
+                merged = np.concatenate(
+                    [parts["gate_proj"], parts["up_proj"]], axis=0)
+                save(
+                    f"model_layers_{layer_idx}_mlp_"
+                    "shared_experts_gate_up_proj_weight",
+                    merged, quantizable=True,
+                    raw_name=(
+                        f"model.layers.{layer_idx}.mlp."
+                        "shared_experts.gate_up_proj.weight"))
+                del shared_gate_up_parts[layer_idx]
+            continue
         d = _as_fp16(dtype_str, wdata)
-        save(wname.replace(".", "_"), d, quantizable=True, raw_name=wname)
+        canonical = _canonical_non_expert_name(wname, cfg)
+        save(canonical.replace(".", "_"), d,
+             quantizable=True, raw_name=wname)
 
     if qkv_parts:
         raise KeyError(
@@ -383,6 +485,10 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
         raise KeyError(
             "incomplete dense gate/up projection sets for layers: "
             + ", ".join(str(i) for i in sorted(dense_gate_up_parts)))
+    if shared_gate_up_parts:
+        raise KeyError(
+            "incomplete shared-expert gate/up projection sets for layers: "
+            + ", ".join(str(i) for i in sorted(shared_gate_up_parts)))
 
     for layer_idx in range(dense_until, total_layers):
         print(f"  Exporting MoE experts layer {layer_idx}/{total_layers - 1}...")
@@ -415,7 +521,7 @@ def export_weights(model_dir: Path, weights_dir: str, cfg: dict,
              raw_name=f"model.layers.{layer_idx}.mlp.experts.down")
 
     if n_shared > 0:
-        print("  Shared experts are exported as regular shared_experts weights.")
+        print("  Shared expert gate/up projections were fused for the graph path.")
 
     if quant != "fp16":
         print(f"  Quantized tensors: W4={quant_counts['w4']} W8={quant_counts['w8']}")
@@ -434,7 +540,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
     num_experts = _num_experts(cfg)
     top_k = int(cfg["num_experts_per_tok"])
     dense_until = int(cfg.get("first_k_dense_replace", 0))
-    n_shared = int(cfg.get("n_shared_experts", 0) or 0)
+    n_shared = _num_shared_experts(cfg)
     shared_intermediate = n_shared * moe_intermediate
     eps = float(cfg.get("rms_norm_eps", 1e-6))
     rope_theta = float(cfg.get("rope_theta", 10000.0))
@@ -453,7 +559,7 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
         hidden_size=hidden_size,
         num_layers=num_layers,
         vocab_size=vocab_size,
-        model_type="qwen3_moe",
+        model_type=str(cfg.get("model_type", "qwen3_moe")),
     )
 
     embed_shape = (vocab_size, hidden_size)
@@ -557,7 +663,7 @@ def build_mtp_graph(weights_dir: str, cfg: dict, seq_len: int = 256,
     num_experts = _num_experts(cfg)
     top_k = int(cfg["num_experts_per_tok"])
     dense_until = int(cfg.get("first_k_dense_replace", 0))
-    n_shared = int(cfg.get("n_shared_experts", 0) or 0)
+    n_shared = _num_shared_experts(cfg)
     shared_intermediate = n_shared * moe_intermediate
     eps = float(cfg.get("rms_norm_eps", 1e-6))
     rope_theta = float(cfg.get("rope_theta", 10000.0))
@@ -673,37 +779,36 @@ def _build_layer(g: GraphBuilder, x: int, x_normed: int,
         (num_experts * hidden_size, moe_intermediate), Precision.FP16)
 
     has_shared = n_shared > 0
-    if has_shared:
-        w_shared_gate = g.weight(
-            os.path.join(weights_dir, f"{mlp_pfx}_shared_experts_gate_proj_weight.weights"),
-            (shared_intermediate, hidden_size), Precision.FP16)
-        w_shared_up = g.weight(
-            os.path.join(weights_dir, f"{mlp_pfx}_shared_experts_up_proj_weight.weights"),
-            (shared_intermediate, hidden_size), Precision.FP16)
-        w_shared_down = g.weight(
-            os.path.join(weights_dir, f"{mlp_pfx}_shared_experts_down_proj_weight.weights"),
-            (hidden_size, shared_intermediate), Precision.FP16)
-    else:
-        w_shared_gate = g.constant(np.zeros((1, hidden_size), dtype=np.float16))
-        w_shared_up = g.constant(np.zeros((1, hidden_size), dtype=np.float16))
-        w_shared_down = g.constant(np.zeros((hidden_size, 1), dtype=np.float16))
-    w_shared_expert_gate = g.constant(np.zeros((1, hidden_size), dtype=np.float16))
-
     mlp_out = g.moe(
         x_normed2, w_router, w_experts_gate_up, w_experts_down,
-        w_shared_gate, w_shared_up, w_shared_down, w_shared_expert_gate,
+        x_normed2, x_normed2, x_normed2, None,
         hidden_size=hidden_size,
         num_experts=num_experts,
         top_k=top_k,
         intermediate_size=moe_intermediate,
-        shared_intermediate_size=shared_intermediate,
+        shared_intermediate_size=0,
         router_bias=w_bias,
         router_score_func=router_score_func,
         norm_topk_prob=norm_topk_prob,
-        has_shared_expert=has_shared,
+        has_shared_expert=False,
+        shared_expert_has_gate=False,
         n_group=n_group,
         topk_group=topk_group,
         routed_scaling_factor=routed_scaling_factor)
+    if has_shared:
+        w_shared_gate_up = g.weight(
+            os.path.join(
+                weights_dir,
+                f"{mlp_pfx}_shared_experts_gate_up_proj_weight.weights"),
+            (2 * shared_intermediate, hidden_size), Precision.FP16)
+        w_shared_down = g.weight(
+            os.path.join(
+                weights_dir,
+                f"{mlp_pfx}_shared_experts_down_proj_weight.weights"),
+            (hidden_size, shared_intermediate), Precision.FP16)
+        shared_hidden = g.swiglu(g.matmul(x_normed2, w_shared_gate_up))
+        shared_out = g.matmul(shared_hidden, w_shared_down)
+        mlp_out = g.add(mlp_out, shared_out)
     next_x_normed = g.add_rms_norm(
         x, mlp_out, next_norm_weight, eps=eps)
     return x, next_x_normed
@@ -831,7 +936,8 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
             f"model.layers.{num_layers}.eh_proj.weight",
             f"model.layers.{num_layers}.enorm.weight",
             f"model.layers.{num_layers}.hnorm.weight",
-            f"model.layers.{num_layers}.shared_head.norm.weight",
+            f"model.layers.{num_layers}."
+            f"{cfg.get('_mtp_head_norm_suffix', 'shared_head.norm.weight')}",
         }
         if not required.issubset(available):
             print("MTP metadata is present but MTP tensors are incomplete; "
@@ -863,7 +969,9 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
         fallback_model_name = _fallback_model_name(model_dir, cfg, num_layers)
         metadata = {
             "model_name": _model_name_from_config(cfg, fallback_model_name),
-            "architecture": "qwen3-moe",
+            "architecture": (
+                "hy-v3" if cfg.get("model_type") == "hy_v3"
+                else "qwen3-moe"),
             "num_layers": num_layers,
             "hidden_size": cfg["hidden_size"],
             "num_heads": cfg["num_attention_heads"],
@@ -876,7 +984,7 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
             "num_experts_per_tok": cfg["num_experts_per_tok"],
             "moe_intermediate_size": cfg["moe_intermediate_size"],
             "first_k_dense_replace": cfg.get("first_k_dense_replace", 0),
-            "n_shared_experts": cfg.get("n_shared_experts", 0),
+            "n_shared_experts": _num_shared_experts(cfg),
             "moe_expert_storage": _moe_expert_storage_metadata(
                 weights_rel, cfg, num_layers + mtp_layers),
             "num_nextn_predict_layers": mtp_layers,
@@ -894,6 +1002,17 @@ def convert_qwen3_moe(model_dir: str, output_path: str,
         print(f"\nDone! Output: {output_path}")
     finally:
         shutil.rmtree(tmp_dir)
+
+
+def convert_hy_v3(model_dir: str, output_path: str,
+                  num_layers: int | None = None,
+                  prefill_seq_len: int = 256,
+                  n_ctx: int = 16384,
+                  quant: str = "fp16"):
+    """Convert an official HY-V3 checkpoint using the shared MoE backend."""
+    return convert_qwen3_moe(
+        model_dir, output_path, num_layers=num_layers,
+        prefill_seq_len=prefill_seq_len, n_ctx=n_ctx, quant=quant)
 
 
 if __name__ == "__main__":

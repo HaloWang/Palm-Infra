@@ -321,6 +321,105 @@ int main() {
         ran_any = true;
     }
 
+    // HY-V3 uses distinct Hunyuan role tokens and injects its default
+    // no-thinking mode into the system prefix.
+    {
+        const char* tokenizer_path =
+            "/tmp/mollm_hyv3_tokenizer_test.json";
+        const char* template_path =
+            "/tmp/mollm_hyv3_template_test.jinja";
+        {
+            std::ofstream f(tokenizer_path);
+            f << R"({
+                "model": {"vocab": {"a": 0, "b": 1}, "merges": []},
+                "added_tokens": [
+                    {"id": 20, "content": "<｜hy_begin▁of▁sentence｜>"},
+                    {"id": 21, "content": "<｜hy_User｜>"},
+                    {"id": 22, "content": "<｜hy_Assistant｜>"},
+                    {"id": 23, "content": "<eos:6124c78e>"},
+                    {"id": 24, "content": "<think>"},
+                    {"id": 25, "content": "</think>"},
+                    {"id": 26, "content": "<｜reasoning_mode｜>"},
+                    {"id": 27, "content": "reasoning_effort:no_think"}
+                ]
+            })";
+        }
+        {
+            std::ofstream f(template_path);
+            f << "{{ '<｜hy_begin▁of▁sentence｜><｜hy_User｜>' }}"
+                 "{{ '<｜hy_Assistant｜>' }}";
+        }
+
+        Tokenizer tok;
+        CHECK(tok.load(tokenizer_path, template_path),
+              "HY-V3 template loads");
+        CHECK(tok.bos_id() == 20, "HY-V3 BOS is detected");
+        CHECK(tok.eos_id() == 23, "HY-V3 EOS is detected");
+        CHECK(tok.decode(std::vector<int>{23}).empty(),
+              "HY-V3 EOS is hidden from decoded text");
+        check_ids(tok.apply_chat("a"),
+                  {20, 26, 27, 21, 0, 22, 24, 25},
+                  "HY-V3 single-turn no-think template");
+        check_ids(tok.apply_chat({
+                      {"system", "b"},
+                      {"user", "a"},
+                      {"assistant", "b"},
+                      {"user", "a"},
+                  }),
+                  {20, 1, 26, 27, 21, 0, 22, 24, 25, 1, 23,
+                   21, 0, 22, 24, 25},
+                  "HY-V3 multi-turn template");
+
+        std::remove(tokenizer_path);
+        std::remove(template_path);
+        ran_any = true;
+    }
+
+    // The public Hy3 checkpoint namespaces its HY-V3 control tokens with
+    // `:opensource` while keeping the same template semantics.
+    {
+        const char* tokenizer_path =
+            "/tmp/mollm_hy3_opensource_tokenizer_test.json";
+        const char* template_path =
+            "/tmp/mollm_hy3_opensource_template_test.jinja";
+        {
+            std::ofstream f(tokenizer_path);
+            f << R"({
+                "model": {"vocab": {"a": 0}, "merges": []},
+                "added_tokens": [
+                    {"id": 20, "content": "<｜hy_begin_of_sentence:opensource｜>"},
+                    {"id": 21, "content": "<｜hy_User:opensource｜>"},
+                    {"id": 22, "content": "<｜hy_Assistant:opensource｜>"},
+                    {"id": 23, "content": "<｜hy_eos:opensource｜>"},
+                    {"id": 24, "content": "<think:opensource>"},
+                    {"id": 25, "content": "</think:opensource>"},
+                    {"id": 26, "content": "<｜reasoning_mode:opensource｜>"},
+                    {"id": 27, "content": "reasoning_effort:no_think"}
+                ]
+            })";
+        }
+        {
+            std::ofstream f(template_path);
+            f << "{{ '<｜hy_User{}｜>'.format(':opensource') }}"
+                 "{{ '<｜hy_Assistant{}｜>'.format(':opensource') }}";
+        }
+
+        Tokenizer tok;
+        CHECK(tok.load(tokenizer_path, template_path),
+              "Hy3 opensource template loads");
+        CHECK(tok.bos_id() == 20, "Hy3 opensource BOS is detected");
+        CHECK(tok.eos_id() == 23, "Hy3 opensource EOS is detected");
+        CHECK(tok.decode(std::vector<int>{23}).empty(),
+              "Hy3 opensource EOS is hidden from decoded text");
+        check_ids(tok.apply_chat("a"),
+                  {20, 26, 27, 21, 0, 22, 24, 25},
+                  "Hy3 opensource no-think template");
+
+        std::remove(tokenizer_path);
+        std::remove(template_path);
+        ran_any = true;
+    }
+
     // RWKV-world vocabulary: longest byte-prefix matching over the official
     // `id python-bytes-literal byte_length` format. This is deliberately a
     // tiny fixture; the production vocabulary has the same syntax.
@@ -403,6 +502,23 @@ int main() {
             CHECK(!chat_ids.empty(), "Youtu apply_chat not empty");
             printf("  Youtu chat template -> %zu tokens\n", chat_ids.size());
             CHECK(chat_ids[0] == tok.bos_id(), "Youtu chat starts with BOS");
+        }
+    }
+
+    {
+        Tokenizer tok;
+        const char* fixture = std::getenv("MOLLM_HYV3_TOKENIZER");
+        const char* template_path = std::getenv("MOLLM_HYV3_TEMPLATE");
+        if (fixture && template_path && tok.load(fixture, template_path)) {
+            ran_any = true;
+            CHECK(tok.bos_id() == 120000, "official HY-V3 BOS");
+            CHECK(tok.eos_id() == 120025, "official HY-V3 EOS");
+            check_ids(
+                tok.apply_chat("今天天气真好。"),
+                {120000, 120044, 70830, 277, 9002, 647, 497, 25,
+                 5130, 25152, 1326, 120006, 7331, 12523, 104846, 292,
+                 120007, 120029, 120030},
+                "official HY-V3 chat matches Transformers");
         }
     }
 

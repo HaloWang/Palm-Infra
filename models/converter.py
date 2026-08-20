@@ -9,6 +9,7 @@ The converter reads <model_dir>/config.json to determine the model type:
     - model_type "qwen3_moe" → Qwen3 MoE-compatible converter (qwen3_moe.py)
     - model_type "qwen3_5"  → Qwen3.5 converter (qwen35.py)
     - model_type "qwen3_5_moe" → Qwen3.5-MoE text converter (qwen35_moe.py)
+    - model_type "hy_v3"       → HY-V3 MoE converter (qwen3_moe.py)
     - model_type "youtu"    → Youtu-LLM MLA converter (mla.py)
     Others → error with supported types list.
 """
@@ -25,6 +26,7 @@ SUPPORTED_MODELS = {
     "qwen3_moe":   ("qwen3_moe",  "convert_qwen3_moe"),
     "qwen3_5":     ("qwen35",     "convert_qwen35"),
     "qwen3_5_moe": ("qwen35_moe", "convert_qwen35_moe"),
+    "hy_v3":       ("qwen3_moe",  "convert_hy_v3"),
     "youtu":       ("mla",        "convert_mla"),
 }
 
@@ -113,7 +115,7 @@ def main():
 
     mod_name, func_name = SUPPORTED_MODELS[model_type]
 
-    print(f"Detected model_type='{model_type}' → {mod_name}.convert_{mod_name}()")
+    print(f"Detected model_type='{model_type}' → {mod_name}.{func_name}()")
     print(f"  model_dir:       {model_dir}")
     print(f"  output:          {output_path}")
     print(f"  prefill_chunk:   {prefill_seq_len} (internal)")

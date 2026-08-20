@@ -438,6 +438,10 @@ if(MOLLM_BUILD_TESTS)
             NAME test_mtp_package
             COMMAND ${Python3_EXECUTABLE}
                     ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_mtp_package.py)
+        add_test(
+            NAME test_hy_v3_adapter
+            COMMAND ${Python3_EXECUTABLE}
+                    ${CMAKE_CURRENT_SOURCE_DIR}/tests/test_hy_v3_adapter.py)
         add_executable(test_tiny_cpu_inference tests/test_tiny_cpu_inference.cpp)
         target_link_libraries(test_tiny_cpu_inference PRIVATE mollm_lib)
         add_dependencies(test_tiny_cpu_inference mollm-quantize)

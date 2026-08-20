@@ -99,6 +99,7 @@ they are not decode-only device traffic.
 | Qwen3-30B-A3B MoE | text-only W4 path |
 | Qwen3.6-35B-A3B MoE | text-only W4 path |
 | Qwen3.5-122B-A10B MoE | CPU W4 with SSD expert offload |
+| Tencent HY-V3 / Hy-MT2-30B-A3B | text-only MoE, including SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16, W8, W4, mixed W4; experimental single-image vision |
 | Youtu-LLM-2B | FP16, W8, W4, mixed W4 |
 | RWKV7 | FP16, W8, mixed W4; recurrent CPU prefill/decode |
@@ -269,6 +270,7 @@ Supported `config.json` model types:
 | `qwen3_moe` | Qwen3 MoE text models |
 | `qwen3_5` | Qwen3.5 dense text and single-image vision models |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
+| `hy_v3` | Tencent HY-V3 / Hy-MT2 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
 | RWKV7 `.pth` | Use `models/rwkv7.py` directly. |
 | `deepseek_v4` | Use the experimental `models/deepseek_v4.py` converter directly. |

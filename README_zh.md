@@ -81,6 +81,7 @@ Apple M5 Pro 上当前的纯 CPU 实验结果：
 | Qwen3-30B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.6-35B-A3B MoE | 仅文本 W4 路径 |
 | Qwen3.5-122B-A10B MoE | CPU W4，支持 SSD expert offload |
+| Tencent HY-V3 / Hy-MT2-30B-A3B | 仅文本 MoE，支持 SSD expert offload |
 | Qwen3.5-0.8B / Qwen3.5-4B | FP16、W8、W4、混合 W4；实验性单图视觉输入 |
 | Youtu-LLM-2B | FP16、W8、W4、混合 W4 |
 | RWKV7 | FP16、W8、混合 W4；循环式 CPU prefill/decode |
@@ -209,6 +210,7 @@ python3 models/deepseek_v4.py \
 | `qwen3_moe` | Qwen3 MoE text models |
 | `qwen3_5` | Qwen3.5 dense text 与单图视觉模型 |
 | `qwen3_5_moe` | Qwen3.5/3.6 MoE text models |
+| `hy_v3` | Tencent HY-V3 / Hy-MT2 MoE text models |
 | `youtu` | Youtu-LLM MLA models |
 | `deepseek_v4` | 直接使用实验性的 `models/deepseek_v4.py` converter。 |
 
