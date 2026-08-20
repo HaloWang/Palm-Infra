@@ -138,6 +138,8 @@ static bool test_case(int H, int KV, int hd, int vd, int src, int cur, int past,
     }
 
     free(kc_buf); free(vc_buf);
+    delete[] qd; delete[] kd; delete[] vdata;
+    delete[] kc; delete[] vc;
     delete[] od; delete[] ref;
     return ok;
 }

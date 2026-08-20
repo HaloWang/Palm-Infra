@@ -27,13 +27,14 @@ static bool write_test_file(const char* path, const MappedFile::Header& hdr,
     h.scales_offset = scales ? h.data_offset + data_len : 0;
     h.scales_size   = scales ? scales_len : 0;
 
-    fwrite(&h, sizeof(h), 1, f);
-    fwrite(data, 1, data_len, f);
+    bool ok = fwrite(&h, sizeof(h), 1, f) == 1;
+    if (data_len > 0)
+        ok = fwrite(data, 1, data_len, f) == data_len && ok;
     if (scales && scales_len > 0) {
-        fwrite(scales, 1, scales_len, f);
+        ok = fwrite(scales, 1, scales_len, f) == scales_len && ok;
     }
-    fclose(f);
-    return true;
+    ok = fclose(f) == 0 && ok;
+    return ok;
 }
 
 static bool write_header_only(const char* path,
