@@ -50,13 +50,16 @@ inline void load_w8_b_scales8(const float* scales, int n, int c_valid,
 }
 #endif
 
-struct alignas(16) Q4B8G128Block {
+// These blocks can point directly into a .mollm package. Package weight
+// payloads guarantee scalar alignment, but not 16-byte alignment; kernels use
+// unaligned vector loads where needed.
+struct Q4B8G128Block {
     float scales[8];
     uint8_t q[4][8][16];
 };
 static_assert(sizeof(Q4B8G128Block) == 544, "unexpected Q4B8G128Block size");
 
-struct alignas(16) Q4B8G32Block {
+struct Q4B8G32Block {
     float scales[8];
     uint8_t q[8][16];
 };

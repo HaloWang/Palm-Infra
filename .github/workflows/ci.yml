@@ -77,6 +77,31 @@ jobs:
           MOLLM_X86_ISA: scalar
         run: ctest --test-dir build --output-on-failure
 
+  x86-sanitizers:
+    name: Linux x86_64 (ASan + UBSan)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install E2E fixture dependency
+        run: python -m pip install --disable-pip-version-check numpy
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -DCMAKE_BUILD_TYPE=RelWithDebInfo
+          -DMOLLM_BUILD_TESTS=ON
+          -DMOLLM_BUILD_EXAMPLE=OFF
+          -DMOLLM_SANITIZERS=ON
+      - name: Build
+        run: cmake --build build -j 2
+      - name: Test
+        env:
+          ASAN_OPTIONS: detect_leaks=1:halt_on_error=1
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: ctest --test-dir build --output-on-failure
+
   linux-arm64-build-and-test:
     name: Linux ARM64 (${{ matrix.name }})
     strategy:

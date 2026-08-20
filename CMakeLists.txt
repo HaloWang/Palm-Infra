@@ -19,12 +19,25 @@ option(MOLLM_BUILD_TESTS "Build tests" ON)
 option(MOLLM_BUILD_EXAMPLE "Build example CLI" ON)
 option(MOLLM_ARM_NATIVE "Build ARM64 kernels with -mcpu=native for local benchmarking" OFF)
 option(MOLLM_METAL "Build the Metal GPU backend (Apple only)" OFF)
+option(MOLLM_SANITIZERS "Enable AddressSanitizer and UndefinedBehaviorSanitizer" OFF)
 set(MOLLM_ARM_I8MM "AUTO" CACHE STRING
     "ARM64 i8mm kernel target mode: AUTO, ON, or OFF")
 set_property(CACHE MOLLM_ARM_I8MM PROPERTY STRINGS AUTO ON OFF)
 string(TOUPPER "${MOLLM_ARM_I8MM}" MOLLM_ARM_I8MM_MODE)
 if(NOT MOLLM_ARM_I8MM_MODE MATCHES "^(AUTO|ON|OFF)$")
     message(FATAL_ERROR "MOLLM_ARM_I8MM must be AUTO, ON, or OFF (got '${MOLLM_ARM_I8MM}')")
+endif()
+
+if(MOLLM_SANITIZERS)
+    if(NOT CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        message(FATAL_ERROR "MOLLM_SANITIZERS requires GCC or Clang")
+    endif()
+    set(MOLLM_SANITIZER_FLAGS
+        -fsanitize=address,undefined
+        -fno-omit-frame-pointer
+        -fno-sanitize-recover=all)
+    add_compile_options(${MOLLM_SANITIZER_FLAGS})
+    add_link_options(${MOLLM_SANITIZER_FLAGS})
 endif()
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
@@ -149,6 +162,10 @@ target_include_directories(mollm_lib PUBLIC
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mollm>
 )
 target_link_libraries(mollm_lib PUBLIC Threads::Threads)
+if(MOLLM_SANITIZERS)
+    # Static-library consumers need the sanitizer runtimes at final link time.
+    target_link_options(mollm_lib INTERFACE ${MOLLM_SANITIZER_FLAGS})
+endif()
 
 # ---------------------------------------------------------------------------
 # platform detection for SIMD

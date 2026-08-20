@@ -518,6 +518,65 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     blob + weight_header.data_offset);
                 const void* scales = weight_header.scales_size
                     ? blob + weight_header.scales_offset : nullptr;
+                const Precision precision =
+                    static_cast<Precision>(weight_header.precision);
+                const bool cpu_weight =
+                    !metal_backend_ ||
+                    exec_ctx.backend != metal_backend_.get();
+                auto align_package_region =
+                    [&](const void* source, uint64_t size, size_t alignment,
+                        const char* suffix) -> void* {
+                    if (!source || alignment <= 1 ||
+                        reinterpret_cast<uintptr_t>(source) % alignment == 0) {
+                        return const_cast<void*>(source);
+                    }
+                    if (size > SIZE_MAX - (alignment - 1))
+                        return nullptr;
+                    auto& storage = packed_weights_[wref + suffix];
+                    if (storage.empty()) {
+                        storage.resize(static_cast<size_t>(size) +
+                                       alignment - 1);
+                        const uintptr_t base =
+                            reinterpret_cast<uintptr_t>(storage.data());
+                        const uintptr_t aligned =
+                            (base + alignment - 1) & ~(alignment - 1);
+                        std::memcpy(reinterpret_cast<void*>(aligned), source,
+                                    static_cast<size_t>(size));
+                    }
+                    const uintptr_t base =
+                        reinterpret_cast<uintptr_t>(storage.data());
+                    return reinterpret_cast<void*>(
+                        (base + alignment - 1) & ~(alignment - 1));
+                };
+                if (cpu_weight) {
+                    size_t data_alignment = 1;
+                    if (precision == Precision::FP32 ||
+                        precision == Precision::INT32 ||
+                        (precision == Precision::INT4 &&
+                         (weight_header.flags &
+                          (MappedFile::FLAG_INT4_BG32 |
+                           MappedFile::FLAG_INT4_BG128)))) {
+                        data_alignment = alignof(float);
+                    } else if (precision == Precision::FP16) {
+                        data_alignment = alignof(uint16_t);
+                    }
+                    data = align_package_region(
+                        data, weight_header.data_size, data_alignment,
+                        "#aligned_data");
+                    if (scales &&
+                        (precision == Precision::INT8 ||
+                         precision == Precision::INT4)) {
+                        scales = align_package_region(
+                            scales, weight_header.scales_size, alignof(float),
+                            "#aligned_scales");
+                    }
+                    if (!data || (weight_header.scales_size && !scales)) {
+                        fprintf(stderr,
+                                "Engine: failed to align package weight %s\n",
+                                wref.c_str());
+                        return false;
+                    }
+                }
                 if ((weight_header.flags &
                      MappedFile::FLAG_EXPERT_INTERLEAVED) != 0) {
                     const auto experts_it =
@@ -581,8 +640,7 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     weight_header.data_size = data_bytes;
                     weight_header.scales_size = scale_bytes;
                 }
-                setup_weight(
-                    data, static_cast<Precision>(weight_header.precision));
+                setup_weight(data, precision);
                 if (!mollm::detail::configure_weight_metadata(
                         t, weight_header, scales, wref.c_str())) {
                     return false;
