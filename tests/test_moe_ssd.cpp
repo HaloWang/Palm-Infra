@@ -2,6 +2,7 @@
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
 
+#include <chrono>
 #include <cstdio>
 #include <cmath>
 #include <cstdint>
@@ -20,6 +21,19 @@ void check(bool condition, const char* message) {
         std::fprintf(stderr, "FAIL: %s\n", message);
         ++failures;
     }
+}
+
+template <typename Predicate>
+bool wait_until(Predicate predicate,
+                std::chrono::milliseconds timeout =
+                    std::chrono::milliseconds(1000)) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    return true;
 }
 
 MoeSsdTensorSpec spec(const char* name, uint64_t offset) {
@@ -382,13 +396,11 @@ int main() {
         check(schedule_moe_hash_cross_layer_prefetch(
                   tokens, table, gate, down, 3, 2),
               "schedule exact hash route");
-        for (int spin = 0;
-             spin < 10000 &&
-             (!cache.contains(gate, down, 1) ||
-              !cache.contains(gate, down, 2));
-             ++spin) {
-            std::this_thread::yield();
-        }
+        check(wait_until([&] {
+                  return cache.contains(gate, down, 1) &&
+                      cache.contains(gate, down, 2);
+              }),
+              "wait for exact hash prefetch");
         check(cache.contains(gate, down, 1) &&
                   cache.contains(gate, down, 2) &&
                   !cache.contains(gate, down, 0),
@@ -826,8 +838,8 @@ int main() {
         const MoeSsdTensorSource* down = cache.find_source("useful_down");
         check(cache.prefetch_many(gate, down, {0}, {1.0f}),
               "queue useful speculative expert");
-        for (int spin = 0; spin < 100 && cache.stats().bytes_read < 8; ++spin)
-            std::this_thread::yield();
+        check(wait_until([&] { return cache.stats().bytes_read >= 8; }),
+              "wait for useful speculative expert");
         Tensor gu, dw;
         check(cache.acquire(gate, down, 0, gu, dw),
               "consume useful speculative expert");
@@ -852,8 +864,8 @@ int main() {
         const MoeSsdTensorSource* down = cache.find_source("stats_down");
         check(cache.prefetch_many(gate, down, {0}, {1.0f}),
               "queue unused speculative expert");
-        for (int spin = 0; spin < 100 && cache.stats().bytes_read < 8; ++spin)
-            std::this_thread::yield();
+        check(wait_until([&] { return cache.stats().bytes_read >= 8; }),
+              "wait for unused speculative expert");
 
         Tensor gu, dw;
         check(cache.acquire(gate, down, 1, gu, dw),
