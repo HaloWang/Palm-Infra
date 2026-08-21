@@ -334,6 +334,10 @@ cmake --build build_cuda -j
 ./build_cuda/mollm_chat --device cuda --package model.mollm
 ```
 
+Explicitly selecting CUDA now requires a working CUDA backend instead of
+silently falling back to CPU. Add `--require-native` to reject any operator
+that would use the CPU reference implementation.
+
 The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
 layers run through cuBLAS, and package-native W4G32/W4G128 weights are

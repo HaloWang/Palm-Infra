@@ -9,6 +9,9 @@
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
 #endif
+#ifdef MOLLM_CUDA
+#include "engine/cuda_backend.h"
+#endif
 
 #include <algorithm>
 #include <cerrno>
@@ -1075,6 +1078,22 @@ bool LLMEngine::load_impl(const EngineConfig& cfg) {
         }
 #else
         if (!fallback_to_cpu("built without MOLLM_METAL"))
+            return false;
+#endif
+    } else if (cfg_.device == Device::CUDA) {
+#ifdef MOLLM_CUDA
+        accelerator_backend_ = std::make_unique<CudaBackend>();
+        if (!accelerator_backend_->available()) {
+            if (!fallback_to_cpu("CUDA backend unavailable"))
+                return false;
+        } else {
+            exec_ctx_prefill_.backend = accelerator_backend_.get();
+            exec_ctx_decode_.backend = accelerator_backend_.get();
+            exec_ctx_mtp_.backend = accelerator_backend_.get();
+            exec_ctx_vision_.backend = accelerator_backend_.get();
+        }
+#else
+        if (!fallback_to_cpu("built without MOLLM_CUDA"))
             return false;
 #endif
     }

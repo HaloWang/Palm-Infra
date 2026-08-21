@@ -498,6 +498,33 @@ int main() {
     if (!test_layout_rope_and_sdpa(backend))
         return 1;
 
+    std::vector<int8_t> weight_int8(static_cast<size_t>(n) * k);
+    std::vector<float> weight_int8_scales(static_cast<size_t>(n));
+    std::vector<float> weight_int8_reference(static_cast<size_t>(n) * k);
+    for (int row = 0; row < n; ++row) {
+        weight_int8_scales[row] = 0.025f + row * 0.002f;
+        for (int column = 0; column < k; ++column) {
+            const int8_t value = static_cast<int8_t>(
+                (row * 7 + column) % 31 - 15);
+            weight_int8[static_cast<size_t>(row) * k + column] = value;
+            weight_int8_reference[static_cast<size_t>(row) * k + column] =
+                value * weight_int8_scales[row];
+        }
+    }
+    Tensor int8 = Tensor::create(
+        Precision::INT8, MemoryType::EXTERNAL, n, k, 1, 1,
+        weight_int8.data());
+    int8.rowmajor_data = weight_int8.data();
+    int8.scales = weight_int8_scales.data();
+    int8.group_size = k;
+    int8.groups_per_row = 1;
+    backend.wrap_weight(int8);
+    std::fill(actual.begin(), actual.end(), 0.0f);
+    reference(activation, weight_int8_reference, expected, m, n, k);
+    if (!dispatch_matmul(backend, int8, activation, actual, m, n, k) ||
+        !close_enough(actual, expected, 8e-3f))
+        return 1;
+
     Q4B8G32Block block{};
     std::vector<float> q4_weight(static_cast<size_t>(n) * k);
     for (int row = 0; row < n; ++row) {
@@ -564,7 +591,7 @@ int main() {
         !close_enough(actual, expected, 1.5e-2f))
         return 1;
 
-    std::printf("CUDA device-resident ops, fallback views, FP16, W4G32 and "
-                "W4G128 matmul tests passed\n");
+    std::printf("CUDA device-resident ops, fallback views, FP16, W8, W4G32 "
+                "and W4G128 matmul tests passed\n");
     return 0;
 }

@@ -24,6 +24,8 @@ public:
                   Tensor* output, ThreadPool* thread_pool) override;
     void clear_dispatch_error() override;
     bool dispatch_failed() const override;
+    bool set_operator_fallback_policy(
+        OperatorFallbackPolicy policy) override;
 
     void* alloc_output(Tensor& output, size_t nbytes,
                        BufferPool* pool) override;
@@ -40,7 +42,10 @@ public:
     void wrap_weight(Tensor& tensor) override;
     void wrap_weight_int4(Tensor& tensor,
                           bool keep_native_experts = false) override;
-    void alloc_persistent(Tensor& tensor, size_t nbytes) override;
+    void alloc_persistent(
+        Tensor& tensor, size_t nbytes,
+        PersistentHostAccess host_access = PersistentHostAccess::FULL,
+        size_t host_prefix_bytes = 0) override;
     void upload_input(Tensor& tensor, const std::string& key,
                       const void* host_src, size_t nbytes) override;
 

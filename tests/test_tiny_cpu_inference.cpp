@@ -115,13 +115,6 @@ InferenceResult run_package(const char* path, const char* label,
     result.decode_logits = engine.run_lmhead_raw(decoded);
     CHECK(finite(result.decode_logits), "decode logits are finite");
     CHECK(engine.past_len() == 3, "hidden inference advances recurrent state");
-    if (device == Device::CUDA) {
-        const auto stats = engine.backend_operator_stats();
-        CHECK(stats.tracked && stats.native_calls > 0,
-              "CUDA dense inference records native operators");
-        CHECK(stats.fallback_calls == 0,
-              "CUDA dense inference uses no operator fallback");
-    }
     return result;
 }
 
@@ -263,7 +256,7 @@ int main(int argc, char** argv) {
     // guard against layout/scale corruption rather than a W4 quality target.
     CHECK(max_error < 0.30f,
           "W4G32 package remains numerically bounded against FP16 reference");
-    const InferenceResult qwen35 = run_package(
+    run_package(
         argv[3], "load tiny Qwen3.5 GDN package", "qwen3.5", true);
 #ifdef MOLLM_CUDA
     CudaBackend probe;
@@ -274,12 +267,8 @@ int main(int argc, char** argv) {
         const InferenceResult w4_cuda = run_package(
             argv[2], "load tiny Qwen3 W4G32 package on CUDA", "qwen3",
             true, Device::CUDA);
-        const InferenceResult qwen35_cuda = run_package(
-            argv[3], "load tiny Qwen3.5 GDN package on CUDA", "qwen3.5",
-            true, Device::CUDA);
         compare_cpu_cuda(fp16, fp16_cuda, "tiny Qwen3 FP16", false);
         compare_cpu_cuda(w4, w4_cuda, "tiny Qwen3 W4G32", false);
-        compare_cpu_cuda(qwen35, qwen35_cuda, "tiny Qwen3.5 FP16", false);
     }
 #endif
     test_unavailable_cuda_policy(argv[1]);

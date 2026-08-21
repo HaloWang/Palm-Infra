@@ -51,31 +51,6 @@ inline void load_w8_b_scales8(const float* scales, int n, int c_valid,
 }
 #endif
 
-// These blocks can point directly into a .mollm package. Package weight
-// payloads guarantee scalar alignment, but not 16-byte alignment; kernels use
-// unaligned vector loads where needed.
-struct Q4B8G128Block {
-    float scales[8];
-    uint8_t q[4][8][16];
-};
-static_assert(sizeof(Q4B8G128Block) == 544, "unexpected Q4B8G128Block size");
-
-struct Q4B8G32Block {
-    float scales[8];
-    uint8_t q[8][16];
-};
-static_assert(sizeof(Q4B8G32Block) == 160, "unexpected Q4B8G32Block size");
-
-// x86 VNNI prefill sidecar for one 8-output x 32-K block. Each row stores
-// four consecutive K nibbles for all eight outputs. Runtime unpacking then
-// feeds one VPDPBUSD that accumulates all eight outputs without horizontal
-// sums, while keeping the sidecar at the original four-bit density.
-struct alignas(16) Q4B8G32VnniBlock {
-    uint8_t q[8][16];
-};
-static_assert(sizeof(Q4B8G32VnniBlock) == 128,
-              "unexpected Q4B8G32VnniBlock size");
-
 struct alignas(16) Q8A4Block {
     float scales[4];
     int8_t even[4][16];

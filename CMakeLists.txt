@@ -523,9 +523,14 @@ if(MOLLM_BUILD_TESTS)
                     ${CMAKE_CURRENT_SOURCE_DIR}/models/converter.py
                     $<TARGET_FILE:mollm-quantize>
                     $<TARGET_FILE:test_tiny_cpu_inference>)
+        if(MOLLM_CUDA)
+            set(TINY_DENSE_E2E_LABELS "cpu;cuda;e2e")
+        else()
+            set(TINY_DENSE_E2E_LABELS "cpu;e2e")
+        endif()
         set_tests_properties(test_tiny_qwen3_cpu_inference
                              PROPERTIES SKIP_RETURN_CODE 77
-                                        LABELS "cpu;e2e")
+                                        LABELS "${TINY_DENSE_E2E_LABELS}")
     else()
         message(STATUS "Python3 not found; tiny CPU inference E2E test disabled")
     endif()

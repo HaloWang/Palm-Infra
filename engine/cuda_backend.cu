@@ -460,6 +460,8 @@ struct CudaBackend::Impl {
     std::unordered_map<std::string, BoundaryBuffer> boundary_buffers;
     std::unordered_map<uint32_t, uint64_t> native_ops;
     std::unordered_map<uint32_t, uint64_t> fallback_ops;
+    OperatorFallbackPolicy operator_fallback =
+        OperatorFallbackPolicy::ALLOW_REFERENCE;
     void* activation = nullptr;
     size_t activation_bytes = 0;
     void* activation_fp16 = nullptr;
@@ -713,6 +715,12 @@ bool CudaBackend::dispatch_failed() const {
     return impl_->failed || impl_->cpu.dispatch_failed();
 }
 
+bool CudaBackend::set_operator_fallback_policy(
+    OperatorFallbackPolicy policy) {
+    impl_->operator_fallback = policy;
+    return true;
+}
+
 bool CudaBackend::register_weight_region(void*, size_t) { return true; }
 
 void CudaBackend::wrap_weight(Tensor& tensor) {
@@ -729,6 +737,29 @@ void CudaBackend::wrap_weight(Tensor& tensor) {
         impl_->upload_weight(tensor, tensor.data, tensor.data,
                              static_cast<size_t>(n) * k * sizeof(float),
                              CUDA_R_32F, n, k);
+    } else if (tensor.prec == Precision::INT8 && tensor.scales &&
+               tensor.group_size > 0) {
+        const auto* quantized = static_cast<const int8_t*>(
+            tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data);
+        const int groups = tensor.groups_per_row > 0
+            ? tensor.groups_per_row
+            : (k + tensor.group_size - 1) / tensor.group_size;
+        std::vector<__half> dequantized(static_cast<size_t>(n) * k);
+        for (int row = 0; row < n; ++row) {
+            for (int column = 0; column < k; ++column) {
+                const float scale = tensor.scales[
+                    static_cast<size_t>(row) * groups +
+                    column / tensor.group_size];
+                dequantized[static_cast<size_t>(row) * k + column] =
+                    __float2half(
+                        static_cast<float>(
+                            quantized[static_cast<size_t>(row) * k + column]) *
+                        scale);
+            }
+        }
+        impl_->upload_weight(
+            tensor, quantized, dequantized.data(),
+            dequantized.size() * sizeof(__half), CUDA_R_16F, n, k);
     }
 }
 
@@ -827,7 +858,11 @@ void CudaBackend::begin_graph() {}
 
 void CudaBackend::end_graph() { synchronize_for_host_read(); }
 
-void CudaBackend::alloc_persistent(Tensor& tensor, size_t nbytes) {
+void CudaBackend::alloc_persistent(
+    Tensor& tensor, size_t nbytes, PersistentHostAccess host_access,
+    size_t host_prefix_bytes) {
+    (void)host_access;
+    (void)host_prefix_bytes;
     void* storage = nullptr;
     if (!available() || nbytes == 0 ||
         !report_cuda(cudaMallocManaged(&storage, nbytes),
@@ -1422,6 +1457,16 @@ void CudaBackend::dispatch(const GraphNode& node,
             record_native();
             return;
         }
+    }
+
+    if (impl_->operator_fallback ==
+        OperatorFallbackPolicy::REQUIRE_NATIVE) {
+        std::fprintf(
+            stderr,
+            "CudaBackend: native-only mode rejected %s operator fallback\n",
+            op_type_name(node.op_type));
+        impl_->failed = true;
+        return;
     }
 
     synchronize_for_host_read();
