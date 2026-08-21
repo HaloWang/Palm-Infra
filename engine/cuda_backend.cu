@@ -52,6 +52,48 @@ __global__ void fp32_to_fp16(const float* source, __half* destination,
         destination[index] = __float2half(source[index]);
 }
 
+__global__ void dequantize_q8_dense_weight_cuda(
+    const int8_t* weight, const float* scales, int group_size,
+    int groups_per_row, __half* output, size_t count, int width) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= count)
+        return;
+    const int row = static_cast<int>(index / width);
+    const int column = static_cast<int>(index % width);
+    const int group = min(column / group_size, groups_per_row - 1);
+    output[index] = __float2half(
+        static_cast<float>(weight[index]) *
+        scales[static_cast<size_t>(row) * groups_per_row + group]);
+}
+
+__global__ void q8_dense_gemv_cuda(
+    const float* activation, const int8_t* weight, const float* scales,
+    int group_size, int groups_per_row, float* output, int columns,
+    int inner) {
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    if (column >= columns)
+        return;
+    float sum = 0.0f;
+    const int8_t* row = weight + static_cast<size_t>(column) * inner;
+    const float* row_scales =
+        scales + static_cast<size_t>(column) * groups_per_row;
+    for (int group = 0; group < groups_per_row; ++group) {
+        const int begin = group * group_size;
+        const int end = min(inner, begin + group_size);
+        const float scale = row_scales[group];
+        for (int k = begin + lane; k < end; k += warpSize)
+            sum += activation[k] * static_cast<float>(row[k]) * scale;
+    }
+    for (int offset = warpSize / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        output[column] = sum;
+}
+
 __device__ float cuda_activation(float value, int kind) {
     switch (kind) {
     case 1: return value / (1.0f + expf(-value));
@@ -435,11 +477,20 @@ int signed_nibble(uint8_t value) {
 }  // namespace
 
 struct CudaBackend::Impl {
+    enum class WeightLayout : uint8_t {
+        Dense = 0,
+        Q8RowMajor,
+    };
+
     struct DeviceWeight {
         void* data = nullptr;
+        float* scales = nullptr;
         cudaDataType type = CUDA_R_16F;
         int n = 0;
         int k = 0;
+        int group_size = 0;
+        int groups_per_row = 0;
+        WeightLayout layout = WeightLayout::Dense;
     };
 
     struct BoundaryBuffer {
@@ -466,6 +517,8 @@ struct CudaBackend::Impl {
     size_t activation_bytes = 0;
     void* activation_fp16 = nullptr;
     size_t activation_fp16_bytes = 0;
+    void* quantized_weight_scratch = nullptr;
+    size_t quantized_weight_scratch_bytes = 0;
     void* output = nullptr;
     size_t output_bytes = 0;
     void* attention_scores = nullptr;
@@ -487,6 +540,8 @@ struct CudaBackend::Impl {
             cudaFree(activation);
         if (activation_fp16)
             cudaFree(activation_fp16);
+        if (quantized_weight_scratch)
+            cudaFree(quantized_weight_scratch);
         if (output)
             cudaFree(output);
         if (attention_scores)
@@ -550,7 +605,8 @@ struct CudaBackend::Impl {
 
     bool upload_weight(Tensor& tensor, const void* cache_key,
                        const void* source, size_t bytes, cudaDataType type,
-                       int n, int k) {
+                       int n, int k,
+                       WeightLayout layout = WeightLayout::Dense) {
         if (!cache_key || !source || bytes == 0)
             return false;
         auto found = weights.find(cache_key);
@@ -567,11 +623,47 @@ struct CudaBackend::Impl {
             }
             device_allocations.push_back(device);
             found = weights.emplace(
-                cache_key, DeviceWeight{device, type, n, k}).first;
+                cache_key,
+                DeviceWeight{device, nullptr, type, n, k, 0, 0, layout})
+                        .first;
             weights_by_device.emplace(device, &found->second);
         }
         tensor.device_data = found->second.data;
         tensor.device_offset = 0;
+        return true;
+    }
+
+    bool upload_quantized_weight(
+        Tensor& tensor, const void* cache_key, const void* source,
+        size_t bytes, const float* host_scales, size_t scale_count,
+        int n, int k, int group_size, int groups_per_row) {
+        if (!host_scales || scale_count == 0 || group_size <= 0 ||
+            groups_per_row <= 0 ||
+            !upload_weight(
+                tensor, cache_key, source, bytes, CUDA_R_8I, n, k,
+                WeightLayout::Q8RowMajor))
+            return false;
+        auto found = weights.find(cache_key);
+        if (found == weights.end())
+            return false;
+        DeviceWeight& prepared = found->second;
+        if (!prepared.scales) {
+            float* device_scales = nullptr;
+            const size_t scale_bytes = scale_count * sizeof(float);
+            if (!report_cuda(cudaMalloc(&device_scales, scale_bytes),
+                             "cudaMalloc weight scales") ||
+                !report_cuda(cudaMemcpy(device_scales, host_scales,
+                                        scale_bytes, cudaMemcpyHostToDevice),
+                             "cudaMemcpy weight scales")) {
+                if (device_scales)
+                    cudaFree(device_scales);
+                return false;
+            }
+            device_allocations.push_back(device_scales);
+            prepared.scales = device_scales;
+        }
+        prepared.group_size = group_size;
+        prepared.groups_per_row = groups_per_row;
         return true;
     }
 
@@ -585,37 +677,86 @@ struct CudaBackend::Impl {
             !device_c || ldc != n)
             return false;
 
-        const size_t a_elements = static_cast<size_t>(m) * lda;
-        const void* gemm_activation = device_a;
-        cudaDataType activation_type = CUDA_R_32F;
-        if (prepared->type == CUDA_R_16F) {
-            if (!reserve(activation_fp16, activation_fp16_bytes,
-                         a_elements * sizeof(__half)))
+        const bool valid_q8 =
+            prepared->layout == WeightLayout::Q8RowMajor &&
+            prepared->scales && prepared->group_size > 0 &&
+            prepared->groups_per_row ==
+                (k + prepared->group_size - 1) / prepared->group_size;
+        if (valid_q8 && m == 1) {
+            constexpr int warps_per_block = 4;
+            constexpr int threads = warps_per_block * 32;
+            const unsigned blocks = static_cast<unsigned>(
+                (n + warps_per_block - 1) / warps_per_block);
+            q8_dense_gemv_cuda<<<blocks, threads>>>(
+                device_a, static_cast<const int8_t*>(prepared->data),
+                prepared->scales, prepared->group_size,
+                prepared->groups_per_row, device_c, n, k);
+            if (!report_cuda(cudaGetLastError(), "q8_dense_gemv_cuda"))
                 return false;
-            constexpr int threads = 256;
-            fp32_to_fp16<<<
-                static_cast<unsigned>((a_elements + threads - 1) / threads),
-                threads>>>(device_a,
-                           static_cast<__half*>(activation_fp16), a_elements);
-            if (!report_cuda(cudaGetLastError(), "fp32_to_fp16"))
+        } else {
+            const void* linear_weight = prepared->data;
+            cudaDataType linear_weight_type = prepared->type;
+            if (valid_q8) {
+                const size_t weight_elements = static_cast<size_t>(n) * k;
+                if (!reserve(
+                        quantized_weight_scratch,
+                        quantized_weight_scratch_bytes,
+                        weight_elements * sizeof(__half)))
+                    return false;
+                constexpr int threads = 256;
+                dequantize_q8_dense_weight_cuda<<<
+                    static_cast<unsigned>(
+                        (weight_elements + threads - 1) / threads),
+                    threads>>>(
+                    static_cast<const int8_t*>(prepared->data),
+                    prepared->scales, prepared->group_size,
+                    prepared->groups_per_row,
+                    static_cast<__half*>(quantized_weight_scratch),
+                    weight_elements, k);
+                if (!report_cuda(
+                        cudaGetLastError(),
+                        "dequantize_q8_dense_weight_cuda"))
+                    return false;
+                linear_weight = quantized_weight_scratch;
+                linear_weight_type = CUDA_R_16F;
+            } else if (prepared->layout != WeightLayout::Dense) {
                 return false;
-            gemm_activation = activation_fp16;
-            activation_type = CUDA_R_16F;
-        }
+            }
 
-        const float alpha = 1.0f;
-        const float beta = 0.0f;
-        // Row-major C[M,N] = A[M,K] * W[N,K]^T is the equivalent
-        // column-major operation C_col[N,M] = W_col[K,N]^T * A_col[K,M].
-        if (!report_cublas(
-                cublasGemmEx(
-                    cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
-                    prepared->data, prepared->type, k, gemm_activation,
-                    activation_type, lda, &beta, device_c, CUDA_R_32F, n,
-                    CUBLAS_COMPUTE_32F,
-                    CUBLAS_GEMM_DEFAULT_TENSOR_OP),
-                "cublasGemmEx"))
-            return false;
+            const size_t a_elements = static_cast<size_t>(m) * lda;
+            const void* gemm_activation = device_a;
+            cudaDataType activation_type = CUDA_R_32F;
+            if (linear_weight_type == CUDA_R_16F) {
+                if (!reserve(activation_fp16, activation_fp16_bytes,
+                             a_elements * sizeof(__half)))
+                    return false;
+                constexpr int threads = 256;
+                fp32_to_fp16<<<
+                    static_cast<unsigned>(
+                        (a_elements + threads - 1) / threads),
+                    threads>>>(
+                    device_a, static_cast<__half*>(activation_fp16),
+                    a_elements);
+                if (!report_cuda(cudaGetLastError(), "fp32_to_fp16"))
+                    return false;
+                gemm_activation = activation_fp16;
+                activation_type = CUDA_R_16F;
+            }
+
+            const float alpha = 1.0f;
+            const float beta = 0.0f;
+            // Row-major C[M,N] = A[M,K] * W[N,K]^T is the equivalent
+            // column-major operation C_col[N,M] = W_col[K,N]^T * A_col[K,M].
+            if (!report_cublas(
+                    cublasGemmEx(
+                        cublas, CUBLAS_OP_T, CUBLAS_OP_N, n, m, k, &alpha,
+                        linear_weight, linear_weight_type, k, gemm_activation,
+                        activation_type, lda, &beta, device_c, CUDA_R_32F, n,
+                        CUBLAS_COMPUTE_32F,
+                        CUBLAS_GEMM_DEFAULT_TENSOR_OP),
+                    "cublasGemmEx"))
+                return false;
+        }
 
         if (activation_kind != Activation::NONE && act_len != 0) {
             const int begin = std::max(0, act_begin);
@@ -739,27 +880,17 @@ void CudaBackend::wrap_weight(Tensor& tensor) {
                              CUDA_R_32F, n, k);
     } else if (tensor.prec == Precision::INT8 && tensor.scales &&
                tensor.group_size > 0) {
-        const auto* quantized = static_cast<const int8_t*>(
-            tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data);
-        const int groups = tensor.groups_per_row > 0
-            ? tensor.groups_per_row
-            : (k + tensor.group_size - 1) / tensor.group_size;
-        std::vector<__half> dequantized(static_cast<size_t>(n) * k);
-        for (int row = 0; row < n; ++row) {
-            for (int column = 0; column < k; ++column) {
-                const float scale = tensor.scales[
-                    static_cast<size_t>(row) * groups +
-                    column / tensor.group_size];
-                dequantized[static_cast<size_t>(row) * k + column] =
-                    __float2half(
-                        static_cast<float>(
-                            quantized[static_cast<size_t>(row) * k + column]) *
-                        scale);
-            }
+        const void* quantized =
+            tensor.rowmajor_data ? tensor.rowmajor_data : tensor.data;
+        const int group_size = static_cast<int>(tensor.group_size);
+        const int groups_per_row = static_cast<int>(tensor.groups_per_row);
+        if (quantized && groups_per_row ==
+                (k + group_size - 1) / group_size) {
+            impl_->upload_quantized_weight(
+                tensor, quantized, quantized, static_cast<size_t>(n) * k,
+                tensor.scales, static_cast<size_t>(n) * groups_per_row,
+                n, k, group_size, groups_per_row);
         }
-        impl_->upload_weight(
-            tensor, quantized, dequantized.data(),
-            dequantized.size() * sizeof(__half), CUDA_R_16F, n, k);
     }
 }
 

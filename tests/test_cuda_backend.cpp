@@ -498,17 +498,26 @@ int main() {
     if (!test_layout_rope_and_sdpa(backend))
         return 1;
 
+    constexpr int int8_group_size = 16;
+    constexpr int int8_groups_per_row = k / int8_group_size;
     std::vector<int8_t> weight_int8(static_cast<size_t>(n) * k);
-    std::vector<float> weight_int8_scales(static_cast<size_t>(n));
+    std::vector<float> weight_int8_scales(
+        static_cast<size_t>(n) * int8_groups_per_row);
     std::vector<float> weight_int8_reference(static_cast<size_t>(n) * k);
     for (int row = 0; row < n; ++row) {
-        weight_int8_scales[row] = 0.025f + row * 0.002f;
-        for (int column = 0; column < k; ++column) {
-            const int8_t value = static_cast<int8_t>(
-                (row * 7 + column) % 31 - 15);
-            weight_int8[static_cast<size_t>(row) * k + column] = value;
-            weight_int8_reference[static_cast<size_t>(row) * k + column] =
-                value * weight_int8_scales[row];
+        for (int group = 0; group < int8_groups_per_row; ++group) {
+            const float scale = 0.01f * (1 + (row + group) % 5);
+            weight_int8_scales[
+                static_cast<size_t>(row) * int8_groups_per_row + group] =
+                    scale;
+            for (int inner = 0; inner < int8_group_size; ++inner) {
+                const int column = group * int8_group_size + inner;
+                const int8_t value = static_cast<int8_t>(
+                    (row * 7 + column * 3) % 31 - 15);
+                weight_int8[static_cast<size_t>(row) * k + column] = value;
+                weight_int8_reference[
+                    static_cast<size_t>(row) * k + column] = value * scale;
+            }
         }
     }
     Tensor int8 = Tensor::create(
@@ -516,13 +525,20 @@ int main() {
         weight_int8.data());
     int8.rowmajor_data = weight_int8.data();
     int8.scales = weight_int8_scales.data();
-    int8.group_size = k;
-    int8.groups_per_row = 1;
+    int8.group_size = int8_group_size;
+    int8.groups_per_row = int8_groups_per_row;
     backend.wrap_weight(int8);
     std::fill(actual.begin(), actual.end(), 0.0f);
     reference(activation, weight_int8_reference, expected, m, n, k);
     if (!dispatch_matmul(backend, int8, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 8e-3f))
+        return 1;
+    std::vector<float> decode_actual(n);
+    std::vector<float> decode_expected(n);
+    reference(activation, weight_int8_reference, decode_expected, 1, n, k);
+    if (!dispatch_matmul(
+            backend, int8, activation, decode_actual, 1, n, k) ||
+        !close_enough(decode_actual, decode_expected, 3e-3f))
         return 1;
 
     Q4B8G32Block block{};
