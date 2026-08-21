@@ -3,6 +3,7 @@
 #include "graph/graph.h"
 #include "graph/execute.h"
 #include "engine/backend.h"
+#include "engine/accelerator_backend.h"
 #include "engine/sampler.h"
 #include "kernels/tensor.h"
 #include "kernels/threading.h"
@@ -75,6 +76,15 @@ enum class Device {
     METAL,
 };
 
+// Controls what happens when the requested accelerator was not compiled in,
+// cannot be initialized, or does not support the loaded model. Library users
+// retain the historical CPU fallback by default; command-line tools require an
+// explicitly selected accelerator so benchmarks cannot silently measure CPU.
+enum class DeviceFallbackPolicy {
+    ALLOW_CPU,
+    REQUIRE_REQUESTED,
+};
+
 #if defined(__APPLE__)
 inline constexpr bool kDefaultLockMoeSsdCache = true;
 #else
@@ -87,13 +97,17 @@ struct EngineConfig {
     static constexpr int kAbsoluteImageMaxPixels = 1024 * 1024;
 
     std::string package_path;         // .mollm single-file package (required)
-    Device device = Device::CPU;      // compute backend (METAL requires MOLLM_METAL)
+    Device device = Device::CPU;      // METAL requires the MOLLM_METAL option
+    DeviceFallbackPolicy device_fallback =
+        DeviceFallbackPolicy::ALLOW_CPU;
+    OperatorFallbackPolicy operator_fallback =
+        OperatorFallbackPolicy::ALLOW_REFERENCE;
     int n_ctx = 4096;                 // max sequence length
     int rope_dim = 64;
     float rope_theta = 500000.f;
     int num_threads = default_worker_threads();
     WeightLoadingMode weight_loading = WeightLoadingMode::RESIDENT;
-    // CPU-only MoE expert cache. A non-zero value enables SSD offload for
+    // Host-side MoE expert cache. A non-zero value enables SSD offload for
     // packages carrying `moe_expert_storage` metadata.
     size_t moe_ssd_cache_bytes = 0;
     int moe_ssd_io_workers = 8;
@@ -290,15 +304,15 @@ public:
     void reset_moe_ssd_stats() {
         if (moe_ssd_cache_) moe_ssd_cache_->reset_stats();
     }
-
     /// Return raw logits. If all_positions=true, returns vocab_size*seq_len
     /// floats (seq_len blocks of vocab_size). Otherwise just the last position.
     std::vector<float> run_lmhead_raw(const Tensor& hidden, int n_tokens = 1,
                                        bool all_positions = false);
 
 private:
-    void prepare_metal_prefill_weights();
+    void prepare_accelerator_prefill_weights();
     bool decode_uses_metal_expert_cache() const;
+    void release_vision_buffers();
 
     EngineConfig cfg_;
     Sampler sampler_;
@@ -312,9 +326,9 @@ private:
     ExecContext exec_ctx_mtp_;
     ThreadPool thread_pool_;
     CPUBackend cpu_backend_;     // owned by engine; assigned to ExecContexts
-    // Owned Metal backend (as base Backend* so the header needs no ObjC/Metal
-    // include). Non-null iff Metal is active; Backend has a virtual destructor.
-    std::unique_ptr<Backend> metal_backend_;
+    // Active graph-resident accelerator. The engine is deliberately unaware
+    // of backend-specific resource types.
+    std::unique_ptr<AcceleratorBackend> accelerator_backend_;
     int past_len_ = 0;
     int mtp_past_len_ = 0;
     MtpStats mtp_stats_;
@@ -416,14 +430,14 @@ private:
 
     /// Run lm_head on the last hidden state.
     int run_lmhead(const Tensor& hidden, int n_tokens = 1,
-                   bool finish_metal_graph = false);
+                   bool finish_accelerator_graph = false);
 
     /// Feed inputs, run graph, extract output.
     Tensor run_graph(Graph& graph, ExecContext& exec_ctx,
                      const Tensor& hidden, const Tensor& mask,
                      const Tensor& cos, const Tensor& sin,
                      const Tensor* token_ids = nullptr,
-                     bool defer_metal_end = false,
+                     bool defer_accelerator_end = false,
                      const Tensor* target_hidden = nullptr,
                      int graph_position = -1,
                      int stop_after_node_index = -1);
@@ -455,8 +469,10 @@ private:
     size_t lock_dense_package_weights();
 
     /// Allocate KV cache buffers with metadata header.
-    void allocate_caches(Graph& g, ExecContext& exec_ctx,
+    bool allocate_caches(Graph& g, ExecContext& exec_ctx,
                          std::vector<CachePair>& caches, int n_ctx);
+    Backend* persistent_backend() const;
+    bool set_cache_lengths(std::vector<CachePair>& caches, uint64_t length);
 
     /// Process a single chunk of tokens (≤ graph_seq_len).
     /// Called by prefill() in a loop for chunked prefill.

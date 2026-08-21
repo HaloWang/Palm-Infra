@@ -109,6 +109,7 @@ set(SOURCES
 )
 
 set(PUBLIC_ENGINE_HEADERS
+    engine/accelerator_backend.h
     engine/backend.h
     engine/engine.h
     engine/sampler.h

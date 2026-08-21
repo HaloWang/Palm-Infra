@@ -613,8 +613,25 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                         graph_params::get_i32(next_it->params, 8, 1);
                     config.topk_group =
                         graph_params::get_i32(next_it->params, 9, 1);
+                    Tensor prediction_input = *inputs[0];
+                    std::vector<uint32_t> prediction_storage;
+                    if (device_resident) {
+                        const size_t bytes = inputs[0]->nbytes();
+                        prediction_storage.resize(
+                            (bytes + sizeof(uint32_t) - 1) /
+                            sizeof(uint32_t));
+                        if (!ctx.backend->copy_to_host(
+                                *inputs[0], prediction_storage.data(),
+                                bytes)) {
+                            ctx.execution_failed = true;
+                            return;
+                        }
+                        prediction_input.data = prediction_storage.data();
+                        prediction_input.device_data = nullptr;
+                        prediction_input.device_offset = 0;
+                    }
                     schedule_moe_cross_layer_prefetch(
-                        *inputs[0], next_router, next_bias,
+                        prediction_input, next_router, next_bias,
                         static_cast<const MoeSsdTensorSource*>(
                             next_gate.moe_ssd_source),
                         static_cast<const MoeSsdTensorSource*>(
@@ -668,10 +685,14 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                     inputs[1]->prec == Precision::FP8_E4M3 ||
                     inputs[1]->prec == Precision::MXFP4;
             }
-            if (round_output)
-                mollm_round_to_bf16(
-                    out.ptr<float>(),
-                    static_cast<size_t>(out.nelements()));
+            if (round_output && !ctx.backend->round_to_bf16(out)) {
+                std::fprintf(
+                    stderr, "execute: backend failed BF16 boundary for "
+                    "node %u (%s)\n",
+                    node.id, op_type_name(node.op_type));
+                ctx.execution_failed = true;
+                return;
+            }
         }
         if (trace_start != 0) {
             const std::string args =
@@ -688,38 +709,43 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
         // environment for every graph node in normal inference.
         static const bool dump_nodes_enabled = getenv("MOLLM_DUMP_NODES") != nullptr;
         if (dump_nodes_enabled && out.data && out.prec == Precision::FP32) {
-            // Metal dispatch is asynchronous. A diagnostic that reads the
-            // zero-copy backing storage must first complete the command stream;
-            // otherwise it reports stale data from an earlier node/run.
+            std::vector<float> host_dump;
+            const float* d = out.ptr<float>();
             if (device_resident) {
-                ctx.backend->synchronize_for_host_read();
-                if (ctx.backend->dispatch_failed()) {
-                    ctx.execution_failed = true;
-                    return;
+                if (!out.is_contiguous()) {
+                    std::fprintf(
+                        stderr, "NODE %u op=%d non-contiguous device "
+                        "output omitted\n",
+                        node.id, static_cast<int>(node.op_type));
+                    d = nullptr;
+                } else {
+                    host_dump.resize(
+                        static_cast<size_t>(out.nelements()));
+                    if (!ctx.backend->copy_to_host(
+                            out, host_dump.data(),
+                            host_dump.size() * sizeof(float))) {
+                        ctx.execution_failed = true;
+                        return;
+                    }
+                    d = host_dump.data();
                 }
             }
-            // Device views keep the allocation base in `data` and carry their
-            // byte displacement separately in `device_offset`. Account for
-            // that here so SLICE/PERMUTE diagnostics inspect the view rather
-            // than repeatedly printing the start of the parent buffer.
-            const auto* bytes = static_cast<const uint8_t*>(out.data);
-            if (device_resident && out.device_data)
-                bytes += out.device_offset;
-            const float* d = reinterpret_cast<const float*>(bytes);
-            double sum = 0.0, sum_sq = 0.0;
-            float max_abs = 0.0f;
-            for (int64_t j = 0; j < out.nelements(); ++j) {
-                sum += d[j];
-                sum_sq += (double)d[j] * d[j];
-                max_abs = std::max(max_abs, std::fabs(d[j]));
+            if (d) {
+                double sum = 0.0, sum_sq = 0.0;
+                float max_abs = 0.0f;
+                for (int64_t j = 0; j < out.nelements(); ++j) {
+                    sum += d[j];
+                    sum_sq += (double)d[j] * d[j];
+                    max_abs = std::max(max_abs, std::fabs(d[j]));
+                }
+                fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  "
+                        "%.5f %.5f %.5f sum=%.9g sq=%.9g max=%.9g\n",
+                        node.id, (int)node.op_type,
+                        (long long)out.shape[0], (long long)out.shape[1],
+                        (long long)out.shape[2], (long long)out.shape[3],
+                         d[0], out.nelements()>1?d[1]:0,
+                         out.nelements()>2?d[2]:0, sum, sum_sq, max_abs);
             }
-            fprintf(stderr, "NODE %u op=%d shape=%lld,%lld,%lld,%lld  "
-                    "%.5f %.5f %.5f sum=%.9g sq=%.9g max=%.9g\n",
-                    node.id, (int)node.op_type,
-                    (long long)out.shape[0], (long long)out.shape[1],
-                    (long long)out.shape[2], (long long)out.shape[3],
-                    d[0], out.nelements()>1?d[1]:0, out.nelements()>2?d[2]:0,
-                    sum, sum_sq, max_abs);
         }
         // Release completed tensors. Classify borrowed views before mutating
         // any producer in this release batch; a producer and its view can have

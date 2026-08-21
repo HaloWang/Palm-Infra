@@ -5,21 +5,24 @@
 #include "kernels/trace.h"
 #ifdef MOLLM_METAL
 #include "engine/metal_backend.h"
-// Downcast the owned Backend* to MetalBackend* (non-null iff Metal active).
-static inline MetalBackend* as_metal(const std::unique_ptr<Backend>& b) {
-    return static_cast<MetalBackend*>(b.get());
-}
 #endif
-
 #include <algorithm>
 #include <cassert>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <vector>
 
 namespace {
+
+#ifdef MOLLM_METAL
+MetalBackend* as_metal(
+    const std::unique_ptr<AcceleratorBackend>& backend) {
+    return static_cast<MetalBackend*>(backend.get());
+}
+#endif
 
 int metal_ssd_prefill_min_tokens() {
     static int threshold = [] {
@@ -160,7 +163,8 @@ void finish_graph_temporaries(Graph& graph, ExecContext& ctx) {
 }
 
 Tensor copy_tensor_contiguous(const Tensor& src,
-                              std::vector<uint8_t>& storage) {
+                              std::vector<uint8_t>& storage,
+                              Backend* backend) {
     size_t es = src.element_size();
     size_t bytes = (size_t)src.nelements() * es;
     storage.resize(bytes);
@@ -169,16 +173,30 @@ Tensor copy_tensor_contiguous(const Tensor& src,
                                 src.shape[1], src.shape[2], src.shape[3],
                                 storage.data());
 
-    if (!src.data || bytes == 0)
+    if ((!src.data && !src.device_data) || bytes == 0)
         return dst;
 
     if (src.is_contiguous()) {
-        std::memcpy(dst.data, src.data, bytes);
+        if (backend) {
+            if (!backend->copy_to_host(src, dst.data, bytes))
+                return Tensor();
+        } else {
+            std::memcpy(dst.data, src.data, bytes);
+        }
         return dst;
     }
 
+    std::vector<uint8_t> source_storage(src.view_span_bytes());
+    if (backend) {
+        if (!backend->copy_to_host(
+                src, source_storage.data(), source_storage.size()))
+            return Tensor();
+    } else {
+        std::memcpy(source_storage.data(), src.data, source_storage.size());
+    }
     char* dp = static_cast<char*>(dst.data);
-    const char* sp_base = static_cast<const char*>(src.data);
+    const char* sp_base =
+        reinterpret_cast<const char*>(source_storage.data());
     size_t flat = 0;
     for (int64_t i3 = 0; i3 < src.shape[3]; i3++) {
         for (int64_t i2 = 0; i2 < src.shape[2]; i2++) {
@@ -207,6 +225,28 @@ void LLMEngine::reset_profiles() {
     reset_profile_stats(exec_ctx_mtp_);
 }
 
+Backend* LLMEngine::persistent_backend() const {
+    return accelerator_backend_
+        ? static_cast<Backend*>(accelerator_backend_.get())
+        : exec_ctx_prefill_.backend;
+}
+
+bool LLMEngine::set_cache_lengths(
+    std::vector<CachePair>& caches, uint64_t length) {
+    Backend* backend = persistent_backend();
+    if (!backend)
+        return false;
+    for (auto& cache : caches) {
+        for (Tensor* tensor : {cache.k, cache.v}) {
+            if (tensor && !backend->copy_from_host(
+                    &length, *tensor, sizeof(length),
+                    offsetof(CacheMetadata, current_seq_len)))
+                return false;
+        }
+    }
+    return true;
+}
+
 // ---------------------------------------------------------------------------
 // reset
 // ---------------------------------------------------------------------------
@@ -231,36 +271,38 @@ void LLMEngine::reset() {
     // GDN state: zero the entire recurrent state buffer (it's small, ~256KB
     // per layer, and GDN reads stale state without causal mask protection).
     // GDN conv state: also zero (short conv uses conv_state for continuity).
+    Backend* backend = persistent_backend();
+    bool storage_reset = backend
+        ? set_cache_lengths(caches_, 0) && set_cache_lengths(mtp_caches_, 0)
+        : caches_.empty() && mtp_caches_.empty() && auxiliary_states_.empty();
     for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = 0;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = 0;
         if (cp.gdn_state) {
             size_t sz = (size_t)cp.gdn_v_dim * cp.gdn_k_dim * cp.gdn_num_heads *
                         sizeof(float);
-            std::memset(cp.gdn_state->data, 0, sz);
+            if (!backend || !backend->zero_tensor(*cp.gdn_state, sz))
+                storage_reset = false;
         }
         if (cp.gdn_conv) {
             size_t sz = (size_t)cp.gdn_conv_groups * (cp.gdn_conv_kernel - 1) *
                         sizeof(float);
-            std::memset(cp.gdn_conv->data, 0, sz);
+            if (!backend || !backend->zero_tensor(*cp.gdn_conv, sz))
+                storage_reset = false;
         }
-        if (cp.rwkv_state)
-            std::memset(cp.rwkv_state->data, 0, cp.rwkv_state->nbytes());
-        if (cp.rwkv_att_shift)
-            std::memset(cp.rwkv_att_shift->data, 0,
-                        cp.rwkv_att_shift->nbytes());
-        if (cp.rwkv_ffn_shift)
-            std::memset(cp.rwkv_ffn_shift->data, 0,
-                        cp.rwkv_ffn_shift->nbytes());
+        for (Tensor* state : {
+                 cp.rwkv_state, cp.rwkv_att_shift, cp.rwkv_ffn_shift}) {
+            if (state &&
+                (!backend || !backend->zero_tensor(*state, state->nbytes())))
+                storage_reset = false;
+        }
     }
-    set_cache_length(mtp_caches_, 0);
     for (const auto& entry : auxiliary_states_) {
         Tensor* state = entry.second;
-        if (state && state->data)
-            std::memset(state->data, 0, state->nbytes());
+        if (state && state->data &&
+            (!backend || !backend->zero_tensor(*state, state->nbytes())))
+            storage_reset = false;
     }
+    if (!storage_reset)
+        std::fprintf(stderr, "Engine: failed to reset persistent state\n");
 }
 
 // ---------------------------------------------------------------------------
@@ -359,7 +401,7 @@ Tensor LLMEngine::embed(const std::vector<int>& token_ids, int pad_to) {
 // ---------------------------------------------------------------------------
 
 int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
-                          bool finish_metal_graph) {
+                          bool finish_accelerator_graph) {
     if (!lm_head_weight_ || !lm_head_weight_->data)
         return 0;
 
@@ -391,39 +433,40 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
     C.owner_id = graph_prefill_.runtime.pool.id();
     C.storage_id = graph_prefill_.runtime.pool.storage_id(c_buf);
 
-    bool lm_head_on_metal = false;
-#ifdef MOLLM_METAL
-    if (finish_metal_graph) {
-        assert(metal_backend_ && hidden.device_data &&
+    if (finish_accelerator_graph) {
+        assert(accelerator_backend_ && hidden.device_data &&
                lm_head_weight_->device_data);
-        lm_head_on_metal = true;
-        as_metal(metal_backend_)
-            ->lm_head_gemv_device_and_end_graph(
+        accelerator_backend_->lm_head_gemv_device_and_end_graph(
                 hidden, (size_t)last_pos*(size_t)hidden_dim,
                 *lm_head_weight_, C.ptr<float>(), vocab_size, hidden_dim);
-    } else if (metal_backend_ && lm_head_weight_->device_data &&
-        (lm_head_weight_->prec == Precision::FP16 ||
-         lm_head_weight_->prec == Precision::INT8 ||
-         lm_head_weight_->prec == Precision::INT4)) {
-        lm_head_on_metal = true;
-        as_metal(metal_backend_)
-            ->lm_head_gemv(A.ptr<float>(), *lm_head_weight_, C.ptr<float>(),
-                           vocab_size, hidden_dim);
-    } else
-#endif
-    {
+    } else if (accelerator_backend_ &&
+               accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
+        std::vector<float> host_activation;
+        const float* activation = A.ptr<float>();
+        if (hidden.device_data) {
+            host_activation.resize(static_cast<size_t>(hidden_dim));
+            if (!accelerator_backend_->copy_to_host(
+                    hidden, host_activation.data(),
+                    host_activation.size() * sizeof(float),
+                    static_cast<size_t>(last_pos) * hidden_dim *
+                        sizeof(float))) {
+                release_pool_tensor(graph_prefill_.runtime.pool, C);
+                return -1;
+            }
+            activation = host_activation.data();
+        }
+        accelerator_backend_->lm_head_gemv(
+            activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
+            hidden_dim);
+    } else {
         kernel_matmul_fp32(A, *lm_head_weight_, C,
                            exec_ctx_decode_.thread_pool);
     }
 
-#ifdef MOLLM_METAL
-    if (lm_head_on_metal && metal_backend_->dispatch_failed()) {
+    if (accelerator_backend_ && accelerator_backend_->dispatch_failed()) {
         release_pool_tensor(graph_prefill_.runtime.pool, C);
         return -1;
     }
-#else
-    (void)lm_head_on_metal;
-#endif
 
     float* scores = C.ptr<float>();
     int token = 0;
@@ -458,10 +501,11 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
     // incremental-prefill batch.  Submit one shared-weight small-M W4
     // projection instead of M standalone GEMVs (and M command-buffer waits).
     if (all_positions && n_pos >= 2 && n_pos <= 4 && hidden.is_contiguous() &&
-        metal_backend_ && lm_head_weight_->device_data &&
+        cfg_.device == Device::METAL && accelerator_backend_ &&
+        lm_head_weight_->device_data &&
         (lm_head_weight_->prec == Precision::INT4 ||
          lm_head_weight_->prec == Precision::INT8)) {
-        if (as_metal(metal_backend_)->lm_head_small_batch(
+        if (as_metal(accelerator_backend_)->lm_head_small_batch(
                 static_cast<const float*>(hidden.data), *lm_head_weight_,
                 logits.data(), n_pos, vocab_size, hidden_dim))
             return logits;
@@ -484,17 +528,24 @@ std::vector<float> LLMEngine::run_lmhead_raw(const Tensor& hidden, int n_tokens,
             Tensor::create(Precision::FP32, MemoryType::EXTERNAL, vocab_size, 1,
                            1, 1, logits.data() + p * vocab_size);
 
-#ifdef MOLLM_METAL
-        if (metal_backend_ && lm_head_weight_->device_data &&
-            (lm_head_weight_->prec == Precision::FP16 ||
-             lm_head_weight_->prec == Precision::INT8 ||
-             lm_head_weight_->prec == Precision::INT4)) {
-            as_metal(metal_backend_)
-                ->lm_head_gemv(A.ptr<float>(), *lm_head_weight_, C.ptr<float>(),
-                               vocab_size, hidden_dim);
-        } else
-#endif
-        {
+        if (accelerator_backend_ &&
+            accelerator_backend_->supports_lm_head(*lm_head_weight_)) {
+            std::vector<float> host_activation;
+            const float* activation = A.ptr<float>();
+            if (hidden.device_data) {
+                host_activation.resize(static_cast<size_t>(hidden_dim));
+                if (!accelerator_backend_->copy_to_host(
+                        hidden, host_activation.data(),
+                        host_activation.size() * sizeof(float),
+                        static_cast<size_t>(pos) * hidden_dim *
+                            sizeof(float)))
+                    return {};
+                activation = host_activation.data();
+            }
+            accelerator_backend_->lm_head_gemv(
+                activation, *lm_head_weight_, C.ptr<float>(), vocab_size,
+                hidden_dim);
+        } else {
             kernel_matmul_fp32(A, *lm_head_weight_, C,
                                exec_ctx_decode_.thread_pool);
         }
@@ -551,7 +602,7 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
                             const Tensor& hidden, const Tensor& mask,
                             const Tensor& cos, const Tensor& sin,
                             const Tensor* token_ids,
-                            bool defer_metal_end,
+                            bool defer_accelerator_end,
                             const Tensor* target_hidden,
                             int position,
                             int stop_after_node_index) {
@@ -610,37 +661,25 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
         }
         // cache_k/cache_v/gdn state are persistent INPUT tensors.
 
-#ifdef MOLLM_METAL
         // Boundary inputs are produced on the host (embed/rope/mask); upload
         // their bytes into a device buffer so GPU kernels can read them.
         // Cache/state INPUTs are already device-resident (allocate_caches).
-        if (metal_backend_ && exec_ctx.backend == metal_backend_.get() &&
-            is_boundary && t->data && !t->device_data) {
-            if (name == "mask" && t->shape[1] == 1) {
-                // A single query at the end of the prefix may attend every
-                // key, hence its complete causal mask is zero.
-                as_metal(metal_backend_)
-                    ->upload_zero_input(*t, name, t->nbytes());
-            } else {
-                as_metal(metal_backend_)
-                    ->upload_input(*t, name, t->data, t->nbytes());
-            }
+        if (accelerator_backend_ &&
+            exec_ctx.backend == accelerator_backend_.get() &&
+            is_boundary && t->data) {
+            accelerator_backend_->upload_input(
+                *t, name, t->data, t->nbytes());
         }
-#else
-        (void)is_boundary;
-#endif
     }
 
-#ifdef MOLLM_METAL
-    if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
-        metal_backend_->begin_graph();
-#endif
+    if (accelerator_backend_ &&
+        exec_ctx.backend == accelerator_backend_.get())
+        accelerator_backend_->begin_graph();
     execute_graph(exec_ctx, stop_after_node_index);
-#ifdef MOLLM_METAL
-    if (metal_backend_ && exec_ctx.backend == metal_backend_.get())
-        if (!defer_metal_end)
-            metal_backend_->end_graph();
-#endif
+    if (accelerator_backend_ &&
+        exec_ctx.backend == accelerator_backend_.get() &&
+        !defer_accelerator_end)
+        accelerator_backend_->end_graph();
 
     if (exec_ctx.backend->dispatch_failed())
         exec_ctx.execution_failed = true;
@@ -662,14 +701,8 @@ Tensor LLMEngine::run_graph(Graph& graph, ExecContext& exec_ctx,
 }
 
 void LLMEngine::set_cache_length(std::vector<CachePair>& caches, int length) {
-    for (auto& cp : caches) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len =
-                static_cast<uint64_t>(length);
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len =
-                static_cast<uint64_t>(length);
-    }
+    if (!set_cache_lengths(caches, static_cast<uint64_t>(length)))
+        std::fprintf(stderr, "Engine: failed to update cache length\n");
 }
 
 Tensor LLMEngine::run_mtp_tokens(const std::vector<int>& token_ids,
@@ -724,19 +757,15 @@ bool LLMEngine::execute_mtp_tokens(
     token_hidden.compute_strides();
     Tensor cos, sin;
     generate_rope_cache(n, position, cos, sin);
-    bool initialize_mask = true;
-#ifdef MOLLM_METAL
-    initialize_mask = !(n == 1 && metal_backend_ &&
-        exec_ctx_mtp_.backend == metal_backend_.get());
-#endif
-    Tensor mask = build_causal_mask(n, position, initialize_mask);
+    Tensor mask = build_causal_mask(n, position);
     set_cache_length(mtp_caches_, position);
 
     bool fuse_metal_lm_head = false;
     Tensor* device_hidden_copy = nullptr;
 #ifdef MOLLM_METAL
-    fuse_metal_lm_head = !cache_only && draft_token && metal_backend_ &&
-        exec_ctx_mtp_.backend == metal_backend_.get() &&
+    fuse_metal_lm_head = !cache_only && draft_token &&
+        cfg_.device == Device::METAL && accelerator_backend_ &&
+        exec_ctx_mtp_.backend == accelerator_backend_.get() &&
         lm_head_weight_ && lm_head_weight_->device_data &&
         (lm_head_weight_->prec == Precision::FP16 ||
          lm_head_weight_->prec == Precision::INT8 ||
@@ -747,7 +776,7 @@ bool LLMEngine::execute_mtp_tokens(
             mtp_draft_hidden_device_ = Tensor::create(
                 Precision::FP32, MemoryType::EXTERNAL,
                 hidden, 1, 1, 1, nullptr);
-            as_metal(metal_backend_)->alloc_persistent(
+            as_metal(accelerator_backend_)->alloc_persistent(
                 mtp_draft_hidden_device_,
                 static_cast<size_t>(hidden) * sizeof(float));
         }
@@ -768,13 +797,14 @@ bool LLMEngine::execute_mtp_tokens(
             // greedy top-k=1 drafts, so copying the full vocabulary to CPU
             // would add a host transfer, allocation, and scan every depth.
             *draft_token =
-                as_metal(metal_backend_)->lm_head_argmax_device_and_end_graph(
+                as_metal(accelerator_backend_)
+                    ->lm_head_argmax_device_and_end_graph(
                 out, static_cast<size_t>(n - 1) * hidden,
                 *lm_head_weight_, vocab, hidden, 0, device_hidden_copy);
         } else {
             // run_graph() deliberately left the Metal graph open for the
             // fused tail; close it even on a malformed/failed graph output.
-            metal_backend_->end_graph();
+            accelerator_backend_->end_graph();
         }
     }
 #endif
@@ -785,7 +815,8 @@ bool LLMEngine::execute_mtp_tokens(
             device_hidden_copy->device_data)
             copied = *device_hidden_copy;
         else
-            copied = copy_tensor_contiguous(out, mtp_hidden_output_copy_);
+            copied = copy_tensor_contiguous(
+                out, mtp_hidden_output_copy_, exec_ctx_mtp_.backend);
     }
     const bool succeeded = out.data &&
         !exec_ctx_mtp_.backend->dispatch_failed() &&
@@ -884,13 +915,12 @@ bool LLMEngine::sync_mtp(const std::vector<int>& token_ids,
 // prefill / decode
 // ---------------------------------------------------------------------------
 
-void LLMEngine::prepare_metal_prefill_weights() {
+void LLMEngine::prepare_accelerator_prefill_weights() {
 #ifdef MOLLM_METAL
-    if (!moe_ssd_cache_ || !metal_backend_ ||
-        exec_ctx_prefill_.backend != metal_backend_.get())
+    if (!moe_ssd_cache_ || !accelerator_backend_ ||
+        exec_ctx_prefill_.backend != accelerator_backend_.get())
         return;
-    auto* metal = as_metal(metal_backend_);
-    if (metal->has_weight_copies()) return;
+    if (accelerator_backend_->has_weight_copies()) return;
 
     for (auto& node : graph_prefill_.nodes) {
         if (node.op_type != OpType::CONSTANT || node.params.str.empty())
@@ -904,11 +934,12 @@ void LLMEngine::prepare_metal_prefill_weights() {
         t.data = const_cast<void*>(t.rowmajor_data);
         t.device_data = nullptr;
         t.device_offset = 0;
-        metal->wrap_weight(t);
+        accelerator_backend_->wrap_weight(t);
         t.data = cpu_data;
         const bool aggregate_expert =
-            node.params.str[0].find("_experts_") != std::string::npos;
-        metal->wrap_weight_int4(t, aggregate_expert);
+            mollm::detail::is_routed_expert_aggregate_ref(
+                node.params.str[0]);
+        accelerator_backend_->wrap_weight_int4(t, aggregate_expert);
     }
 #endif
 }
@@ -920,8 +951,14 @@ void LLMEngine::release_prefill_buffers() {
 
 bool LLMEngine::decode_uses_metal_expert_cache() const {
     return cfg_.metal_ssd_full ||
-           (metal_backend_ &&
-            exec_ctx_decode_.moe_backend == metal_backend_.get());
+           (cfg_.device == Device::METAL && accelerator_backend_ &&
+            exec_ctx_decode_.moe_backend == accelerator_backend_.get());
+}
+
+void LLMEngine::release_vision_buffers() {
+    release_graph_temporaries(graph_vision_, exec_ctx_vision_.backend);
+    graph_vision_.runtime.pool.clear();
+    invalidate_workspace_key(exec_ctx_vision_);
 }
 
 int LLMEngine::prefill(const std::vector<int>& token_ids) {
@@ -943,10 +980,10 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
     bool short_ssd_cpu_prefill = false;
 #ifdef MOLLM_METAL
     const bool is_ssd_metal =
-        moe_ssd_cache_ && metal_backend_ &&
-        saved_prefill_backend == metal_backend_.get();
+        moe_ssd_cache_ && accelerator_backend_ &&
+        saved_prefill_backend == accelerator_backend_.get();
     const bool metal_weights_ready =
-        is_ssd_metal && as_metal(metal_backend_)->has_weight_copies();
+        is_ssd_metal && accelerator_backend_->has_weight_copies();
     short_ssd_cpu_prefill =
         is_ssd_metal &&
         (n < metal_ssd_prefill_min_tokens() ||
@@ -959,10 +996,10 @@ int LLMEngine::prefill(const std::vector<int>& token_ids) {
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
     } else {
-        prepare_metal_prefill_weights();
+        prepare_accelerator_prefill_weights();
     }
 #else
-    prepare_metal_prefill_weights();
+    prepare_accelerator_prefill_weights();
 #endif
     auto finish_prefill_phase = [&] {
         // Hybrid decode is CPU-only, so no prefill workspace is useful after
@@ -1042,10 +1079,10 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
     bool short_ssd_cpu_prefill = false;
 #ifdef MOLLM_METAL
     const bool is_ssd_metal =
-        moe_ssd_cache_ && metal_backend_ &&
-        saved_prefill_backend == metal_backend_.get();
+        moe_ssd_cache_ && accelerator_backend_ &&
+        saved_prefill_backend == accelerator_backend_.get();
     const bool metal_weights_ready =
-        is_ssd_metal && as_metal(metal_backend_)->has_weight_copies();
+        is_ssd_metal && accelerator_backend_->has_weight_copies();
     short_ssd_cpu_prefill =
         is_ssd_metal &&
         (n < metal_ssd_prefill_min_tokens() ||
@@ -1055,10 +1092,10 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
         invalidate_workspace_key(exec_ctx_prefill_);
         exec_ctx_prefill_.backend = &cpu_backend_;
     } else {
-        prepare_metal_prefill_weights();
+        prepare_accelerator_prefill_weights();
     }
 #else
-    prepare_metal_prefill_weights();
+    prepare_accelerator_prefill_weights();
 #endif
 
     int graph_seq_len = 1;
@@ -1105,12 +1142,15 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
 
     // n_real_tokens injection is done by inject_runtime_shapes() above.
 
-    // Set cache metadata
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    // Set cache metadata through the persistent-storage backend so device-only
+    // caches do not need a host-addressable payload.
+    if (!set_cache_lengths(caches_, static_cast<uint64_t>(past_len_))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        exec_ctx_prefill_.backend = saved_prefill_backend;
+        return Tensor();
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
@@ -1128,7 +1168,8 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
 #ifdef MOLLM_METAL
     fuse_metal_lm_head = (all_logits || all_top1) &&
         !use_padding && n >= 2 && n <= 4 &&
-        metal_backend_ && exec_ctx_prefill_.backend == metal_backend_.get() &&
+        cfg_.device == Device::METAL && accelerator_backend_ &&
+        exec_ctx_prefill_.backend == accelerator_backend_.get() &&
         lm_head_weight_ && lm_head_weight_->device_data &&
         (lm_head_weight_->prec == Precision::INT4 ||
          lm_head_weight_->prec == Precision::INT8);
@@ -1144,7 +1185,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
             if (all_top1) {
                 all_top1->resize(static_cast<size_t>(n), -1);
                 const bool top1_ok =
-                    as_metal(metal_backend_)
+                    as_metal(accelerator_backend_)
                         ->lm_head_small_batch_argmax_device_and_end_graph(
                             out, *lm_head_weight_, all_top1->data(),
                             n, vocab, hidden);
@@ -1158,7 +1199,7 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
                 }
             } else {
                 all_logits->resize(static_cast<size_t>(n) * vocab);
-                if (!as_metal(metal_backend_)
+                if (!as_metal(accelerator_backend_)
                          ->lm_head_small_batch_device_and_end_graph(
                              out, *lm_head_weight_, all_logits->data(),
                              n, vocab, hidden)) {
@@ -1166,29 +1207,26 @@ Tensor LLMEngine::prefill_hidden(const std::vector<int>& token_ids,
                 }
             }
         } else {
-            metal_backend_->end_graph();
+            accelerator_backend_->end_graph();
         }
     }
 #endif
     mollm_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data && !exec_ctx_prefill_.backend->dispatch_failed())
-        copied = copy_tensor_contiguous(out, hidden_output_copy_);
+        copied = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_prefill_.backend);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
     if (copied.data) {
-        past_len_ += n;
-        for (auto& cp : caches_) {
-            if (cp.k)
-                cache_meta(cp.k->data)->current_seq_len =
-                    (uint64_t)past_len_;
-            if (cp.v)
-                cache_meta(cp.v->data)->current_seq_len =
-                    (uint64_t)past_len_;
-        }
+        const int next_past = past_len_ + n;
+        if (set_cache_lengths(caches_, static_cast<uint64_t>(next_past)))
+            past_len_ = next_past;
+        else
+            copied = Tensor();
     }
 
     finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
@@ -1276,11 +1314,12 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     // n_real_tokens injection is now done by inject_runtime_shapes() above.
 
     // Set cache metadata so SDPA knows the existing context length.
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past;
+    if (!set_cache_lengths(caches_, static_cast<uint64_t>(past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        return -1;
     }
 
     mollm_set_matmul_profile_phase("prefill_graph");
@@ -1303,7 +1342,8 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
     }
 
     if (has_mtp() && cfg_.mtp_draft_tokens > 0) {
-        Tensor verified = copy_tensor_contiguous(out, hidden_output_copy_);
+        Tensor verified = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_prefill_.backend);
         if (!verified.data || !sync_mtp(token_ids, verified, past)) {
             fprintf(stderr, "prefill_chunk: failed to synchronize MTP state\n");
             release_pool_tensor(graph_prefill_.runtime.pool, h);
@@ -1315,15 +1355,16 @@ int LLMEngine::prefill_chunk(const std::vector<int>& token_ids, int past) {
         }
     }
 
-    past_len_ = past + n;
-
-    // Update cache metadata for decode (past + current prefill tokens)
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    const int next_past = past + n;
+    if (!set_cache_lengths(caches_, static_cast<uint64_t>(next_past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_prefill_, exec_ctx_prefill_);
+        return -1;
     }
+    past_len_ = next_past;
 
     // Cache migration (prefill→decode graph) is done once at load time.
     // Both graphs share the same physical cache buffers.
@@ -1356,15 +1397,12 @@ int LLMEngine::decode(int token_id) {
 
     Tensor mask = build_causal_mask(1, past_len_);
 
-    bool defer_metal_lmhead = false;
-#ifdef MOLLM_METAL
-    defer_metal_lmhead =
-        metal_backend_ && exec_ctx_decode_.backend == metal_backend_.get() &&
-        lm_head_weight_ && lm_head_weight_->device_data &&
-        (lm_head_weight_->prec == Precision::FP16 ||
-         lm_head_weight_->prec == Precision::INT8 ||
-         lm_head_weight_->prec == Precision::INT4);
-#endif
+    const bool defer_accelerator_lmhead =
+        accelerator_backend_ &&
+        accelerator_backend_->is_device_resident() &&
+        exec_ctx_decode_.backend == accelerator_backend_.get() &&
+        lm_head_weight_ &&
+        accelerator_backend_->supports_lm_head(*lm_head_weight_);
 
     mollm_set_matmul_profile_phase("decode_graph");
     int32_t graph_token_id = token_id;
@@ -1373,7 +1411,7 @@ int LLMEngine::decode(int token_id) {
         1, 1, 1, 1, &graph_token_id);
     Tensor out = run_graph(
         graph_decode_, exec_ctx_decode_, h, mask, cos, sin,
-        &token_tensor, defer_metal_lmhead);
+        &token_tensor, defer_accelerator_lmhead);
     if (!out.data) {
         release_pool_tensor(graph_prefill_.runtime.pool, h);
         release_pool_tensor(graph_prefill_.runtime.pool, mask);
@@ -1384,7 +1422,8 @@ int LLMEngine::decode(int token_id) {
     }
 
     if (has_mtp() && cfg_.mtp_draft_tokens > 0) {
-        Tensor verified = copy_tensor_contiguous(out, hidden_output_copy_);
+        Tensor verified = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_decode_.backend);
         if (!verified.data ||
             !sync_mtp(std::vector<int>{token_id}, verified, past_len_)) {
             fprintf(stderr, "decode: failed to synchronize MTP state\n");
@@ -1397,19 +1436,20 @@ int LLMEngine::decode(int token_id) {
         }
     }
 
-    past_len_++;
-
-    // Update cache metadata
-    for (auto& cp : caches_) {
-        if (cp.k)
-            cache_meta(cp.k->data)->current_seq_len = (uint64_t)past_len_;
-        if (cp.v)
-            cache_meta(cp.v->data)->current_seq_len = (uint64_t)past_len_;
+    const int next_past = past_len_ + 1;
+    if (!set_cache_lengths(caches_, static_cast<uint64_t>(next_past))) {
+        release_pool_tensor(graph_prefill_.runtime.pool, h);
+        release_pool_tensor(graph_prefill_.runtime.pool, mask);
+        release_pool_tensor(graph_prefill_.runtime.pool, cos);
+        release_pool_tensor(graph_prefill_.runtime.pool, sin);
+        finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
+        return -1;
     }
+    past_len_ = next_past;
 
     mollm_set_matmul_profile_phase("decode_lmhead");
     sampler_.accept(token_id);
-    int token = run_lmhead(out, 1, defer_metal_lmhead);
+    int token = run_lmhead(out, 1, defer_accelerator_lmhead);
     mollm_set_matmul_profile_phase("unscoped");
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
@@ -1660,22 +1700,19 @@ Tensor LLMEngine::decode_hidden(int token_id) {
     mollm_set_matmul_profile_phase("unscoped");
     Tensor copied;
     if (out.data)
-        copied = copy_tensor_contiguous(out, hidden_output_copy_);
+        copied = copy_tensor_contiguous(
+            out, hidden_output_copy_, exec_ctx_decode_.backend);
     release_pool_tensor(graph_prefill_.runtime.pool, h);
     release_pool_tensor(graph_prefill_.runtime.pool, mask);
     release_pool_tensor(graph_prefill_.runtime.pool, cos);
     release_pool_tensor(graph_prefill_.runtime.pool, sin);
 
-    if (out.data) {
-        past_len_++;
-        for (auto& cp : caches_) {
-            if (cp.k)
-                cache_meta(cp.k->data)->current_seq_len =
-                    (uint64_t)past_len_;
-            if (cp.v)
-                cache_meta(cp.v->data)->current_seq_len =
-                    (uint64_t)past_len_;
-        }
+    if (copied.data) {
+        const int next_past = past_len_ + 1;
+        if (set_cache_lengths(caches_, static_cast<uint64_t>(next_past)))
+            past_len_ = next_past;
+        else
+            copied = Tensor();
     }
 
     finish_graph_temporaries(graph_decode_, exec_ctx_decode_);
