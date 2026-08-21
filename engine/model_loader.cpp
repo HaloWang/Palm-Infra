@@ -440,7 +440,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
             // Prepare accelerator storage while t.data still points at the raw
             // package bytes. CPU load-time packing may replace t.data later.
             if (accelerator_backend_ &&
-                exec_ctx.backend == accelerator_backend_.get())
+                exec_ctx.backend == accelerator_backend_.get() &&
+                t.prec != Precision::INT4 &&
+                t.prec != Precision::INT8)
                 accelerator_backend_->wrap_weight(t);
         };
 
@@ -449,6 +451,8 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
         auto finalize_accelerator_weight = [&]() {
             if (accelerator_backend_ &&
                 exec_ctx.backend == accelerator_backend_.get()) {
+                if (t.prec == Precision::INT8)
+                    accelerator_backend_->wrap_weight(t);
                 const bool is_aggregate_expert =
                     mollm::detail::is_routed_expert_aggregate_ref(wref);
                 accelerator_backend_->wrap_weight_int4(
