@@ -57,6 +57,43 @@ __global__ void q8_dense_gemv_cuda(
         output[column] = sum;
 }
 
+// W8PC is the common decode layout: every output row has one scale and the
+// inner dimension is naturally vector aligned.  Assign four adjacent values
+// to each lane so both the int8 weights and FP32 activation are fetched with
+// vector loads.  The generic kernel above remains the single source of truth
+// for grouped and ragged layouts.
+__global__ void q8_per_channel_dense_gemv_cuda(
+    const float* __restrict__ activation,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ scales,
+    float* __restrict__ output, int columns, int inner) {
+    constexpr int warps_per_block = 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
+    if (column >= columns)
+        return;
+
+    const auto* activation4 = reinterpret_cast<const float4*>(activation);
+    const auto* row4 = reinterpret_cast<const char4*>(
+        weight + static_cast<size_t>(column) * inner);
+    const int vectors = inner / 4;
+    const float scale = scales[column];
+    float sum = 0.0f;
+    for (int index = lane; index < vectors; index += warpSize) {
+        const float4 a = activation4[index];
+        const char4 w = row4[index];
+        sum = fmaf(a.x, static_cast<float>(w.x) * scale, sum);
+        sum = fmaf(a.y, static_cast<float>(w.y) * scale, sum);
+        sum = fmaf(a.z, static_cast<float>(w.z) * scale, sum);
+        sum = fmaf(a.w, static_cast<float>(w.w) * scale, sum);
+    }
+    for (int offset = warpSize / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(0xffffffffu, sum, offset);
+    if (lane == 0)
+        output[column] = sum;
+}
+
 __global__ void dequantize_q4_g32_dense_weight_cuda(
     const Q4B8G32Block* weight, __half2* output, size_t packed_count,
     int rows, int groups) {
@@ -197,9 +234,18 @@ void launch_q8_dense_gemv(
     constexpr int threads = warps_per_block * 32;
     const unsigned blocks = static_cast<unsigned>(
         (columns + warps_per_block - 1) / warps_per_block);
-    q8_dense_gemv_cuda<<<blocks, threads>>>(
-        activation, weight, scales, group_size, groups_per_row, output,
-        columns, inner);
+    const bool vector_aligned =
+        reinterpret_cast<uintptr_t>(activation) % alignof(float4) == 0 &&
+        reinterpret_cast<uintptr_t>(weight) % alignof(char4) == 0;
+    if (groups_per_row == 1 && group_size >= inner && inner % 4 == 0 &&
+        vector_aligned) {
+        q8_per_channel_dense_gemv_cuda<<<blocks, threads>>>(
+            activation, weight, scales, output, columns, inner);
+    } else {
+        q8_dense_gemv_cuda<<<blocks, threads>>>(
+            activation, weight, scales, group_size, groups_per_row, output,
+            columns, inner);
+    }
 }
 
 void launch_dequantize_q4_g32_dense_weight(

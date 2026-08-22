@@ -985,6 +985,35 @@ void CudaBackend::dispatch(const GraphNode& node,
                 return;
             }
             auto* scores = static_cast<float*>(impl_->attention_scores);
+            if (query_length == 1) {
+                mollm_cuda::launch_sdpa_decode(
+                    query_data, key_data, value_data, scores, output_data,
+                    mask_data, num_heads, num_kv_heads, key_length,
+                    past_length, key_dim, value_dim, key_capacity, cached,
+                    fp16_cache, causal, scale,
+                    query.stride[0] / sizeof(float),
+                    query.stride[2] / sizeof(float),
+                    cached ? 1 : current_key.stride[0] / sizeof(float),
+                    cached ? static_cast<size_t>(key_dim)
+                           : current_key.stride[1] / sizeof(float),
+                    cached ? static_cast<size_t>(key_capacity) * key_dim
+                           : current_key.stride[2] / sizeof(float),
+                    cached ? 1 : current_value.stride[0] / sizeof(float),
+                    cached ? static_cast<size_t>(value_dim)
+                           : current_value.stride[1] / sizeof(float),
+                    cached ? static_cast<size_t>(key_capacity) * value_dim
+                           : current_value.stride[2] / sizeof(float),
+                    mask ? mask->stride[0] / sizeof(float) : 0,
+                    output->stride[0] / sizeof(float),
+                    output->stride[2] / sizeof(float));
+                if (!mollm_cuda::report_cuda(
+                        cudaGetLastError(), "sdpa_decode_cuda")) {
+                    impl_->failed = true;
+                    return;
+                }
+                record_native();
+                return;
+            }
             mollm_cuda::launch_sdpa_scores(
                 query_data, key_data, scores, mask_data, num_heads,
                 num_kv_heads, query_length, key_length, past_length, key_dim,

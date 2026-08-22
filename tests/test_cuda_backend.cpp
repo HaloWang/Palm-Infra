@@ -612,6 +612,66 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     backend.end_graph();
     if (backend.dispatch_failed())
         return false;
+    std::vector<float> decode_actual;
+    if (!download(backend, decode_output, decode_actual))
+        return false;
+    std::vector<float> decode_expected(
+        static_cast<size_t>(heads) * value_dim, 0.0f);
+    for (int head = 0; head < heads; ++head) {
+        const int key_head = head / heads_per_group;
+        float scores[total_length + 1];
+        float maximum = -INFINITY;
+        for (int key_position = 0; key_position <= total_length;
+             ++key_position) {
+            float score = 0.0f;
+            for (int dimension = 0; dimension < key_dim; ++dimension) {
+                float key_element;
+                if (key_position < past_length) {
+                    key_element = initial_key[
+                        (key_head * capacity + key_position) * key_dim +
+                        dimension];
+                } else if (key_position < total_length) {
+                    key_element = round_for_cache(key_data[
+                        (key_head * current_length + key_position -
+                         past_length) * key_dim + dimension]);
+                } else {
+                    key_element = round_for_cache(
+                        decode_key_data[key_head * key_dim + dimension]);
+                }
+                score += decode_query_data[head * key_dim + dimension] *
+                    key_element;
+            }
+            scores[key_position] = score * scale;
+            maximum = std::max(maximum, scores[key_position]);
+        }
+        float sum = 0.0f;
+        for (float& score : scores) {
+            score = std::exp(score - maximum);
+            sum += score;
+        }
+        for (int key_position = 0; key_position <= total_length;
+             ++key_position) {
+            for (int dimension = 0; dimension < value_dim; ++dimension) {
+                float value_element;
+                if (key_position < past_length) {
+                    value_element = initial_value[
+                        (key_head * capacity + key_position) * value_dim +
+                        dimension];
+                } else if (key_position < total_length) {
+                    value_element = round_for_cache(value_data[
+                        (key_head * current_length + key_position -
+                         past_length) * value_dim + dimension]);
+                } else {
+                    value_element = round_for_cache(
+                        decode_value_data[key_head * value_dim + dimension]);
+                }
+                decode_expected[head * value_dim + dimension] +=
+                    scores[key_position] / sum * value_element;
+            }
+        }
+    }
+    if (!close_enough(decode_actual, decode_expected, 3e-5f))
+        return false;
     if (!backend.copy_to_host(
             key_cache, cached_key_bytes.data(), cached_key_bytes.size(),
             CacheMetadata::SIZE))
@@ -650,7 +710,6 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
          &key_cache, &value_cache},
         &decode_output, nullptr);
     backend.end_graph();
-    std::vector<float> decode_actual;
     if (backend.dispatch_failed() ||
         !download(backend, decode_output, decode_actual))
         return false;
@@ -1011,6 +1070,47 @@ int main() {
     if (!dispatch_matmul(
             backend, int8, activation, decode_actual, 1, n, k) ||
         !close_enough(decode_actual, decode_expected, 3e-3f))
+        return 1;
+
+    // Exercise the vectorized W8 per-channel decode path with more than one
+    // vector-load iteration per lane.  Grouped W8 above continues to cover the
+    // generic kernel.
+    constexpr int w8pc_k = 256;
+    std::vector<float> w8pc_activation(w8pc_k);
+    std::vector<int8_t> w8pc_weight(static_cast<size_t>(n) * w8pc_k);
+    std::vector<float> w8pc_scales(n);
+    std::vector<float> w8pc_reference_weight(
+        static_cast<size_t>(n) * w8pc_k);
+    for (int inner = 0; inner < w8pc_k; ++inner)
+        w8pc_activation[inner] =
+            static_cast<float>(inner % 29 - 14) / 31.0f;
+    for (int row = 0; row < n; ++row) {
+        w8pc_scales[row] = 0.0075f * (row + 1);
+        for (int inner = 0; inner < w8pc_k; ++inner) {
+            const int8_t value = static_cast<int8_t>(
+                (row * 11 + inner * 5) % 63 - 31);
+            const size_t index = static_cast<size_t>(row) * w8pc_k + inner;
+            w8pc_weight[index] = value;
+            w8pc_reference_weight[index] = value * w8pc_scales[row];
+        }
+    }
+    Tensor w8pc = Tensor::create(
+        Precision::INT8, MemoryType::EXTERNAL, n, w8pc_k, 1, 1,
+        w8pc_weight.data());
+    w8pc.rowmajor_data = w8pc_weight.data();
+    w8pc.scales = w8pc_scales.data();
+    w8pc.group_size = w8pc_k;
+    w8pc.groups_per_row = 1;
+    backend.wrap_weight(w8pc);
+    std::vector<float> w8pc_actual(n);
+    std::vector<float> w8pc_expected(n);
+    reference(
+        w8pc_activation, w8pc_reference_weight, w8pc_expected,
+        1, n, w8pc_k);
+    if (!dispatch_matmul(
+            backend, w8pc, w8pc_activation, w8pc_actual,
+            1, n, w8pc_k) ||
+        !close_enough(w8pc_actual, w8pc_expected, 3e-3f))
         return 1;
 
     Q4B8G32Block block{};

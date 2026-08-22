@@ -82,6 +82,17 @@ void launch_sdpa_output(
     size_t value_head_stride,
     size_t output_feature_stride, size_t output_position_stride,
     size_t output_head_stride);
+void launch_sdpa_decode(
+    const float* query, const void* key, const void* value, float* scores,
+    float* output, const float* mask, int num_heads, int num_kv_heads,
+    int key_length, int past_length, int key_dim, int value_dim,
+    int key_capacity, bool cached, bool fp16_cache, bool causal, float scale,
+    size_t query_feature_stride, size_t query_head_stride,
+    size_t key_feature_stride, size_t key_position_stride,
+    size_t key_head_stride, size_t value_feature_stride,
+    size_t value_position_stride, size_t value_head_stride,
+    size_t mask_column_stride, size_t output_feature_stride,
+    size_t output_head_stride);
 
 void launch_apply_activation(float* values, int rows, int columns, int kind,
                              int begin, int end);

@@ -233,6 +233,111 @@ __global__ void sdpa_output_cuda(
     }
 }
 
+// Decode has one query position, so the score and softmax/value passes can be
+// owned by one block per query head.  Keeping the temporary score row in the
+// backend scratch buffer avoids a context-length shared-memory limit while a
+// single launch removes the inter-kernel boundary.  Softmax exponentials are
+// also computed once per key instead of once per output dimension.
+__global__ void sdpa_decode_cuda(
+    const float* query, const void* key, const void* value, float* scores,
+    float* output, const float* mask, int num_heads, int num_kv_heads,
+    int key_length, int past_length, int key_dim, int value_dim,
+    int key_capacity, bool cached, bool fp16_cache, bool causal, float scale,
+    size_t query_feature_stride, size_t query_head_stride,
+    size_t key_feature_stride, size_t key_position_stride,
+    size_t key_head_stride, size_t value_feature_stride,
+    size_t value_position_stride, size_t value_head_stride,
+    size_t mask_column_stride, size_t output_feature_stride,
+    size_t output_head_stride) {
+    const int head = blockIdx.x;
+    if (head >= num_heads)
+        return;
+    const int key_head = head / (num_heads / num_kv_heads);
+    const float* query_row = query +
+        static_cast<size_t>(head) * query_head_stride;
+    float* score_row = scores + static_cast<size_t>(head) * key_length;
+    __shared__ float reduction[256];
+
+    float local_maximum = -FLT_MAX;
+    for (int key_position = threadIdx.x; key_position < key_length;
+         key_position += blockDim.x) {
+        const size_t cached_key_base =
+            (static_cast<size_t>(key_head) * key_capacity + key_position) *
+            key_dim;
+        const size_t current_key_base =
+            static_cast<size_t>(key_head) * key_head_stride +
+            static_cast<size_t>(key_position) * key_position_stride;
+        float dot = 0.0f;
+        for (int dimension = 0; dimension < key_dim; ++dimension) {
+            const float key_element = cached
+                ? load_kv_cache_value(
+                      key, cached_key_base + dimension, fp16_cache)
+                : static_cast<const float*>(key)[
+                      current_key_base + static_cast<size_t>(dimension) *
+                          key_feature_stride];
+            dot += query_row[static_cast<size_t>(dimension) *
+                             query_feature_stride] * key_element;
+        }
+        float score = dot * scale;
+        if (mask)
+            score += mask[static_cast<size_t>(key_position) *
+                          mask_column_stride];
+        else if (causal && key_position > past_length)
+            score = -FLT_MAX;
+        score_row[key_position] = score;
+        local_maximum = fmaxf(local_maximum, score);
+    }
+    reduction[threadIdx.x] = local_maximum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] = fmaxf(
+                reduction[threadIdx.x], reduction[threadIdx.x + stride]);
+        __syncthreads();
+    }
+    const float maximum = reduction[0];
+
+    float local_sum = 0.0f;
+    for (int key_position = threadIdx.x; key_position < key_length;
+         key_position += blockDim.x) {
+        const float numerator = expf(score_row[key_position] - maximum);
+        score_row[key_position] = numerator;
+        local_sum += numerator;
+    }
+    reduction[threadIdx.x] = local_sum;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (threadIdx.x < stride)
+            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
+        __syncthreads();
+    }
+    const float inverse_sum = reduction[0] > 0.0f
+        ? 1.0f / reduction[0] : 0.0f;
+
+    for (int dimension = threadIdx.x; dimension < value_dim;
+         dimension += blockDim.x) {
+        float result = 0.0f;
+        for (int key_position = 0; key_position < key_length;
+             ++key_position) {
+            const size_t cached_value_index =
+                (static_cast<size_t>(key_head) * key_capacity +
+                 key_position) * value_dim + dimension;
+            const size_t current_value_index =
+                static_cast<size_t>(key_head) * value_head_stride +
+                static_cast<size_t>(key_position) * value_position_stride +
+                static_cast<size_t>(dimension) * value_feature_stride;
+            const float value_element = cached
+                ? load_kv_cache_value(
+                      value, cached_value_index, fp16_cache)
+                : static_cast<const float*>(value)[current_value_index];
+            result += score_row[key_position] * inverse_sum * value_element;
+        }
+        output[static_cast<size_t>(head) * output_head_stride +
+               static_cast<size_t>(dimension) * output_feature_stride] =
+            result;
+    }
+}
+
 }  // namespace
 
 namespace mollm_cuda {
@@ -307,6 +412,27 @@ void launch_sdpa_output(
         key_length, value_dim, value_capacity, cached, fp16_cache,
         value_feature_stride, value_position_stride, value_head_stride,
         output_feature_stride, output_position_stride, output_head_stride);
+}
+
+void launch_sdpa_decode(
+    const float* query, const void* key, const void* value, float* scores,
+    float* output, const float* mask, int num_heads, int num_kv_heads,
+    int key_length, int past_length, int key_dim, int value_dim,
+    int key_capacity, bool cached, bool fp16_cache, bool causal, float scale,
+    size_t query_feature_stride, size_t query_head_stride,
+    size_t key_feature_stride, size_t key_position_stride,
+    size_t key_head_stride, size_t value_feature_stride,
+    size_t value_position_stride, size_t value_head_stride,
+    size_t mask_column_stride, size_t output_feature_stride,
+    size_t output_head_stride) {
+    constexpr int threads = 256;
+    sdpa_decode_cuda<<<num_heads, threads>>>(
+        query, key, value, scores, output, mask, num_heads, num_kv_heads,
+        key_length, past_length, key_dim, value_dim, key_capacity, cached,
+        fp16_cache, causal, scale, query_feature_stride, query_head_stride,
+        key_feature_stride, key_position_stride, key_head_stride,
+        value_feature_stride, value_position_stride, value_head_stride,
+        mask_column_stride, output_feature_stride, output_head_stride);
 }
 
 }  // namespace mollm_cuda
