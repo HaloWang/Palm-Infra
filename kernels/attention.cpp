@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <cstdlib>
 #include <cfloat>
@@ -1018,6 +1019,12 @@ void kernel_sdpa(const OpParams& params,
     const Tensor* mask   = (inputs.size() > 3 && inputs[3] && inputs[3]->data) ? inputs[3] : nullptr;
     const Tensor* K_cache= (inputs.size() > 4 && inputs[4] && inputs[4]->data) ? inputs[4] : nullptr;
     const Tensor* V_cache= (inputs.size() > 5 && inputs[5] && inputs[5]->data) ? inputs[5] : nullptr;
+    if (kv_cache == 2 && K_cache && V_cache &&
+        K_cache->prec != V_cache->prec) {
+        std::fprintf(
+            stderr, "SDPA: K/V cache precision must match\n");
+        return;
+    }
 
     Tensor& out       = *outputs[0];
     Tensor* K_cache_out = outputs.size() > 1 ? outputs[1] : nullptr;

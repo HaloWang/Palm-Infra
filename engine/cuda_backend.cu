@@ -897,6 +897,14 @@ void CudaBackend::dispatch(const GraphNode& node,
         void* value_cache_data = nullptr;
         bool fp16_cache = false;
         if (cache_mode == 2 && key_cache && value_cache &&
+            key_cache->prec != value_cache->prec) {
+            std::fprintf(
+                stderr,
+                "CudaBackend: SDPA requires matching K/V cache precision\n");
+            impl_->failed = true;
+            return;
+        }
+        if (cache_mode == 2 && key_cache && value_cache &&
             key_cache->prec == value_cache->prec &&
             (key_cache->prec == Precision::FP16 ||
              key_cache->prec == Precision::FP32) &&
