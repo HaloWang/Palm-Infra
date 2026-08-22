@@ -769,8 +769,11 @@ void CudaBackend::dispatch(const GraphNode& node,
         const int size = graph_params::get_i32(
             node.params, 2, static_cast<int>(source.shape[dimension]));
         *output = source;
-        output->device_offset = source.device_offset +
+        const size_t byte_offset =
             static_cast<size_t>(offset) * source.stride[dimension];
+        if (source.data)
+            output->data = static_cast<uint8_t*>(source.data) + byte_offset;
+        output->device_offset = source.device_offset + byte_offset;
         output->shape[dimension] = size;
         record_native();
         return;

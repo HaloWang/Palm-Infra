@@ -896,15 +896,20 @@ int main() {
         return 1;
     {
         constexpr int sliced_n = n / 2;
-        Tensor sliced_weight = fp16.view_2d(
-            sliced_n, k,
-            static_cast<size_t>(sliced_n) * k *
-                sizeof(mollm::cpu::fp16_t));
+        Tensor sliced_weight;
+        GraphNode slice_weight;
+        slice_weight.op_type = OpType::SLICE;
+        slice_weight.params.i32 = {0, sliced_n, sliced_n};
+        backend.dispatch(slice_weight, {&fp16}, &sliced_weight, nullptr);
         Tensor sliced_input = device_tensor(backend, k, m);
         Tensor sliced_output = device_tensor(backend, sliced_n, m);
+        const size_t sliced_weight_offset =
+            static_cast<size_t>(sliced_n) * fp16.stride[0] /
+            sizeof(mollm::cpu::fp16_t);
         std::vector<float> sliced_reference_weight(
-            weight_f32.begin() + static_cast<size_t>(sliced_n) * k,
-            weight_f32.end());
+            weight_f32.begin() + sliced_weight_offset,
+            weight_f32.begin() + sliced_weight_offset +
+                static_cast<size_t>(sliced_n) * k);
         std::vector<float> sliced_expected(
             static_cast<size_t>(m) * sliced_n);
         std::vector<float> sliced_actual;
