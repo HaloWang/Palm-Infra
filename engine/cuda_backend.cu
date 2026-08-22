@@ -1023,7 +1023,7 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
     }
 
-    const DeviceWeight* matmul_weight =
+    const auto* matmul_weight =
         inputs.size() >= 2 && inputs[1] ? impl_->find_weight(*inputs[1])
                                         : nullptr;
     if (node.op_type == OpType::MATMUL && inputs.size() >= 2 && inputs[0] &&
