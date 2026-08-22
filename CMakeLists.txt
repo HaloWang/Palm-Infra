@@ -361,12 +361,18 @@ if(MOLLM_CUDA)
     endif()
     enable_language(CUDA)
     find_package(CUDAToolkit REQUIRED)
-    target_sources(mollm_lib PRIVATE engine/cuda_backend.cu)
+    target_sources(mollm_lib PRIVATE
+        engine/cuda_attention.cu
+        engine/cuda_backend.cu
+        engine/cuda_matmul.cu
+        engine/cuda_memory.cu
+        engine/cuda_ops.cu)
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CUDA=1)
     target_link_libraries(mollm_lib PUBLIC CUDA::cudart CUDA::cublas)
     set_target_properties(mollm_lib PROPERTIES
         CUDA_STANDARD 17
-        CUDA_STANDARD_REQUIRED ON)
+        CUDA_STANDARD_REQUIRED ON
+        CUDA_SEPARABLE_COMPILATION OFF)
     message(STATUS "CUDA correctness backend enabled")
 endif()
 
