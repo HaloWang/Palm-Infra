@@ -197,6 +197,8 @@ void test_unavailable_cuda_policy(const char* path) {
           "permissive CUDA request falls back when CUDA is unavailable");
     CHECK(fallback_engine.config().device == Device::CPU,
           "fallback reports CPU as the active device");
+    CHECK(!fallback_engine.package_weights_mmap_backed(),
+          "unavailable CUDA fallback preserves resident CPU package storage");
 }
 
 }  // namespace

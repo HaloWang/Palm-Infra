@@ -612,6 +612,18 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
     const bool deepseek_v4 =
         architecture != package_metadata_.end() &&
         architecture->second == "deepseek-v4";
+    // A successfully selected CUDA backend uploads prepared weights into
+    // device-owned storage. Keep its host package file-backed so CPU reference
+    // fallback can still use the serialized layouts without retaining a
+    // second model-sized anonymous copy. Device selection has already run, so
+    // an unavailable permissive CUDA request has cfg_.device == CPU here and
+    // preserves the caller's CPU storage policy.
+    if (cfg_.device == Device::CUDA &&
+        cfg_.weight_loading == WeightLoadingMode::RESIDENT) {
+        std::fprintf(
+            stderr, "Engine: CUDA uses mmap-backed host package weights\n");
+        cfg_.weight_loading = WeightLoadingMode::MMAP;
+    }
     if (cfg_.device == Device::METAL && cfg_.moe_ssd_cache_bytes == 0) {
         if (deepseek_v4) {
             cfg_.weight_loading = WeightLoadingMode::MMAP;
