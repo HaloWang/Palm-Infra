@@ -5,9 +5,9 @@
 #include <memory>
 
 // CUDA backend with device-resident graph storage. CUDA owns prepared linear
-// weights and managed intermediate/persistent buffers. Operators not yet
-// implemented natively synchronize and use the CPU reference dispatcher over
-// those managed buffers, providing an explicit incremental migration path.
+// weights and cudaMalloc-backed intermediate/persistent buffers. KV metadata
+// may retain a small coherent host prefix. Operators not yet implemented
+// natively use an explicit D2H -> CPU reference -> H2D bridge.
 class CudaBackend final : public AcceleratorBackend {
 public:
     CudaBackend();
@@ -31,6 +31,14 @@ public:
                        BufferPool* pool) override;
     void free_output(Tensor& tensor, BufferPool* pool) override;
     bool is_device_resident() const override { return true; }
+    bool copy_to_host(const Tensor& source, void* destination,
+                      size_t nbytes, size_t source_offset = 0) override;
+    bool copy_from_host(const void* source, Tensor& destination,
+                        size_t nbytes,
+                        size_t destination_offset = 0) override;
+    bool zero_tensor(Tensor& tensor, size_t nbytes,
+                     size_t destination_offset = 0) override;
+    bool round_to_bf16(Tensor& tensor) override;
     void synchronize_for_host_read() override;
     void begin_graph() override;
     void end_graph() override;

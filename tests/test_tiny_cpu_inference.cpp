@@ -75,9 +75,8 @@ InferenceResult run_package(const char* path, const char* label,
         : OperatorFallbackPolicy::ALLOW_REFERENCE;
     config.n_ctx = 8;
     config.num_threads = 1;
-    config.weight_loading =
-        (use_mmap || device == Device::CUDA)
-            ? WeightLoadingMode::MMAP : WeightLoadingMode::RESIDENT;
+    config.weight_loading = use_mmap
+        ? WeightLoadingMode::MMAP : WeightLoadingMode::RESIDENT;
     config.sampling.temperature = 0.0f;
 
     CHECK(engine.load(config), label);
@@ -217,7 +216,7 @@ int main(int argc, char** argv) {
             argv[2], "load real dense package on CPU", nullptr, true,
             Device::CPU);
         const InferenceResult cuda = run_package(
-            argv[2], "load real dense package on CUDA", nullptr, true,
+            argv[2], "load real dense package on CUDA", nullptr, false,
             Device::CUDA);
         compare_cpu_cuda(cpu, cuda, "real dense", true);
         if (failures == 0)
@@ -265,10 +264,10 @@ int main(int argc, char** argv) {
     if (probe.available()) {
         const InferenceResult fp16_cuda = run_package(
             argv[1], "load tiny Qwen3 FP16 package on CUDA", "qwen3",
-            true, Device::CUDA);
+            false, Device::CUDA);
         const InferenceResult w4_cuda = run_package(
             argv[2], "load tiny Qwen3 W4G32 package on CUDA", "qwen3",
-            true, Device::CUDA);
+            false, Device::CUDA);
         compare_cpu_cuda(fp16, fp16_cuda, "tiny Qwen3 FP16", false);
         compare_cpu_cuda(w4, w4_cuda, "tiny Qwen3 W4G32", false);
     }

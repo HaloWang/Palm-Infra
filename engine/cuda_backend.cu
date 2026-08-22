@@ -15,7 +15,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
-#include <map>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -46,6 +45,19 @@ struct CudaBackend::Impl {
         size_t capacity = 0;
     };
 
+    struct PersistentHostMirror {
+        explicit PersistentHostMirror(size_t bytes)
+            : size(bytes),
+              words((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t)) {}
+
+        uint8_t* data() {
+            return reinterpret_cast<uint8_t*>(words.data());
+        }
+
+        size_t size = 0;
+        std::vector<uint64_t> words;
+    };
+
     bool ok = false;
     bool failed = false;
     cublasHandle_t cublas = nullptr;
@@ -53,9 +65,10 @@ struct CudaBackend::Impl {
     std::unordered_map<const void*, DeviceWeight> weights;
     std::unordered_map<const void*, const DeviceWeight*> weights_by_device;
     std::vector<void*> device_allocations;
+    mollm_cuda::DeviceBufferPool* output_pool =
+        mollm_cuda::create_device_buffer_pool();
     std::vector<void*> managed_allocations;
-    std::unordered_map<void*, size_t> managed_sizes;
-    std::multimap<size_t, void*> free_managed;
+    std::unordered_map<void*, PersistentHostMirror> persistent_host_mirrors;
     std::unordered_map<std::string, BoundaryBuffer> boundary_buffers;
     std::unordered_map<uint32_t, uint64_t> native_ops;
     std::unordered_map<uint32_t, uint64_t> fallback_ops;
@@ -79,6 +92,7 @@ struct CudaBackend::Impl {
             cublasDestroy(cublas);
         for (void* allocation : device_allocations)
             cudaFree(allocation);
+        mollm_cuda::destroy_device_buffer_pool(output_pool);
         for (void* allocation : managed_allocations)
             cudaFree(allocation);
         for (auto& entry : boundary_buffers)
@@ -107,28 +121,6 @@ struct CudaBackend::Impl {
                              op_type_name(static_cast<OpType>(entry.first)),
                              static_cast<unsigned long long>(entry.second));
         }
-    }
-
-    void* acquire_managed(size_t bytes) {
-        auto found = free_managed.lower_bound(bytes);
-        if (found != free_managed.end()) {
-            void* pointer = found->second;
-            free_managed.erase(found);
-            return pointer;
-        }
-        void* pointer = nullptr;
-        if (!mollm_cuda::malloc_managed(
-                &pointer, bytes, "cudaMallocManaged output"))
-            return nullptr;
-        managed_allocations.push_back(pointer);
-        managed_sizes.emplace(pointer, bytes);
-        return pointer;
-    }
-
-    void release_managed(void* pointer) {
-        const auto found = managed_sizes.find(pointer);
-        if (found != managed_sizes.end())
-            free_managed.emplace(found->second, pointer);
     }
 
     bool reserve(void*& pointer, size_t& capacity, size_t requested) {
@@ -497,7 +489,8 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
 void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
     if (!available() || nbytes == 0)
         return nullptr;
-    void* pointer = impl_->acquire_managed(nbytes);
+    void* pointer = mollm_cuda::acquire_device_buffer(
+        impl_->output_pool, nbytes);
     if (!pointer) {
         impl_->failed = true;
         return nullptr;
@@ -513,7 +506,126 @@ void* CudaBackend::alloc_output(Tensor& output, size_t nbytes, BufferPool*) {
 
 void CudaBackend::free_output(Tensor& tensor, BufferPool*) {
     if (tensor.device_data)
-        impl_->release_managed(tensor.device_data);
+        mollm_cuda::release_device_buffer(
+            impl_->output_pool, tensor.device_data);
+}
+
+bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
+                               size_t nbytes, size_t source_offset) {
+    if (!destination || source_offset > source.view_span_bytes() ||
+        nbytes > source.view_span_bytes() - source_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    const auto* device = device_pointer_const<uint8_t>(source);
+    if (!device) {
+        if (!source.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memcpy(
+            destination,
+            static_cast<const uint8_t*>(source.data) + source_offset,
+            nbytes);
+        return true;
+    }
+    if (!mollm_cuda::copy_memory(
+            destination, device + source_offset, nbytes,
+            cudaMemcpyDeviceToHost, "cudaMemcpy tensor to host")) {
+        impl_->failed = true;
+        return false;
+    }
+    return true;
+}
+
+bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
+                                 size_t nbytes,
+                                 size_t destination_offset) {
+    if (!source || destination_offset > destination.view_span_bytes() ||
+        nbytes > destination.view_span_bytes() - destination_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    auto* device = device_pointer<uint8_t>(destination);
+    if (!device) {
+        if (!destination.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memcpy(
+            static_cast<uint8_t*>(destination.data) + destination_offset,
+            source, nbytes);
+        return true;
+    }
+    if (!mollm_cuda::copy_memory(
+            device + destination_offset, source, nbytes,
+            cudaMemcpyHostToDevice, "cudaMemcpy tensor from host")) {
+        impl_->failed = true;
+        return false;
+    }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        destination.device_data);
+    const size_t absolute_offset =
+        destination.device_offset + destination_offset;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        const size_t mirror_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        std::memcpy(
+            mirror->second.data() + absolute_offset, source, mirror_bytes);
+    }
+    return true;
+}
+
+bool CudaBackend::zero_tensor(Tensor& tensor, size_t nbytes,
+                              size_t destination_offset) {
+    if (destination_offset > tensor.view_span_bytes() ||
+        nbytes > tensor.view_span_bytes() - destination_offset) {
+        impl_->failed = true;
+        return false;
+    }
+    auto* device = device_pointer<uint8_t>(tensor);
+    if (!device) {
+        if (!tensor.data) {
+            impl_->failed = true;
+            return false;
+        }
+        std::memset(
+            static_cast<uint8_t*>(tensor.data) + destination_offset,
+            0, nbytes);
+        return true;
+    }
+    if (!mollm_cuda::zero_memory(
+            device + destination_offset, nbytes, "cudaMemset tensor")) {
+        impl_->failed = true;
+        return false;
+    }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        tensor.device_data);
+    const size_t absolute_offset = tensor.device_offset + destination_offset;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        const size_t mirror_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        std::memset(
+            mirror->second.data() + absolute_offset, 0, mirror_bytes);
+    }
+    return true;
+}
+
+bool CudaBackend::round_to_bf16(Tensor& tensor) {
+    float* values = device_pointer<float>(tensor);
+    if (!values || tensor.prec != Precision::FP32 ||
+        !tensor.is_contiguous()) {
+        impl_->failed = true;
+        return false;
+    }
+    if (!mollm_cuda::launch_round_to_bf16(
+            values, static_cast<size_t>(tensor.nelements()))) {
+        impl_->failed = true;
+        return false;
+    }
+    return true;
 }
 
 void CudaBackend::synchronize_for_host_read() {
@@ -529,18 +641,47 @@ void CudaBackend::end_graph() { synchronize_for_host_read(); }
 void CudaBackend::alloc_persistent(
     Tensor& tensor, size_t nbytes, PersistentHostAccess host_access,
     size_t host_prefix_bytes) {
-    (void)host_access;
-    (void)host_prefix_bytes;
     void* storage = nullptr;
     if (!available() || nbytes == 0 ||
-        !mollm_cuda::malloc_managed(
-            &storage, nbytes, "cudaMallocManaged persistent")) {
+        (host_access == PersistentHostAccess::MIRRORED_PREFIX &&
+         (host_prefix_bytes == 0 || host_prefix_bytes > nbytes))) {
         impl_->failed = true;
         return;
     }
-    impl_->managed_allocations.push_back(storage);
-    std::memset(storage, 0, nbytes);
-    tensor.data = storage;
+    if (host_access == PersistentHostAccess::FULL) {
+        if (!mollm_cuda::malloc_managed(
+                &storage, nbytes,
+                "cudaMallocManaged host-coherent persistent")) {
+            impl_->failed = true;
+            return;
+        }
+        impl_->managed_allocations.push_back(storage);
+        std::memset(storage, 0, nbytes);
+        tensor.data = storage;
+    } else {
+        if (!mollm_cuda::malloc_device(
+                &storage, nbytes, "cudaMalloc persistent") ||
+            !mollm_cuda::zero_memory(
+                storage, nbytes, "cudaMemset persistent")) {
+            if (storage)
+                cudaFree(storage);
+            impl_->failed = true;
+            return;
+        }
+        impl_->device_allocations.push_back(storage);
+        if (host_access == PersistentHostAccess::MIRRORED_PREFIX) {
+            auto [entry, inserted] =
+                impl_->persistent_host_mirrors.emplace(
+                    storage, Impl::PersistentHostMirror(host_prefix_bytes));
+            (void)inserted;
+            tensor.data = entry->second.data();
+        } else {
+            // Tensor::data remains a non-null storage handle for executor
+            // ownership checks. PersistentHostAccess::NONE forbids host
+            // dereference; all access goes through explicit transfer methods.
+            tensor.data = storage;
+        }
+    }
     tensor.device_data = storage;
     tensor.device_offset = 0;
     tensor.mem_type = MemoryType::EXTERNAL;
@@ -1128,25 +1269,81 @@ void CudaBackend::dispatch(const GraphNode& node,
         return;
     std::vector<Tensor> host_tensors;
     std::vector<const Tensor*> host_inputs;
+    std::vector<std::vector<uint64_t>> host_storage;
+    std::vector<int> staged_storage(inputs.size(), -1);
     host_tensors.reserve(inputs.size());
     host_inputs.reserve(inputs.size());
-    for (const Tensor* input : inputs) {
+    host_storage.reserve(inputs.size());
+    for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+        const Tensor* input = inputs[input_index];
         if (!input) {
             host_inputs.push_back(nullptr);
             continue;
         }
         host_tensors.push_back(*input);
         Tensor& host = host_tensors.back();
-        if (host.data && host.device_offset)
-            host.data = static_cast<uint8_t*>(host.data) +
-                host.device_offset;
+        // Prepared constants retain their package-native host representation.
+        // Device intermediates and persistent state are staged from the first
+        // byte of the tensor view, preserving their original shape/strides.
+        const bool device_weight = impl_->find_weight(*input) != nullptr;
+        if (input->device_data && !device_weight) {
+            const size_t bytes = input->view_span_bytes();
+            host_storage.emplace_back(
+                (bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+            staged_storage[input_index] =
+                static_cast<int>(host_storage.size() - 1);
+            void* destination = host_storage.back().data();
+            if (!copy_to_host(*input, destination, bytes)) {
+                impl_->failed = true;
+                return;
+            }
+            host.data = destination;
+        } else if (device_weight && !host.data) {
+            std::fprintf(
+                stderr, "CudaBackend: %s fallback lacks host weight storage\n",
+                op_type_name(node.op_type));
+            impl_->failed = true;
+            return;
+        }
         host.device_data = nullptr;
         host.device_offset = 0;
         host_inputs.push_back(&host);
     }
+    if (!output || !output->device_data) {
+        impl_->failed = true;
+        return;
+    }
+    const size_t output_bytes = output->view_span_bytes();
+    std::vector<uint64_t> host_output_storage(
+        (output_bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t));
+    Tensor host_output = *output;
+    host_output.data = host_output_storage.data();
+    host_output.device_data = nullptr;
+    host_output.device_offset = 0;
     impl_->cpu.clear_dispatch_error();
-    impl_->cpu.dispatch(node, host_inputs, output, thread_pool);
+    impl_->cpu.dispatch(node, host_inputs, &host_output, thread_pool);
     if (impl_->cpu.dispatch_failed()) {
+        impl_->failed = true;
+        return;
+    }
+    // Reference kernels may mutate cache or recurrent-state inputs. Copy every
+    // staged input back; this is intentionally centralized so new fallback
+    // operators cannot silently lose in-place updates.
+    for (size_t input_index = 0; input_index < inputs.size(); ++input_index) {
+        const int storage_index = staged_storage[input_index];
+        if (storage_index < 0)
+            continue;
+        Tensor& input = *const_cast<Tensor*>(inputs[input_index]);
+        const size_t bytes = input.view_span_bytes();
+        if (!copy_from_host(
+                host_storage[static_cast<size_t>(storage_index)].data(),
+                input, bytes)) {
+            impl_->failed = true;
+            return;
+        }
+    }
+    if (host_output.data != host_output_storage.data() ||
+        !copy_from_host(host_output.data, *output, output_bytes)) {
         impl_->failed = true;
         return;
     }

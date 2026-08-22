@@ -61,6 +61,19 @@ Tensor device_tensor(CudaBackend& backend, int64_t d0, int64_t d1 = 1,
     return tensor;
 }
 
+bool upload(CudaBackend& backend, Tensor& tensor,
+            const std::vector<float>& values) {
+    return values.size() * sizeof(float) == tensor.nbytes() &&
+        backend.copy_from_host(values.data(), tensor, tensor.nbytes());
+}
+
+bool download(CudaBackend& backend, const Tensor& tensor,
+              std::vector<float>& values) {
+    values.resize(static_cast<size_t>(tensor.nelements()));
+    return backend.copy_to_host(
+        tensor, values.data(), values.size() * sizeof(float));
+}
+
 bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
                               const std::vector<float>& activation,
                               const std::vector<float>& expected,
@@ -69,15 +82,17 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     Tensor c = device_tensor(backend, n, m);
     if (!a.data || !c.data)
         return false;
-    std::memcpy(a.data, activation.data(), a.nbytes());
+    if (!upload(backend, a, activation))
+        return false;
 
     GraphNode matmul;
     matmul.op_type = OpType::MATMUL;
     backend.clear_dispatch_error();
     backend.dispatch(matmul, {&a, &weight}, &c, nullptr);
     backend.end_graph();
-    std::vector<float> actual(static_cast<size_t>(m) * n);
-    std::memcpy(actual.data(), c.data, c.nbytes());
+    std::vector<float> actual;
+    if (!download(backend, c, actual))
+        return false;
     if (backend.dispatch_failed() ||
         !close_enough(actual, expected, 3e-3f))
         return false;
@@ -105,7 +120,8 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     }
     Tensor norm_source = device_tensor(backend, width, rows);
     Tensor norm_output = device_tensor(backend, width, rows);
-    std::memcpy(norm_source.data, norm_input.data(), norm_source.nbytes());
+    if (!upload(backend, norm_source, norm_input))
+        return false;
     Tensor norm_scale = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, width, 1, 1, 1,
         norm_weight.data());
@@ -115,8 +131,8 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     backend.dispatch(rms_norm, {&norm_source, &norm_scale},
                      &norm_output, nullptr);
     backend.end_graph();
-    actual.resize(norm_expected.size());
-    std::memcpy(actual.data(), norm_output.data, norm_output.nbytes());
+    if (!download(backend, norm_output, actual))
+        return false;
     if (backend.dispatch_failed() ||
         !close_enough(actual, norm_expected, 2e-5f))
         return false;
@@ -125,8 +141,8 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     Tensor rhs = device_tensor(backend, width, rows);
     Tensor sum = device_tensor(backend, width, rows);
     Tensor silu = device_tensor(backend, width, rows);
-    auto* lhs_data = lhs.ptr<float>();
-    auto* rhs_data = rhs.ptr<float>();
+    std::vector<float> lhs_data(width * rows);
+    std::vector<float> rhs_data(width * rows);
     std::vector<float> elementwise_expected(width * rows);
     for (int i = 0; i < width * rows; ++i) {
         lhs_data[i] = (i - 5) / 7.0f;
@@ -134,6 +150,8 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
         const float value = lhs_data[i] + rhs_data[i];
         elementwise_expected[i] = value / (1.0f + std::exp(-value));
     }
+    if (!upload(backend, lhs, lhs_data) || !upload(backend, rhs, rhs_data))
+        return false;
     GraphNode add;
     add.op_type = OpType::ADD;
     GraphNode silu_node;
@@ -141,15 +159,18 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     backend.dispatch(add, {&lhs, &rhs}, &sum, nullptr);
     backend.dispatch(silu_node, {&sum}, &silu, nullptr);
     backend.end_graph();
-    actual.resize(elementwise_expected.size());
-    std::memcpy(actual.data(), silu.data, silu.nbytes());
+    if (!download(backend, silu, actual))
+        return false;
     if (backend.dispatch_failed() ||
         !close_enough(actual, elementwise_expected, 2e-6f))
         return false;
 
     Tensor view_source = device_tensor(backend, 6, 2);
+    std::vector<float> view_source_data(12);
     for (int i = 0; i < 12; ++i)
-        view_source.ptr<float>()[i] = (i - 4) / 5.0f;
+        view_source_data[i] = (i - 4) / 5.0f;
+    if (!upload(backend, view_source, view_source_data))
+        return false;
     Tensor slice;
     GraphNode slice_node;
     slice_node.op_type = OpType::SLICE;
@@ -161,12 +182,12 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
     std::vector<float> view_expected(4);
     for (int row = 0; row < 2; ++row)
         for (int column = 0; column < 2; ++column) {
-            const float value = view_source.ptr<float>()[row * 6 + column + 2];
+            const float value = view_source_data[row * 6 + column + 2];
             view_expected[row * 2 + column] =
                 value / (1.0f + std::exp(-value));
         }
-    actual.resize(view_expected.size());
-    std::memcpy(actual.data(), view_result.data, view_result.nbytes());
+    if (!download(backend, view_result, actual))
+        return false;
     return !backend.dispatch_failed() &&
         close_enough(actual, view_expected, 2e-6f);
 }
@@ -174,8 +195,11 @@ bool test_device_resident_ops(CudaBackend& backend, Tensor& weight,
 bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor rope_storage = device_tensor(backend, 10, 2);
+    std::vector<float> rope_storage_data(20);
     for (int i = 0; i < 20; ++i)
-        rope_storage.ptr<float>()[i] = (i - 8) / 17.0f;
+        rope_storage_data[i] = (i - 8) / 17.0f;
+    if (!upload(backend, rope_storage, rope_storage_data))
+        return false;
     Tensor rope_input;
     GraphNode slice;
     slice.op_type = OpType::SLICE;
@@ -183,10 +207,15 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     backend.dispatch(slice, {&rope_storage}, &rope_input, nullptr);
     Tensor cosine = device_tensor(backend, 4, 2);
     Tensor sine = device_tensor(backend, 4, 2);
+    std::vector<float> cosine_data(8);
+    std::vector<float> sine_data(8);
     for (int i = 0; i < 8; ++i) {
-        cosine.ptr<float>()[i] = std::cos((i + 1) * 0.13f);
-        sine.ptr<float>()[i] = std::sin((i + 1) * 0.13f);
+        cosine_data[i] = std::cos((i + 1) * 0.13f);
+        sine_data[i] = std::sin((i + 1) * 0.13f);
     }
+    if (!upload(backend, cosine, cosine_data) ||
+        !upload(backend, sine, sine_data))
+        return false;
     Tensor rope_output = device_tensor(backend, 8, 2);
     GraphNode rope;
     rope.op_type = OpType::ROTARY_EMBED;
@@ -197,16 +226,17 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     std::vector<float> expected(16);
     for (int row = 0; row < 2; ++row)
         for (int pair = 0; pair < 4; ++pair) {
-            const float x0 = rope_storage.ptr<float>()[row * 10 + pair + 1];
+            const float x0 = rope_storage_data[row * 10 + pair + 1];
             const float x1 =
-                rope_storage.ptr<float>()[row * 10 + pair + 5];
-            const float c = cosine.ptr<float>()[row * 4 + pair];
-            const float s = sine.ptr<float>()[row * 4 + pair];
+                rope_storage_data[row * 10 + pair + 5];
+            const float c = cosine_data[row * 4 + pair];
+            const float s = sine_data[row * 4 + pair];
             expected[row * 8 + pair] = x0 * c - x1 * s;
             expected[row * 8 + pair + 4] = x0 * s + x1 * c;
         }
-    std::vector<float> actual(expected.size());
-    std::memcpy(actual.data(), rope_output.data, rope_output.nbytes());
+    std::vector<float> actual;
+    if (!download(backend, rope_output, actual))
+        return false;
     if (backend.dispatch_failed() || !close_enough(actual, expected, 2e-6f))
         return false;
 
@@ -218,8 +248,9 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     for (int row = 0; row < 2; ++row)
         for (int column = 0; column < 8; ++column)
             expected[row * 8 + column] =
-                rope_storage.ptr<float>()[row * 10 + column + 1];
-    std::memcpy(actual.data(), contiguous.data, contiguous.nbytes());
+                rope_storage_data[row * 10 + column + 1];
+    if (!download(backend, contiguous, actual))
+        return false;
     if (backend.dispatch_failed() || !close_enough(actual, expected, 0.0f))
         return false;
 
@@ -229,16 +260,21 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     Tensor update = device_tensor(backend, norm_width, norm_rows);
     Tensor add_norm_output = device_tensor(backend, norm_width, norm_rows);
     std::vector<float> norm_weight(norm_width);
+    std::vector<float> residual_data(norm_width * norm_rows);
+    std::vector<float> update_data(norm_width * norm_rows);
     std::vector<float> residual_expected(norm_width * norm_rows);
     std::vector<float> add_norm_expected(norm_width * norm_rows);
     for (int column = 0; column < norm_width; ++column)
         norm_weight[column] = 0.8f + column * 0.02f;
     for (int i = 0; i < norm_width * norm_rows; ++i) {
-        residual.ptr<float>()[i] = (i - 6) / 9.0f;
-        update.ptr<float>()[i] = (4 - i) / 13.0f;
+        residual_data[i] = (i - 6) / 9.0f;
+        update_data[i] = (4 - i) / 13.0f;
         residual_expected[i] =
-            residual.ptr<float>()[i] + update.ptr<float>()[i];
+            residual_data[i] + update_data[i];
     }
+    if (!upload(backend, residual, residual_data) ||
+        !upload(backend, update, update_data))
+        return false;
     for (int row = 0; row < norm_rows; ++row) {
         float sum = 0.0f;
         for (int column = 0; column < norm_width; ++column) {
@@ -261,11 +297,11 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     backend.dispatch(add_norm, {&residual, &update, &norm_scale},
                      &add_norm_output, nullptr);
     backend.end_graph();
-    actual.resize(add_norm_expected.size());
-    std::memcpy(actual.data(), add_norm_output.data,
-                add_norm_output.nbytes());
-    std::vector<float> residual_actual(residual_expected.size());
-    std::memcpy(residual_actual.data(), residual.data, residual.nbytes());
+    if (!download(backend, add_norm_output, actual))
+        return false;
+    std::vector<float> residual_actual;
+    if (!download(backend, residual, residual_actual))
+        return false;
     if (backend.dispatch_failed() ||
         !close_enough(actual, add_norm_expected, 2e-5f) ||
         !close_enough(residual_actual, residual_expected, 2e-6f))
@@ -275,9 +311,13 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     constexpr int rope_heads = 3;
     Tensor flat_norm_input =
         device_tensor(backend, norm_width, rope_sequence * rope_heads);
+    std::vector<float> flat_norm_data(
+        static_cast<size_t>(flat_norm_input.nelements()));
     for (int64_t i = 0; i < flat_norm_input.nelements(); ++i)
-        flat_norm_input.ptr<float>()[i] =
+        flat_norm_data[static_cast<size_t>(i)] =
             (static_cast<int>(i % 17) - 8) / 15.0f;
+    if (!upload(backend, flat_norm_input, flat_norm_data))
+        return false;
     Tensor fused_rope_output =
         device_tensor(backend, norm_width, rope_sequence, rope_heads);
     GraphNode fused_rope;
@@ -296,27 +336,26 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
             float sum = 0.0f;
             for (int dimension = 0; dimension < norm_width; ++dimension) {
                 const float value =
-                    flat_norm_input.ptr<float>()[row * norm_width + dimension];
+                    flat_norm_data[row * norm_width + dimension];
                 sum += value * value;
             }
             const float inverse = 1.0f /
                 std::sqrt(sum / norm_width + 1e-6f);
             for (int pair = 0; pair < norm_width / 2; ++pair) {
-                const float x0 = flat_norm_input.ptr<float>()[
+                const float x0 = flat_norm_data[
                     row * norm_width + pair * 2] * inverse *
                     norm_weight[pair * 2];
-                const float x1 = flat_norm_input.ptr<float>()[
+                const float x1 = flat_norm_data[
                     row * norm_width + pair * 2 + 1] * inverse *
                     norm_weight[pair * 2 + 1];
-                const float c = cosine.ptr<float>()[position * 4 + pair];
-                const float s = sine.ptr<float>()[position * 4 + pair];
+                const float c = cosine_data[position * 4 + pair];
+                const float s = sine_data[position * 4 + pair];
                 expected[row * norm_width + pair * 2] = x0 * c - x1 * s;
                 expected[row * norm_width + pair * 2 + 1] = x0 * s + x1 * c;
             }
         }
-    actual.resize(expected.size());
-    std::memcpy(actual.data(), fused_rope_output.data,
-                fused_rope_output.nbytes());
+    if (!download(backend, fused_rope_output, actual))
+        return false;
     if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
         return false;
 
@@ -332,12 +371,23 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
     Tensor key = device_tensor(backend, key_dim, current_length, kv_heads);
     Tensor value =
         device_tensor(backend, value_dim, current_length, kv_heads);
+    std::vector<float> query_data(
+        static_cast<size_t>(query.nelements()));
+    std::vector<float> key_data(static_cast<size_t>(key.nelements()));
+    std::vector<float> value_data(static_cast<size_t>(value.nelements()));
     for (int64_t i = 0; i < query.nelements(); ++i)
-        query.ptr<float>()[i] = (static_cast<int>(i % 13) - 6) / 11.0f;
+        query_data[static_cast<size_t>(i)] =
+            (static_cast<int>(i % 13) - 6) / 11.0f;
     for (int64_t i = 0; i < key.nelements(); ++i)
-        key.ptr<float>()[i] = (static_cast<int>(i % 9) - 4) / 7.0f;
+        key_data[static_cast<size_t>(i)] =
+            (static_cast<int>(i % 9) - 4) / 7.0f;
     for (int64_t i = 0; i < value.nelements(); ++i)
-        value.ptr<float>()[i] = (static_cast<int>(i % 7) - 3) / 5.0f;
+        value_data[static_cast<size_t>(i)] =
+            (static_cast<int>(i % 7) - 3) / 5.0f;
+    if (!upload(backend, query, query_data) ||
+        !upload(backend, key, key_data) ||
+        !upload(backend, value, value_data))
+        return false;
 
     const size_t key_cache_bytes = CacheMetadata::SIZE +
         static_cast<size_t>(kv_heads) * capacity * key_dim * sizeof(float);
@@ -407,10 +457,10 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
                     const float key_value = key_position < past_length
                         ? initial_key[(key_head * capacity + key_position) *
                                       key_dim + dimension]
-                        : key.ptr<float>()[
+                        : key_data[
                               (key_head * current_length + key_position -
                                past_length) * key_dim + dimension];
-                    score += query.ptr<float>()[
+                    score += query_data[
                                  (head * query_length + position) * key_dim +
                                  dimension] * key_value;
                 }
@@ -432,7 +482,7 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
                         ? initial_value[
                               (key_head * capacity + key_position) *
                                   value_dim + dimension]
-                        : value.ptr<float>()[
+                        : value_data[
                               (key_head * current_length + key_position -
                                past_length) * value_dim + dimension];
                     expected[(head * query_length + position) * value_dim +
@@ -441,9 +491,8 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
             }
         }
     }
-    actual.resize(expected.size());
-    std::memcpy(actual.data(), attention_output.data,
-                attention_output.nbytes());
+    if (!download(backend, attention_output, actual))
+        return false;
     if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
         return false;
     for (int head = 0; head < kv_heads; ++head)
@@ -451,11 +500,167 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend) {
             for (int dimension = 0; dimension < key_dim; ++dimension)
                 if (std::fabs(cached_key[
                         (head * capacity + past_length + position) * key_dim +
-                        dimension] - key.ptr<float>()[
+                        dimension] - key_data[
                             (head * current_length + position) * key_dim +
                             dimension]) > 1e-6f)
                     return false;
     return true;
+}
+
+bool test_memory_and_fallback_bridge(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    Tensor storage = device_tensor(backend, 6, 2);
+    std::vector<float> source(12);
+    for (int i = 0; i < 12; ++i)
+        source[i] = static_cast<float>(i + 1);
+    if (!upload(backend, storage, source))
+        return false;
+
+    Tensor view = storage;
+    view.device_offset += 2 * sizeof(float);
+    view.shape[0] = 2;
+    const size_t span = view.view_span_bytes();
+    std::vector<float> raw_span(span / sizeof(float));
+    if (!backend.copy_to_host(view, raw_span.data(), span) ||
+        raw_span.front() != 3.0f || raw_span[1] != 4.0f ||
+        raw_span[6] != 9.0f || raw_span[7] != 10.0f)
+        return false;
+    float second_row[2] = {};
+    if (!backend.copy_to_host(
+            view, second_row, sizeof(second_row), 6 * sizeof(float)) ||
+        second_row[0] != 9.0f || second_row[1] != 10.0f)
+        return false;
+
+    std::vector<float> replacement(raw_span.size(), -3.0f);
+    replacement[0] = 21.0f;
+    replacement[1] = 22.0f;
+    replacement[6] = 23.0f;
+    replacement[7] = 24.0f;
+    if (!backend.copy_from_host(replacement.data(), view, span) ||
+        !download(backend, storage, source) ||
+        source[2] != 21.0f || source[3] != 22.0f ||
+        source[8] != 23.0f || source[9] != 24.0f)
+        return false;
+
+    Tensor layer_output = device_tensor(backend, 2, 2);
+    std::vector<float> scale_data = {1.5f, 0.75f};
+    std::vector<float> bias_data = {0.25f, -0.5f};
+    Tensor scale = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
+        scale_data.data());
+    Tensor bias = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
+        bias_data.data());
+    GraphNode layer_norm;
+    layer_norm.op_type = OpType::LAYER_NORM;
+    layer_norm.params.f32 = {1e-5f};
+    backend.dispatch(layer_norm, {&view, &scale, &bias}, &layer_output, nullptr);
+    std::vector<float> layer_actual;
+    if (backend.dispatch_failed() ||
+        !download(backend, layer_output, layer_actual))
+        return false;
+    std::vector<float> layer_expected(4);
+    for (int row = 0; row < 2; ++row) {
+        const float x0 = row == 0 ? 21.0f : 23.0f;
+        const float x1 = row == 0 ? 22.0f : 24.0f;
+        const float mean = (x0 + x1) * 0.5f;
+        const float inv = 1.0f /
+            std::sqrt(((x0 - mean) * (x0 - mean) +
+                       (x1 - mean) * (x1 - mean)) * 0.5f + 1e-5f);
+        layer_expected[row * 2] = (x0 - mean) * inv * scale_data[0] +
+            bias_data[0];
+        layer_expected[row * 2 + 1] =
+            (x1 - mean) * inv * scale_data[1] + bias_data[1];
+    }
+    if (!close_enough(layer_actual, layer_expected, 2e-5f))
+        return false;
+
+    Tensor update = device_tensor(backend, 2, 2);
+    Tensor add_norm_output = device_tensor(backend, 2, 2);
+    std::vector<float> update_data = {1.0f, -2.0f, 3.0f, -4.0f};
+    if (!upload(backend, update, update_data))
+        return false;
+    GraphNode add_norm;
+    add_norm.op_type = OpType::ADD_RMS_NORM;
+    add_norm.params.f32 = {1e-6f};
+    backend.dispatch(add_norm, {&view, &update, &scale},
+                     &add_norm_output, nullptr);
+    if (backend.dispatch_failed() ||
+        !download(backend, storage, source) ||
+        source[2] != 22.0f || source[3] != 20.0f ||
+        source[8] != 26.0f || source[9] != 20.0f)
+        return false;
+
+    Tensor rounded = device_tensor(backend, 4);
+    std::vector<float> round_source = {
+        1.001f, -2.003f, INFINITY, std::nanf("")};
+    if (!upload(backend, rounded, round_source) ||
+        !backend.round_to_bf16(rounded))
+        return false;
+    std::vector<float> round_actual;
+    if (!download(backend, rounded, round_actual))
+        return false;
+    for (size_t i = 0; i < 3; ++i) {
+        uint32_t bits = 0;
+        std::memcpy(&bits, &round_source[i], sizeof(bits));
+        if ((bits & 0x7f800000u) != 0x7f800000u)
+            bits += 0x7fffu + ((bits >> 16) & 1u);
+        bits &= 0xffff0000u;
+        uint32_t actual_bits = 0;
+        std::memcpy(&actual_bits, &round_actual[i], sizeof(actual_bits));
+        if (actual_bits != bits)
+            return false;
+    }
+
+    Tensor full = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 16);
+    Tensor mirrored = full;
+    Tensor device_only = full;
+    backend.alloc_persistent(
+        full, full.nbytes(), PersistentHostAccess::FULL);
+    backend.alloc_persistent(
+        mirrored, mirrored.nbytes(),
+        PersistentHostAccess::MIRRORED_PREFIX, 16);
+    backend.alloc_persistent(
+        device_only, device_only.nbytes(), PersistentHostAccess::NONE);
+    if (!full.data || full.data != full.device_data ||
+        !mirrored.data || mirrored.data == mirrored.device_data ||
+        !device_only.data || device_only.data != device_only.device_data)
+        return false;
+    const uint32_t prefix[4] = {7, 8, 9, 10};
+    if (!backend.copy_from_host(prefix, mirrored, sizeof(prefix)) ||
+        std::memcmp(mirrored.data, prefix, sizeof(prefix)) != 0 ||
+        !backend.zero_tensor(mirrored, sizeof(uint32_t), sizeof(uint32_t)) ||
+        static_cast<const uint32_t*>(mirrored.data)[1] != 0)
+        return false;
+    const float payload[2] = {31.0f, 32.0f};
+    float payload_copy[2] = {};
+    if (!backend.copy_from_host(
+            payload, device_only, sizeof(payload), 4 * sizeof(float)) ||
+        !backend.copy_to_host(
+            device_only, payload_copy, sizeof(payload_copy),
+            4 * sizeof(float)) ||
+        payload_copy[0] != payload[0] || payload_copy[1] != payload[1])
+        return false;
+
+    Tensor pooled_a = device_tensor(backend, 64);
+    void* pooled_pointer = pooled_a.device_data;
+    backend.free_output(pooled_a, nullptr);
+    Tensor pooled_b = device_tensor(backend, 32);
+    if (pooled_b.device_data != pooled_pointer)
+        return false;
+
+    backend.clear_dispatch_error();
+    if (!backend.set_operator_fallback_policy(
+            OperatorFallbackPolicy::REQUIRE_NATIVE))
+        return false;
+    backend.dispatch(layer_norm, {&view, &scale, &bias},
+                     &layer_output, nullptr);
+    const bool rejected_before_staging = backend.dispatch_failed();
+    backend.set_operator_fallback_policy(
+        OperatorFallbackPolicy::ALLOW_REFERENCE);
+    backend.clear_dispatch_error();
+    return rejected_before_staging;
 }
 
 }  // namespace
@@ -496,6 +701,8 @@ int main() {
                                   m, n, k))
         return 1;
     if (!test_layout_rope_and_sdpa(backend))
+        return 1;
+    if (!test_memory_and_fallback_bridge(backend))
         return 1;
 
     constexpr int int8_group_size = 16;
