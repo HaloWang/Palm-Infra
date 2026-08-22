@@ -738,10 +738,10 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     Tensor layer_output = device_tensor(backend, 2, 2);
     std::vector<float> scale_data = {-91.0f, 83.0f, 1.5f, 0.75f};
     std::vector<float> bias_data = {0.25f, -0.5f};
-    Tensor scale = Tensor::create(
-        Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
+    Tensor scale_storage = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, 4, 1, 1, 1,
         scale_data.data());
-    scale.device_offset = 2 * sizeof(float);
+    Tensor scale = scale_storage.view_1d(2, 2 * sizeof(float));
     Tensor bias = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
         bias_data.data());
@@ -894,6 +894,35 @@ int main() {
         !test_device_resident_ops(backend, fp16, activation, expected,
                                   m, n, k))
         return 1;
+    {
+        constexpr int sliced_n = n / 2;
+        Tensor sliced_weight = fp16.view_2d(
+            sliced_n, k,
+            static_cast<size_t>(sliced_n) * k *
+                sizeof(mollm::cpu::fp16_t));
+        Tensor sliced_input = device_tensor(backend, k, m);
+        Tensor sliced_output = device_tensor(backend, sliced_n, m);
+        std::vector<float> sliced_reference_weight(
+            weight_f32.begin() + static_cast<size_t>(sliced_n) * k,
+            weight_f32.end());
+        std::vector<float> sliced_expected(
+            static_cast<size_t>(m) * sliced_n);
+        std::vector<float> sliced_actual;
+        reference(activation, sliced_reference_weight, sliced_expected,
+                  m, sliced_n, k);
+        GraphNode sliced_matmul;
+        sliced_matmul.op_type = OpType::MATMUL;
+        backend.clear_dispatch_error();
+        if (!upload(backend, sliced_input, activation))
+            return 1;
+        backend.dispatch(
+            sliced_matmul, {&sliced_input, &sliced_weight},
+            &sliced_output, nullptr);
+        if (backend.dispatch_failed() ||
+            !download(backend, sliced_output, sliced_actual) ||
+            !close_enough(sliced_actual, sliced_expected, 3e-3f))
+            return 1;
+    }
     if (backend.kv_cache_precision(Precision::FP16) != Precision::FP16 ||
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||

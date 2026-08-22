@@ -1023,10 +1023,16 @@ void CudaBackend::dispatch(const GraphNode& node,
         }
     }
 
+    const DeviceWeight* matmul_weight =
+        inputs.size() >= 2 && inputs[1] ? impl_->find_weight(*inputs[1])
+                                        : nullptr;
     if (node.op_type == OpType::MATMUL && inputs.size() >= 2 && inputs[0] &&
         inputs[1] && output && inputs[0]->prec == Precision::FP32 &&
         output->prec == Precision::FP32 &&
-        impl_->find_weight(*inputs[1])) {
+        matmul_weight &&
+        matmul_weight->n == inputs[1]->shape[0] &&
+        matmul_weight->k == inputs[0]->shape[0] &&
+        inputs[1]->device_offset == 0) {
         const Tensor& a = *inputs[0];
         const Tensor& weight = *inputs[1];
         const int m = static_cast<int>(a.shape[1]);
@@ -1335,9 +1341,6 @@ void CudaBackend::dispatch(const GraphNode& node,
                 op_type_name(node.op_type));
             impl_->failed = true;
             return;
-        } else if (host.data && host.device_offset != 0) {
-            host.data = static_cast<uint8_t*>(host.data) +
-                host.device_offset;
         }
         host.device_data = nullptr;
         host.device_offset = 0;
