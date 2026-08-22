@@ -569,6 +569,103 @@ int main() {
     if (!dispatch_matmul(backend, q4, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 8e-3f))
         return 1;
+    reference(activation, q4_weight, decode_expected, 1, n, k);
+    if (!dispatch_matmul(
+            backend, q4, activation, decode_actual, 1, n, k) ||
+        !close_enough(decode_actual, decode_expected, 8e-3f))
+        return 1;
+
+    constexpr int padded_n = n - 1;
+    Q4B8G32Block padded_block = block;
+    Tensor padded_q4 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, padded_n, k, 1, 1,
+        &padded_block);
+    padded_q4.rowmajor_data = &padded_block;
+    padded_q4.q4_g32_data = &padded_block;
+    padded_q4.is_q4_g32_packed = true;
+    padded_q4.group_size = 32;
+    padded_q4.groups_per_row = 1;
+    backend.wrap_weight_int4(padded_q4);
+    std::vector<float> padded_q4_weight(
+        q4_weight.begin(), q4_weight.begin() + padded_n * k);
+    std::vector<float> padded_actual(static_cast<size_t>(m) * padded_n);
+    std::vector<float> padded_expected(padded_actual.size());
+    reference(
+        activation, padded_q4_weight, padded_expected, m, padded_n, k);
+    if (!dispatch_matmul(
+            backend, padded_q4, activation, padded_actual, m, padded_n, k) ||
+        !close_enough(padded_actual, padded_expected, 8e-3f))
+        return 1;
+    padded_actual.resize(padded_n);
+    padded_expected.resize(padded_n);
+    reference(
+        activation, padded_q4_weight, padded_expected, 1, padded_n, k);
+    if (!dispatch_matmul(
+            backend, padded_q4, activation, padded_actual, 1, padded_n, k) ||
+        !close_enough(padded_actual, padded_expected, 8e-3f))
+        return 1;
+    Tensor invalid_q4 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, n, k, 1, 1, &block);
+    invalid_q4.q4_g32_data = &block;
+    invalid_q4.is_q4_g32_packed = true;
+    invalid_q4.group_size = 16;
+    invalid_q4.groups_per_row = 2;
+    backend.wrap_weight_int4(invalid_q4);
+    if (invalid_q4.device_data)
+        return 1;
+
+    constexpr int k64 = 64;
+    constexpr int groups32 = k64 / 32;
+    std::vector<float> activation64(static_cast<size_t>(m) * k64);
+    for (size_t i = 0; i < activation64.size(); ++i)
+        activation64[i] =
+            static_cast<float>(static_cast<int>(i % 19) - 9) / 23.0f;
+    std::vector<Q4B8G32Block> blocks32(groups32);
+    std::vector<float> q4_weight64(static_cast<size_t>(n) * k64);
+    for (int group = 0; group < groups32; ++group) {
+        auto& packed_block = blocks32[group];
+        for (int row = 0; row < n; ++row) {
+            packed_block.scales[row] =
+                0.03125f + 0.002f * (row + group);
+            for (int inner = 0; inner < 32; inner += 2) {
+                const int low = (row + group * 5 + inner) % 16 - 8;
+                const int high =
+                    (row + group * 5 + inner + 1) % 16 - 8;
+                packed_block.q[row][inner / 2] =
+                    static_cast<uint8_t>(
+                        (low & 0xf) | ((high & 0xf) << 4));
+                q4_weight64[static_cast<size_t>(row) * k64 +
+                            group * 32 + inner] =
+                    low * packed_block.scales[row];
+                q4_weight64[static_cast<size_t>(row) * k64 +
+                            group * 32 + inner + 1] =
+                    high * packed_block.scales[row];
+            }
+        }
+    }
+    Tensor q4_multi = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, n, k64, 1, 1,
+        blocks32.data());
+    q4_multi.rowmajor_data = blocks32.data();
+    q4_multi.q4_g32_data = blocks32.data();
+    q4_multi.is_q4_g32_packed = true;
+    q4_multi.group_size = 32;
+    q4_multi.groups_per_row = groups32;
+    backend.wrap_weight_int4(q4_multi);
+    std::memset(
+        blocks32.data(), 0, blocks32.size() * sizeof(Q4B8G32Block));
+    actual.resize(static_cast<size_t>(m) * n);
+    expected.resize(actual.size());
+    reference(activation64, q4_weight64, expected, m, n, k64);
+    if (!dispatch_matmul(
+            backend, q4_multi, activation64, actual, m, n, k64) ||
+        !close_enough(actual, expected, 8e-3f))
+        return 1;
+    reference(activation64, q4_weight64, decode_expected, 1, n, k64);
+    if (!dispatch_matmul(
+            backend, q4_multi, activation64, decode_actual, 1, n, k64) ||
+        !close_enough(decode_actual, decode_expected, 8e-3f))
+        return 1;
 
     constexpr int k128 = 128;
     std::vector<float> activation128(static_cast<size_t>(m) * k128);
@@ -605,6 +702,100 @@ int main() {
     if (!dispatch_matmul(backend, q4_128, activation128, actual,
                          m, n, k128) ||
         !close_enough(actual, expected, 1.5e-2f))
+        return 1;
+    reference(
+        std::vector<float>(activation128.begin(),
+                           activation128.begin() + k128),
+        q4_weight128, decode_expected, 1, n, k128);
+    if (!dispatch_matmul(
+            backend, q4_128, activation128, decode_actual, 1, n, k128) ||
+        !close_enough(decode_actual, decode_expected, 1.5e-2f))
+        return 1;
+
+    Q4B8G128Block padded_block128 = block128;
+    Tensor padded_q4_128 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, padded_n, k128, 1, 1,
+        &padded_block128);
+    padded_q4_128.rowmajor_data = &padded_block128;
+    padded_q4_128.q4_g128_data = &padded_block128;
+    padded_q4_128.is_q4_g128_packed = true;
+    padded_q4_128.group_size = 128;
+    padded_q4_128.groups_per_row = 1;
+    backend.wrap_weight_int4(padded_q4_128);
+    std::vector<float> padded_q4_weight128(
+        q4_weight128.begin(), q4_weight128.begin() + padded_n * k128);
+    padded_actual.resize(static_cast<size_t>(m) * padded_n);
+    padded_expected.resize(padded_actual.size());
+    reference(
+        activation128, padded_q4_weight128, padded_expected,
+        m, padded_n, k128);
+    if (!dispatch_matmul(
+            backend, padded_q4_128, activation128, padded_actual,
+            m, padded_n, k128) ||
+        !close_enough(padded_actual, padded_expected, 1.5e-2f))
+        return 1;
+    padded_actual.resize(padded_n);
+    padded_expected.resize(padded_n);
+    reference(
+        activation128, padded_q4_weight128, padded_expected,
+        1, padded_n, k128);
+    if (!dispatch_matmul(
+            backend, padded_q4_128, activation128, padded_actual,
+            1, padded_n, k128) ||
+        !close_enough(padded_actual, padded_expected, 1.5e-2f))
+        return 1;
+
+    constexpr int k256 = 256;
+    constexpr int groups128 = k256 / 128;
+    std::vector<float> activation256(static_cast<size_t>(m) * k256);
+    for (size_t i = 0; i < activation256.size(); ++i)
+        activation256[i] =
+            static_cast<float>(static_cast<int>(i % 23) - 11) / 29.0f;
+    std::vector<Q4B8G128Block> blocks128(groups128);
+    std::vector<float> q4_weight256(static_cast<size_t>(n) * k256);
+    for (int group = 0; group < groups128; ++group) {
+        auto& packed_block = blocks128[group];
+        for (int row = 0; row < n; ++row) {
+            packed_block.scales[row] =
+                0.015625f + 0.001f * (row + group);
+            for (int inner = 0; inner < 128; inner += 2) {
+                const int low = (row + group * 7 + inner) % 16 - 8;
+                const int high =
+                    (row + group * 7 + inner + 1) % 16 - 8;
+                const int subgroup = inner / 32;
+                const int subgroup_inner = inner % 32;
+                packed_block.q[subgroup][row][subgroup_inner / 2] =
+                    static_cast<uint8_t>(
+                        (low & 0xf) | ((high & 0xf) << 4));
+                q4_weight256[static_cast<size_t>(row) * k256 +
+                             group * 128 + inner] =
+                    low * packed_block.scales[row];
+                q4_weight256[static_cast<size_t>(row) * k256 +
+                             group * 128 + inner + 1] =
+                    high * packed_block.scales[row];
+            }
+        }
+    }
+    Tensor q4_multi128 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL, n, k256, 1, 1,
+        blocks128.data());
+    q4_multi128.rowmajor_data = blocks128.data();
+    q4_multi128.q4_g128_data = blocks128.data();
+    q4_multi128.is_q4_g128_packed = true;
+    q4_multi128.group_size = 128;
+    q4_multi128.groups_per_row = groups128;
+    backend.wrap_weight_int4(q4_multi128);
+    std::memset(
+        blocks128.data(), 0, blocks128.size() * sizeof(Q4B8G128Block));
+    reference(activation256, q4_weight256, expected, m, n, k256);
+    if (!dispatch_matmul(
+            backend, q4_multi128, activation256, actual, m, n, k256) ||
+        !close_enough(actual, expected, 1.5e-2f))
+        return 1;
+    reference(activation256, q4_weight256, decode_expected, 1, n, k256);
+    if (!dispatch_matmul(
+            backend, q4_multi128, activation256, decode_actual, 1, n, k256) ||
+        !close_enough(decode_actual, decode_expected, 1.5e-2f))
         return 1;
 
     std::printf("CUDA device-resident ops, fallback views, FP16, W8, W4G32 "

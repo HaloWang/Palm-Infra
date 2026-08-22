@@ -342,9 +342,9 @@ The CUDA backend is still a correctness-first implementation. Graph outputs
 and persistent state use device-addressable managed storage, FP16/FP32 linear
 layers run through cuBLAS. W8 weights remain quantized on device: decode uses
 a native GEMV kernel, while prefill dequantizes one matrix at a time into
-reusable FP16 scratch before cuBLAS. Package-native W4G32/W4G128 weights are
-currently dequantized to FP16 device weights at load time. RMSNorm and fused
-norm paths,
+reusable FP16 scratch before cuBLAS. Package-native W4G32/W4G128 weights use
+the same policy with packed decode kernels and reusable prefill scratch.
+RMSNorm and fused norm paths,
 dense elementwise operations, common activations, SwiGLU, RoPE, strided layout
 materialization, FP32 cached SDPA, zero-copy views, and the decode lm_head also
 stay on CUDA. Operators not yet implemented natively synchronize and use the

@@ -7,6 +7,8 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#include "kernels/quant_layouts.h"
+
 namespace mollm_cuda {
 
 bool report_cuda(cudaError_t error, const char* operation);
@@ -25,6 +27,18 @@ void launch_q8_dense_gemv(
     const float* activation, const int8_t* weight, const float* scales,
     int group_size, int groups_per_row, float* output, int columns,
     int inner);
+void launch_dequantize_q4_g32_dense_weight(
+    const Q4B8G32Block* weight, __half2* output, size_t packed_count,
+    int rows, int groups);
+void launch_dequantize_q4_g128_dense_weight(
+    const Q4B8G128Block* weight, __half2* output, size_t packed_count,
+    int rows, int groups);
+void launch_q4_g32_dense_gemv(
+    const float* activation, const Q4B8G32Block* weight, float* output,
+    int columns, int inner);
+void launch_q4_g128_dense_gemv(
+    const float* activation, const Q4B8G128Block* weight, float* output,
+    int columns, int inner);
 bool run_dense_matmul(
     cublasHandle_t cublas, const void* weight, cudaDataType weight_type,
     const void* activation, cudaDataType activation_type, float* output,
