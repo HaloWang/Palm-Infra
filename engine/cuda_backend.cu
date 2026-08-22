@@ -1298,6 +1298,9 @@ void CudaBackend::dispatch(const GraphNode& node,
                 return;
             }
             host.data = destination;
+        } else if (device_weight && host.data && host.device_offset != 0) {
+            host.data = static_cast<uint8_t*>(host.data) +
+                host.device_offset;
         } else if (device_weight && !host.data) {
             std::fprintf(
                 stderr, "CudaBackend: %s fallback lacks host weight storage\n",
