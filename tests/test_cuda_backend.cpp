@@ -1,5 +1,6 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
+#include "graph/execute.h"
 #include "kernels/quant_layouts.h"
 
 #include <algorithm>
@@ -896,13 +897,42 @@ int main() {
         return 1;
     {
         constexpr int sliced_n = n / 2;
-        Tensor sliced_weight;
+        Graph graph;
+        GraphNode input_node;
+        input_node.id = 0;
+        input_node.op_type = OpType::INPUT;
+        input_node.out_shape[0] = k;
+        input_node.out_shape[1] = m;
+        input_node.out_prec = Precision::FP32;
+        GraphNode weight_node;
+        weight_node.id = 1;
+        weight_node.op_type = OpType::CONSTANT;
+        weight_node.out_shape[0] = n;
+        weight_node.out_shape[1] = k;
+        weight_node.out_prec = Precision::FP16;
         GraphNode slice_weight;
+        slice_weight.id = 2;
         slice_weight.op_type = OpType::SLICE;
+        slice_weight.inputs = {1};
+        slice_weight.out_shape[0] = sliced_n;
+        slice_weight.out_shape[1] = k;
+        slice_weight.out_prec = Precision::FP16;
         slice_weight.params.i32 = {0, sliced_n, sliced_n};
-        backend.dispatch(slice_weight, {&fp16}, &sliced_weight, nullptr);
+        GraphNode sliced_matmul;
+        sliced_matmul.id = 3;
+        sliced_matmul.op_type = OpType::MATMUL;
+        sliced_matmul.inputs = {0, 2};
+        sliced_matmul.out_shape[0] = sliced_n;
+        sliced_matmul.out_shape[1] = m;
+        sliced_matmul.out_prec = Precision::FP32;
+        graph.nodes = {
+            input_node, weight_node, slice_weight, sliced_matmul};
+        graph.graph_inputs = {0};
+        graph.graph_outputs = {3};
+        graph.runtime.tensors.resize(4);
         Tensor sliced_input = device_tensor(backend, k, m);
-        Tensor sliced_output = device_tensor(backend, sliced_n, m);
+        graph.runtime.tensors[0] = sliced_input;
+        graph.runtime.tensors[1] = fp16;
         const size_t sliced_weight_offset =
             static_cast<size_t>(sliced_n) * fp16.stride[0] /
             sizeof(mollm::cpu::fp16_t);
@@ -915,16 +945,20 @@ int main() {
         std::vector<float> sliced_actual;
         reference(activation, sliced_reference_weight, sliced_expected,
                   m, sliced_n, k);
-        GraphNode sliced_matmul;
-        sliced_matmul.op_type = OpType::MATMUL;
         backend.clear_dispatch_error();
         if (!upload(backend, sliced_input, activation))
             return 1;
-        backend.dispatch(
-            sliced_matmul, {&sliced_input, &sliced_weight},
-            &sliced_output, nullptr);
+        graph.runtime.tensors[0] = sliced_input;
+        BufferPool pool;
+        ExecContext context;
+        context.graph = &graph;
+        context.pool = &pool;
+        context.backend = &backend;
+        prepare_execution(context);
+        execute_graph(context);
         if (backend.dispatch_failed() ||
-            !download(backend, sliced_output, sliced_actual) ||
+            context.execution_failed ||
+            !download(backend, graph.runtime.tensors[3], sliced_actual) ||
             !close_enough(sliced_actual, sliced_expected, 3e-3f))
             return 1;
     }
