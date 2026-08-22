@@ -54,10 +54,26 @@ __global__ void rope_cuda(
         ? x0 * c - x1 * s : x0 * s + x1 * c;
 }
 
+__device__ float load_kv_cache_value(
+    const void* cache, size_t index, bool fp16_cache) {
+    return fp16_cache
+        ? __half2float(static_cast<const __half*>(cache)[index])
+        : static_cast<const float*>(cache)[index];
+}
+
+__device__ void store_kv_cache_value(
+    void* cache, size_t index, float value, bool fp16_cache) {
+    if (fp16_cache)
+        static_cast<__half*>(cache)[index] = __float2half_rn(value);
+    else
+        static_cast<float*>(cache)[index] = value;
+}
+
 __global__ void append_kv_cuda(
-    const float* key, const float* value, float* key_cache,
-    float* value_cache, int num_kv_heads, int current_length,
-    int past_length, int max_length, int key_dim, int value_dim,
+    const float* key, const float* value, void* key_cache,
+    void* value_cache, bool fp16_cache, int num_kv_heads,
+    int current_length, int past_length, int max_length,
+    int key_dim, int value_dim,
     size_t key_position_stride, size_t key_head_stride,
     size_t value_position_stride, size_t value_head_stride) {
     const int maximum_dim = max(key_dim, value_dim);
@@ -73,26 +89,34 @@ __global__ void append_kv_cuda(
     const int position = static_cast<int>(remaining % current_length);
     const int head = static_cast<int>(remaining / current_length);
     if (dimension < key_dim) {
-        key_cache[(static_cast<size_t>(head) * max_length + past_length +
-                   position) * key_dim + dimension] =
+        const size_t destination =
+            (static_cast<size_t>(head) * max_length + past_length +
+             position) * key_dim + dimension;
+        store_kv_cache_value(
+            key_cache, destination,
             key[static_cast<size_t>(head) * key_head_stride +
                 static_cast<size_t>(position) * key_position_stride +
-                dimension];
+                dimension],
+            fp16_cache);
     }
     if (dimension < value_dim) {
-        value_cache[(static_cast<size_t>(head) * max_length + past_length +
-                     position) * value_dim + dimension] =
+        const size_t destination =
+            (static_cast<size_t>(head) * max_length + past_length +
+             position) * value_dim + dimension;
+        store_kv_cache_value(
+            value_cache, destination,
             value[static_cast<size_t>(head) * value_head_stride +
                   static_cast<size_t>(position) * value_position_stride +
-                  dimension];
+                  dimension],
+            fp16_cache);
     }
 }
 
 __global__ void sdpa_scores_cuda(
-    const float* query, const float* key, float* scores,
+    const float* query, const void* key, float* scores,
     const float* mask, int num_heads, int num_kv_heads,
     int query_length, int key_length, int past_length, int key_dim,
-    int key_capacity, bool cached, bool causal, float scale,
+    int key_capacity, bool cached, bool fp16_cache, bool causal, float scale,
     size_t query_feature_stride, size_t query_position_stride,
     size_t query_head_stride, size_t key_feature_stride,
     size_t key_position_stride, size_t key_head_stride,
@@ -112,16 +136,24 @@ __global__ void sdpa_scores_cuda(
     const float* query_row = query +
         static_cast<size_t>(head) * query_head_stride +
         static_cast<size_t>(query_position) * query_position_stride;
-    const float* key_row = cached
-        ? key + (static_cast<size_t>(key_head) * key_capacity +
-                 key_position) * key_dim
-        : key + static_cast<size_t>(key_head) * key_head_stride +
-            static_cast<size_t>(key_position) * key_position_stride;
+    const size_t cached_key_base =
+        (static_cast<size_t>(key_head) * key_capacity + key_position) *
+        key_dim;
+    const auto* current_key = static_cast<const float*>(key);
+    const size_t current_key_base =
+        static_cast<size_t>(key_head) * key_head_stride +
+        static_cast<size_t>(key_position) * key_position_stride;
     float dot = 0.0f;
-    for (int dimension = 0; dimension < key_dim; ++dimension)
+    for (int dimension = 0; dimension < key_dim; ++dimension) {
+        const float key_value = cached
+            ? load_kv_cache_value(
+                  key, cached_key_base + dimension, fp16_cache)
+            : current_key[current_key_base +
+                          static_cast<size_t>(dimension) *
+                              key_feature_stride];
         dot += query_row[static_cast<size_t>(dimension) *
-                         query_feature_stride] *
-            key_row[static_cast<size_t>(dimension) * key_feature_stride];
+                         query_feature_stride] * key_value;
+    }
     float score = dot * scale;
     if (mask) {
         score += mask[static_cast<size_t>(query_position) * mask_row_stride +
@@ -134,9 +166,9 @@ __global__ void sdpa_scores_cuda(
 }
 
 __global__ void sdpa_output_cuda(
-    const float* scores, const float* value, float* output,
+    const float* scores, const void* value, float* output,
     int num_heads, int num_kv_heads, int query_length, int key_length,
-    int value_dim, int value_capacity, bool cached,
+    int value_dim, int value_capacity, bool cached, bool fp16_cache,
     size_t value_feature_stride, size_t value_position_stride,
     size_t value_head_stride, size_t output_feature_stride,
     size_t output_position_stride, size_t output_head_stride) {
@@ -180,14 +212,18 @@ __global__ void sdpa_output_cuda(
         for (int position = 0; position < key_length; ++position) {
             const float probability =
                 expf(score_row[position] - maximum) * inverse_sum;
-            const float* value_row = cached
-                ? value + (static_cast<size_t>(key_head) * value_capacity +
-                           position) * value_dim
-                : value + static_cast<size_t>(key_head) * value_head_stride +
-                    static_cast<size_t>(position) * value_position_stride;
-            result += probability *
-                value_row[static_cast<size_t>(dimension) *
-                          value_feature_stride];
+            const size_t cached_index =
+                (static_cast<size_t>(key_head) * value_capacity + position) *
+                    value_dim + dimension;
+            const auto* current_value = static_cast<const float*>(value);
+            const size_t current_index =
+                static_cast<size_t>(key_head) * value_head_stride +
+                static_cast<size_t>(position) * value_position_stride +
+                static_cast<size_t>(dimension) * value_feature_stride;
+            const float value_element = cached
+                ? load_kv_cache_value(value, cached_index, fp16_cache)
+                : current_value[current_index];
+            result += probability * value_element;
         }
         output[static_cast<size_t>(head) * output_head_stride +
                static_cast<size_t>(query_position) *
@@ -218,9 +254,10 @@ void launch_rope(
 }
 
 void launch_append_kv(
-    const float* key, const float* value, float* key_cache,
-    float* value_cache, int num_kv_heads, int current_length, int past_length,
-    int max_length, int key_dim, int value_dim, size_t key_position_stride,
+    const float* key, const float* value, void* key_cache,
+    void* value_cache, bool fp16_cache, int num_kv_heads,
+    int current_length, int past_length, int max_length,
+    int key_dim, int value_dim, size_t key_position_stride,
     size_t key_head_stride, size_t value_position_stride,
     size_t value_head_stride) {
     constexpr int threads = 256;
@@ -229,16 +266,18 @@ void launch_append_kv(
         maximum_dim;
     append_kv_cuda<<<static_cast<unsigned>((count + threads - 1) / threads),
                      threads>>>(
-        key, value, key_cache, value_cache, num_kv_heads, current_length,
-        past_length, max_length, key_dim, value_dim, key_position_stride,
-        key_head_stride, value_position_stride, value_head_stride);
+        key, value, key_cache, value_cache, fp16_cache, num_kv_heads,
+        current_length, past_length, max_length, key_dim, value_dim,
+        key_position_stride, key_head_stride, value_position_stride,
+        value_head_stride);
 }
 
 void launch_sdpa_scores(
-    const float* query, const float* key, float* scores, const float* mask,
+    const float* query, const void* key, float* scores, const float* mask,
     int num_heads, int num_kv_heads, int query_length, int key_length,
-    int past_length, int key_dim, int key_capacity, bool cached, bool causal,
-    float scale, size_t query_feature_stride, size_t query_position_stride,
+    int past_length, int key_dim, int key_capacity, bool cached,
+    bool fp16_cache, bool causal, float scale,
+    size_t query_feature_stride, size_t query_position_stride,
     size_t query_head_stride, size_t key_feature_stride,
     size_t key_position_stride, size_t key_head_stride,
     size_t mask_column_stride, size_t mask_row_stride) {
@@ -248,25 +287,26 @@ void launch_sdpa_scores(
     sdpa_scores_cuda<<<static_cast<unsigned>((count + threads - 1) / threads),
                        threads>>>(
         query, key, scores, mask, num_heads, num_kv_heads, query_length,
-        key_length, past_length, key_dim, key_capacity, cached, causal, scale,
-        query_feature_stride, query_position_stride, query_head_stride,
-        key_feature_stride, key_position_stride, key_head_stride,
-        mask_column_stride, mask_row_stride);
+        key_length, past_length, key_dim, key_capacity, cached, fp16_cache,
+        causal, scale, query_feature_stride, query_position_stride,
+        query_head_stride, key_feature_stride, key_position_stride,
+        key_head_stride, mask_column_stride, mask_row_stride);
 }
 
 void launch_sdpa_output(
-    const float* scores, const float* value, float* output, int num_heads,
+    const float* scores, const void* value, float* output, int num_heads,
     int num_kv_heads, int query_length, int key_length, int value_dim,
-    int value_capacity, bool cached, size_t value_feature_stride,
-    size_t value_position_stride, size_t value_head_stride,
+    int value_capacity, bool cached, bool fp16_cache,
+    size_t value_feature_stride, size_t value_position_stride,
+    size_t value_head_stride,
     size_t output_feature_stride, size_t output_position_stride,
     size_t output_head_stride) {
     constexpr int threads = 256;
     sdpa_output_cuda<<<num_heads * query_length, threads>>>(
         scores, value, output, num_heads, num_kv_heads, query_length,
-        key_length, value_dim, value_capacity, cached, value_feature_stride,
-        value_position_stride, value_head_stride, output_feature_stride,
-        output_position_stride, output_head_stride);
+        key_length, value_dim, value_capacity, cached, fp16_cache,
+        value_feature_stride, value_position_stride, value_head_stride,
+        output_feature_stride, output_position_stride, output_head_stride);
 }
 
 }  // namespace mollm_cuda

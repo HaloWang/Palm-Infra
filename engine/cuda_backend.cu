@@ -887,33 +887,54 @@ void CudaBackend::dispatch(const GraphNode& node,
         int past_length = 0;
         int key_capacity = current_length;
         bool cached = false;
-        const float* key_data = device_pointer_const<float>(current_key);
-        const float* value_data = device_pointer_const<float>(current_value);
-        float* key_cache_data = nullptr;
-        float* value_cache_data = nullptr;
+        const float* current_key_data =
+            device_pointer_const<float>(current_key);
+        const float* current_value_data =
+            device_pointer_const<float>(current_value);
+        const void* key_data = current_key_data;
+        const void* value_data = current_value_data;
+        void* key_cache_data = nullptr;
+        void* value_cache_data = nullptr;
+        bool fp16_cache = false;
         if (cache_mode == 2 && key_cache && value_cache &&
-            key_cache->prec == Precision::FP32 &&
-            value_cache->prec == Precision::FP32 &&
+            key_cache->prec == value_cache->prec &&
+            (key_cache->prec == Precision::FP16 ||
+             key_cache->prec == Precision::FP32) &&
             key_cache->device_data && value_cache->device_data) {
-            const auto* metadata = cache_meta(
+            const auto* key_metadata = cache_meta(
                 static_cast<const uint8_t*>(key_cache->data) +
                 key_cache->device_offset);
-            past_length = static_cast<int>(metadata->current_seq_len);
-            key_capacity = static_cast<int>(metadata->max_seq_len);
-            key_cache_data = reinterpret_cast<float*>(
+            const auto* value_metadata = cache_meta(
+                static_cast<const uint8_t*>(value_cache->data) +
+                value_cache->device_offset);
+            past_length = static_cast<int>(key_metadata->current_seq_len);
+            key_capacity = static_cast<int>(key_metadata->max_seq_len);
+            key_cache_data =
                 static_cast<uint8_t*>(key_cache->device_data) +
-                key_cache->device_offset + CacheMetadata::SIZE);
-            value_cache_data = reinterpret_cast<float*>(
+                key_cache->device_offset + CacheMetadata::SIZE;
+            value_cache_data =
                 static_cast<uint8_t*>(value_cache->device_data) +
-                value_cache->device_offset + CacheMetadata::SIZE);
-            cached = true;
+                value_cache->device_offset + CacheMetadata::SIZE;
+            fp16_cache = key_cache->prec == Precision::FP16;
+            cached =
+                value_metadata->current_seq_len ==
+                    key_metadata->current_seq_len &&
+                value_metadata->max_seq_len == key_metadata->max_seq_len &&
+                key_metadata->num_kv_heads ==
+                    static_cast<uint64_t>(num_kv_heads) &&
+                value_metadata->num_kv_heads ==
+                    static_cast<uint64_t>(num_kv_heads) &&
+                key_metadata->head_dim == static_cast<uint64_t>(key_dim) &&
+                value_metadata->v_head_dim ==
+                    static_cast<uint64_t>(value_dim);
         }
         const int key_length = past_length + current_length;
         const float* query_data = device_pointer_const<float>(query);
         float* output_data = device_pointer<float>(*output);
         const float* mask_data = mask
             ? device_pointer_const<float>(*mask) : nullptr;
-        const bool valid = query_data && key_data && value_data &&
+        const bool valid = query_data && current_key_data &&
+            current_value_data &&
             output_data && num_heads > 0 && num_kv_heads > 0 &&
             num_heads % num_kv_heads == 0 && query_length > 0 &&
             current_length > 0 && key_dim > 0 && value_dim > 0 &&
@@ -927,9 +948,10 @@ void CudaBackend::dispatch(const GraphNode& node,
         if (valid) {
             if (cached) {
                 mollm_cuda::launch_append_kv(
-                    key_data, value_data, key_cache_data, value_cache_data,
-                    num_kv_heads, current_length, past_length, key_capacity,
-                    key_dim, value_dim,
+                    current_key_data, current_value_data, key_cache_data,
+                    value_cache_data, fp16_cache, num_kv_heads,
+                    current_length, past_length, key_capacity, key_dim,
+                    value_dim,
                     current_key.stride[1] / sizeof(float),
                     current_key.stride[2] / sizeof(float),
                     current_value.stride[1] / sizeof(float),
@@ -955,7 +977,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             mollm_cuda::launch_sdpa_scores(
                 query_data, key_data, scores, mask_data, num_heads,
                 num_kv_heads, query_length, key_length, past_length, key_dim,
-                key_capacity, cached, causal, scale,
+                key_capacity, cached, fp16_cache, causal, scale,
                 query.stride[0] / sizeof(float),
                 query.stride[1] / sizeof(float),
                 query.stride[2] / sizeof(float),
@@ -974,6 +996,7 @@ void CudaBackend::dispatch(const GraphNode& node,
             mollm_cuda::launch_sdpa_output(
                 scores, value_data, output_data, num_heads, num_kv_heads,
                 query_length, key_length, value_dim, key_capacity, cached,
+                fp16_cache,
                 cached ? 1 : current_value.stride[0] / sizeof(float),
                 cached ? static_cast<size_t>(value_dim)
                        : current_value.stride[1] / sizeof(float),

@@ -59,24 +59,27 @@ void launch_rope(
     size_t x_s3, size_t c_s0, size_t c_s1, size_t s_s0, size_t s_s1,
     size_t o_s0, size_t o_s1, size_t o_s2, size_t o_s3);
 void launch_append_kv(
-    const float* key, const float* value, float* key_cache,
-    float* value_cache, int num_kv_heads, int current_length, int past_length,
-    int max_length, int key_dim, int value_dim, size_t key_position_stride,
+    const float* key, const float* value, void* key_cache,
+    void* value_cache, bool fp16_cache, int num_kv_heads,
+    int current_length, int past_length, int max_length,
+    int key_dim, int value_dim, size_t key_position_stride,
     size_t key_head_stride, size_t value_position_stride,
     size_t value_head_stride);
 void launch_sdpa_scores(
-    const float* query, const float* key, float* scores, const float* mask,
+    const float* query, const void* key, float* scores, const float* mask,
     int num_heads, int num_kv_heads, int query_length, int key_length,
-    int past_length, int key_dim, int key_capacity, bool cached, bool causal,
-    float scale, size_t query_feature_stride, size_t query_position_stride,
+    int past_length, int key_dim, int key_capacity, bool cached,
+    bool fp16_cache, bool causal, float scale,
+    size_t query_feature_stride, size_t query_position_stride,
     size_t query_head_stride, size_t key_feature_stride,
     size_t key_position_stride, size_t key_head_stride,
     size_t mask_column_stride, size_t mask_row_stride);
 void launch_sdpa_output(
-    const float* scores, const float* value, float* output, int num_heads,
+    const float* scores, const void* value, float* output, int num_heads,
     int num_kv_heads, int query_length, int key_length, int value_dim,
-    int value_capacity, bool cached, size_t value_feature_stride,
-    size_t value_position_stride, size_t value_head_stride,
+    int value_capacity, bool cached, bool fp16_cache,
+    size_t value_feature_stride, size_t value_position_stride,
+    size_t value_head_stride,
     size_t output_feature_stride, size_t output_position_stride,
     size_t output_head_stride);
 

@@ -42,8 +42,9 @@ public:
     void synchronize_for_host_read() override;
     void begin_graph() override;
     void end_graph() override;
-    Precision kv_cache_precision(Precision) const override {
-        return Precision::FP32;
+    Precision kv_cache_precision(Precision requested) const override {
+        return requested == Precision::FP16 || requested == Precision::FP32
+            ? requested : Precision::FP32;
     }
 
     bool register_weight_region(void* base, size_t size) override;
