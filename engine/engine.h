@@ -74,6 +74,7 @@ enum class WeightLoadingMode {
 enum class Device {
     CPU,
     METAL,
+    CUDA,
 };
 
 // Controls what happens when the requested accelerator was not compiled in,

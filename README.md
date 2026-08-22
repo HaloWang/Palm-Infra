@@ -324,6 +324,36 @@ Standard mollm benchmark:
     --threads 4
 ```
 
+## CUDA correctness backend
+
+CUDA support can be built independently of the CPU provider:
+
+```bash
+cmake -S . -B build_cuda -DCMAKE_BUILD_TYPE=Release -DMOLLM_CUDA=ON
+cmake --build build_cuda -j
+./build_cuda/mollm_chat --device cuda --package model.mollm
+```
+
+Explicitly selecting CUDA now requires a working CUDA backend instead of
+silently falling back to CPU. Add `--require-native` to reject any operator
+that would use the CPU reference implementation.
+
+The CUDA backend is still a correctness-first implementation. Graph outputs
+and persistent state use device-addressable managed storage, FP16/FP32 linear
+layers run through cuBLAS. W8 weights remain quantized on device: decode uses
+a native GEMV kernel, while prefill dequantizes one matrix at a time into
+reusable FP16 scratch before cuBLAS. Package-native W4G32/W4G128 weights use
+the same policy with packed decode kernels and reusable prefill scratch.
+RMSNorm and fused norm paths,
+dense elementwise operations, common activations, SwiGLU, RoPE, strided layout
+materialization, FP32 cached SDPA, zero-copy views, and the decode lm_head also
+stay on CUDA. Operators not yet implemented natively synchronize and use the
+CPU reference dispatcher over the managed buffers. Set
+`MOLLM_CUDA_PROFILE=1` to print native/fallback operator counts. Recurrent
+Gated DeltaNet/short-convolution operators and several specialized model
+families still fall back, so this is not yet a performance-complete CUDA
+backend.
+
 ## Local HTTP server
 
 ```bash

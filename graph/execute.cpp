@@ -493,8 +493,11 @@ void execute_graph(ExecContext& ctx, int stop_after_node_index) {
                     node.params, 2, (int)src.shape[dim]);
                 out = src;
                 out.device_data = src.device_data;
-                out.device_offset =
-                    src.device_offset + (size_t)offset * src.stride[dim];
+                const size_t byte_offset =
+                    (size_t)offset * src.stride[dim];
+                if (src.data)
+                    out.data = static_cast<uint8_t*>(src.data) + byte_offset;
+                out.device_offset = src.device_offset + byte_offset;
                 out.shape[dim] = size;
                 inline_zero_copy_view = true;
             } else if (node.op_type == OpType::CONTIGUOUS &&

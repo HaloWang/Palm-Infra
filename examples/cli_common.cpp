@@ -124,10 +124,20 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
                 error = "--device metal requires a build with -DMOLLM_METAL=ON";
                 return false;
 #endif
+            } else if (dev == "cuda") {
+#ifdef MOLLM_CUDA
+                opts.device = Device::CUDA;
+#else
+                error = "--device cuda requires a build with -DMOLLM_CUDA=ON";
+                return false;
+#endif
             } else {
-                error = std::string("unknown --device value '") + dev + "' (use cpu|metal)";
+                error = std::string("unknown --device value '") + dev +
+                        "' (use cpu|metal|cuda)";
                 return false;
             }
+        } else if (arg == "--require-native") {
+            opts.require_native = true;
         } else if (arg == "--mmap") {
             opts.weight_loading = WeightLoadingMode::MMAP;
         } else if (arg == "--ssd-cache-mb") {
@@ -266,6 +276,10 @@ bool parse_common_args(int argc, char** argv, CliCommonOptions& opts,
         error = "missing required --package <file.mollm>";
         return false;
     }
+    if (opts.require_native && opts.device == Device::CPU) {
+        error = "--require-native requires an accelerator device";
+        return false;
+    }
     if (!validate_sampling_params(opts.sampling, &error))
         return false;
     if (opts.ssd_cache_mb > 0) {
@@ -296,7 +310,8 @@ void print_common_usage(const char* program_name, const char* extra_usage) {
                 default_worker_threads());
     std::printf("  --profile                Print aggregated per-op profile in bench\n");
     std::printf("  --static-padded          Pad short prompts to graph_seq_len (A/B vs DYNAMIC)\n");
-    std::printf("  --device <cpu|metal>     Compute backend (metal requires MOLLM_METAL build)\n");
+    std::printf("  --device <cpu|metal|cuda> Compute backend (GPU backends require their build option)\n");
+    std::printf("  --require-native         Reject accelerator operator fallback\n");
     std::printf("  --mmap                  Use mmap-backed package weights (default: resident)\n");
     std::printf("  --ssd-cache-mb <int>    CPU MoE SSD cache; pins dense weights by default\n");
     std::printf("  --ssd-io-workers <int>  Dedicated SSD pread workers (default: 8)\n");
@@ -342,6 +357,12 @@ EngineConfig make_engine_config(const CliCommonOptions& opts) {
     cfg.static_padded = opts.static_padded;
     cfg.image_max_pixels = opts.image_max_pixels;
     cfg.device = opts.device;
+    cfg.device_fallback = opts.device == Device::CPU
+        ? DeviceFallbackPolicy::ALLOW_CPU
+        : DeviceFallbackPolicy::REQUIRE_REQUESTED;
+    cfg.operator_fallback = opts.require_native
+        ? OperatorFallbackPolicy::REQUIRE_NATIVE
+        : OperatorFallbackPolicy::ALLOW_REFERENCE;
     cfg.weight_loading = opts.weight_loading;
     cfg.moe_ssd_cache_bytes = static_cast<size_t>(opts.ssd_cache_mb) * 1024 * 1024;
     cfg.moe_ssd_io_workers = opts.ssd_io_workers;
