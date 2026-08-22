@@ -4,6 +4,35 @@
 
 namespace {
 
+__device__ float warp_reduce_sum(float value) {
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1)
+        value += __shfl_down_sync(0xffffffffu, value, offset);
+    return value;
+}
+
+// Preserve the original 256-thread tree's addition order through stride 32,
+// then finish the first warp with shuffles.  This removes five block barriers
+// without perturbing the numerical path used by quantized-model parity tests.
+__device__ float block_reduce_sum_256(float value, float* reduction) {
+    const int thread = static_cast<int>(threadIdx.x);
+    reduction[thread] = value;
+    __syncthreads();
+    if (thread < 128)
+        reduction[thread] += reduction[thread + 128];
+    __syncthreads();
+    if (thread < 64)
+        reduction[thread] += reduction[thread + 64];
+    __syncthreads();
+    if (thread < 32) {
+        value = reduction[thread] + reduction[thread + 32];
+        value = warp_reduce_sum(value);
+        if (thread == 0)
+            reduction[0] = value;
+    }
+    __syncthreads();
+    return reduction[0];
+}
+
 __device__ float cuda_activation(float value, int kind) {
     switch (kind) {
     case 1: return value / (1.0f + expf(-value));
@@ -124,14 +153,8 @@ __global__ void rms_norm_cuda(const float* input, const float* weight,
         sum += value * value;
     }
     __shared__ float reduction[256];
-    reduction[threadIdx.x] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inverse = rsqrtf(reduction[0] / width + epsilon);
+    const float block_sum = block_reduce_sum_256(sum, reduction);
+    const float inverse = rsqrtf(block_sum / width + epsilon);
     for (int column = threadIdx.x; column < width; column += blockDim.x)
         output[static_cast<size_t>(row) * width + column] =
             source[column] * inverse * weight[column];
@@ -155,14 +178,8 @@ __global__ void add_rms_norm_cuda(
         sum += value * value;
     }
     __shared__ float reduction[256];
-    reduction[threadIdx.x] = sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inverse = rsqrtf(reduction[0] / width + epsilon);
+    const float block_sum = block_reduce_sum_256(sum, reduction);
+    const float inverse = rsqrtf(block_sum / width + epsilon);
     float* output_row = output + static_cast<size_t>(row) *
         output_row_stride;
     for (int column = threadIdx.x; column < width; column += blockDim.x)
