@@ -141,6 +141,12 @@ void CPUBackend::dispatch(const GraphNode& node,
 
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
+        const int cache_mode = graph_params::get_i32(params, 0, 2);
+        if (cache_mode == 2 && inputs.size() > 5 && inputs[4] && inputs[5] &&
+            inputs[4]->prec != inputs[5]->prec) {
+            reject();
+            break;
+        }
         std::vector<Tensor*> sdpa_outs = { output };
         kernel_sdpa(params, inputs, sdpa_outs, thread_pool);
         break;

@@ -736,11 +736,12 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         return false;
 
     Tensor layer_output = device_tensor(backend, 2, 2);
-    std::vector<float> scale_data = {1.5f, 0.75f};
+    std::vector<float> scale_data = {-91.0f, 83.0f, 1.5f, 0.75f};
     std::vector<float> bias_data = {0.25f, -0.5f};
     Tensor scale = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
         scale_data.data());
+    scale.device_offset = 2 * sizeof(float);
     Tensor bias = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, 2, 1, 1, 1,
         bias_data.data());
@@ -760,10 +761,10 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         const float inv = 1.0f /
             std::sqrt(((x0 - mean) * (x0 - mean) +
                        (x1 - mean) * (x1 - mean)) * 0.5f + 1e-5f);
-        layer_expected[row * 2] = (x0 - mean) * inv * scale_data[0] +
+        layer_expected[row * 2] = (x0 - mean) * inv * scale_data[2] +
             bias_data[0];
         layer_expected[row * 2 + 1] =
-            (x1 - mean) * inv * scale_data[1] + bias_data[1];
+            (x1 - mean) * inv * scale_data[3] + bias_data[1];
     }
     if (!close_enough(layer_actual, layer_expected, 2e-5f))
         return false;

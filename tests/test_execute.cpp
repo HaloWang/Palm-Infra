@@ -15,6 +15,27 @@ static int failures = 0;
 int main() {
     CPUBackend cpu_backend;  // shared across all ExecContexts below
 
+    {
+        float scalar = 0.0f;
+        Tensor value = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1, &scalar);
+        Tensor key_cache = Tensor::create(
+            Precision::FP16, MemoryType::EXTERNAL, 1, 1, 1, 1, &scalar);
+        Tensor value_cache = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, 1, 1, 1, 1, &scalar);
+        GraphNode sdpa;
+        sdpa.op_type = OpType::SDPA;
+        sdpa.params.i32 = {2};
+        cpu_backend.clear_dispatch_error();
+        cpu_backend.dispatch(
+            sdpa,
+            {&value, &value, &value, nullptr, &key_cache, &value_cache},
+            &value, nullptr);
+        CHECK(cpu_backend.dispatch_failed(),
+              "CPU backend rejects mixed K/V cache precision");
+        cpu_backend.clear_dispatch_error();
+    }
+
     // Partial execution is used by MTP synchronization: run through the
     // stateful cache-update node, but skip an expensive stateless suffix.
     {
