@@ -918,13 +918,13 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
                            Precision cache_precision, int past_length,
                            int current_length = 1,
                            bool explicit_mask = false,
-                           int kv_heads = 1) {
+                           int kv_heads = 1, int head_dim = 128) {
     backend.clear_dispatch_error();
     const int heads = 2 * kv_heads;
-    // Match the common Qwen head width so decode and prefill specializations
+    // Exercise common Qwen head widths so decode and prefill specializations
     // can test their parallel reductions against the same reference.
-    constexpr int key_dim = 128;
-    constexpr int value_dim = 128;
+    const int key_dim = head_dim;
+    const int value_dim = head_dim;
     const int key_length = past_length + current_length;
     const int capacity = key_length + 1;
 
@@ -2018,6 +2018,10 @@ int main() {
         !test_wide_cached_sdpa(backend, Precision::FP16, 0, 4) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 257, 8) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 3, 5, true) ||
+        !test_wide_cached_sdpa(
+            backend, Precision::FP16, 0, 17, false, 2, 256) ||
+        !test_wide_cached_sdpa(
+            backend, Precision::FP16, 1023, 2, true, 1, 256) ||
         !test_shortconv(backend) ||
         !test_gdn(backend) ||
         !test_decode_add_rms_norm(backend) ||

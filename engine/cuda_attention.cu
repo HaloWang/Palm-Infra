@@ -751,7 +751,7 @@ __global__ void sdpa_decode_value_fp16_cuda(
     }
 }
 
-template <bool SharedScores>
+template <int HeadDim, bool SharedScores>
 __global__ void sdpa_prefill_fp16_cuda(
     const float* __restrict__ query, const __half* __restrict__ key,
     const __half* __restrict__ value, float* __restrict__ scores,
@@ -761,7 +761,12 @@ __global__ void sdpa_prefill_fp16_cuda(
     size_t query_position_stride, size_t query_head_stride,
     size_t mask_column_stride, size_t mask_row_stride,
     size_t output_position_stride, size_t output_head_stride) {
-    constexpr int lanes_per_key = staged_sdpa_score_lanes_per_key;
+    static_assert(HeadDim == 128 || HeadDim == 256);
+    constexpr int pairs = HeadDim / 2;
+    // Keep sixteen FP16 pairs per lane for both supported widths. This exposes
+    // enough keys per block while preserving a fixed reduction tree.
+    constexpr int lanes_per_key =
+        HeadDim == 256 ? 8 : staged_sdpa_score_lanes_per_key;
     constexpr int keys_per_iteration = prefill_sdpa_threads / lanes_per_key;
     const int query_position = static_cast<int>(blockIdx.x);
     const int head = static_cast<int>(blockIdx.y);
@@ -772,7 +777,7 @@ __global__ void sdpa_prefill_fp16_cuda(
         query + static_cast<size_t>(head) * query_head_stride +
         static_cast<size_t>(query_position) * query_position_stride);
     const auto* key2 = reinterpret_cast<const __half2*>(key) +
-        static_cast<size_t>(key_head) * key_capacity * staged_sdpa_pairs;
+        static_cast<size_t>(key_head) * key_capacity * pairs;
     extern __shared__ float shared_scores[];
     float* score_row = SharedScores
         ? shared_scores
@@ -784,11 +789,11 @@ __global__ void sdpa_prefill_fp16_cuda(
          key_position += keys_per_iteration) {
         float dot = 0.0f;
 #pragma unroll
-        for (int pair = lane; pair < staged_sdpa_pairs;
+        for (int pair = lane; pair < pairs;
              pair += lanes_per_key) {
             const float2 q = query2[pair];
             const float2 k = __half22float2(
-                key2[static_cast<size_t>(key_position) * staged_sdpa_pairs +
+                key2[static_cast<size_t>(key_position) * pairs +
                      pair]);
             dot = fmaf(q.x, k.x, dot);
             dot = fmaf(q.y, k.y, dot);
@@ -832,40 +837,57 @@ __global__ void sdpa_prefill_fp16_cuda(
         score_row[key_position] *= inverse_sum;
     __syncthreads();
 
-    constexpr int value_groups = prefill_sdpa_threads / staged_sdpa_pairs;
-    const int pair = static_cast<int>(threadIdx.x) % staged_sdpa_pairs;
-    const int group = static_cast<int>(threadIdx.x) / staged_sdpa_pairs;
-    const auto* value2 = reinterpret_cast<const __half2*>(value) +
-        static_cast<size_t>(key_head) * key_capacity * staged_sdpa_pairs;
-    float2 value_sum{0.0f, 0.0f};
-    for (int key_position = group; key_position < key_length;
-         key_position += value_groups) {
-        const float2 element = __half22float2(
-            value2[static_cast<size_t>(key_position) * staged_sdpa_pairs +
-                   pair]);
-        const float probability = score_row[key_position];
-        value_sum.x = fmaf(probability, element.x, value_sum.x);
-        value_sum.y = fmaf(probability, element.y, value_sum.y);
-    }
-    __shared__ float2 value_partial[prefill_sdpa_threads];
-    value_partial[threadIdx.x] = value_sum;
-    __syncthreads();
-    if (threadIdx.x < staged_sdpa_pairs) {
-        float2 result = value_partial[pair];
-#pragma unroll
-        for (int value_group = 1; value_group < value_groups;
-             ++value_group) {
-            const float2 next = value_partial[
-                value_group * staged_sdpa_pairs + pair];
-            result.x += next.x;
-            result.y += next.y;
+    if constexpr (HeadDim == 256) {
+        const int dimension = static_cast<int>(threadIdx.x);
+        float result = 0.0f;
+        for (int key_position = 0; key_position < key_length;
+             ++key_position) {
+            const size_t value_index =
+                (static_cast<size_t>(key_head) * key_capacity +
+                 key_position) * HeadDim + dimension;
+            result = fmaf(
+                score_row[key_position], __half2float(value[value_index]),
+                result);
         }
-        const size_t output_base =
-            static_cast<size_t>(head) * output_head_stride +
-            static_cast<size_t>(query_position) * output_position_stride +
-            pair * 2;
-        output[output_base] = result.x;
-        output[output_base + 1] = result.y;
+        output[static_cast<size_t>(head) * output_head_stride +
+               static_cast<size_t>(query_position) * output_position_stride +
+               dimension] = result;
+    } else {
+        constexpr int value_groups = prefill_sdpa_threads / pairs;
+        const int pair = static_cast<int>(threadIdx.x) % pairs;
+        const int group = static_cast<int>(threadIdx.x) / pairs;
+        const auto* value2 = reinterpret_cast<const __half2*>(value) +
+            static_cast<size_t>(key_head) * key_capacity * pairs;
+        float2 value_sum{0.0f, 0.0f};
+        for (int key_position = group; key_position < key_length;
+             key_position += value_groups) {
+            const float2 element = __half22float2(
+                value2[static_cast<size_t>(key_position) * pairs + pair]);
+            const float probability = score_row[key_position];
+            value_sum.x = fmaf(probability, element.x, value_sum.x);
+            value_sum.y = fmaf(probability, element.y, value_sum.y);
+        }
+        __shared__ float2 value_partial[prefill_sdpa_threads];
+        value_partial[threadIdx.x] = value_sum;
+        __syncthreads();
+        if (threadIdx.x < pairs) {
+            float2 result = value_partial[pair];
+#pragma unroll
+            for (int value_group = 1; value_group < value_groups;
+                 ++value_group) {
+                const float2 next =
+                    value_partial[value_group * pairs + pair];
+                result.x += next.x;
+                result.y += next.y;
+            }
+            const size_t output_base =
+                static_cast<size_t>(head) * output_head_stride +
+                static_cast<size_t>(query_position) *
+                    output_position_stride +
+                pair * 2;
+            output[output_base] = result.x;
+            output[output_base + 1] = result.y;
+        }
     }
 }
 
@@ -979,8 +1001,8 @@ bool try_launch_sdpa_prefill(
     size_t output_head_stride) {
     const bool supported = query && key && value && scores && output &&
         query_length > 1 && cached && fp16_cache &&
-        key_dim == staged_sdpa_head_dim &&
-        value_dim == staged_sdpa_head_dim && query_feature_stride == 1 &&
+        (key_dim == 128 || key_dim == 256) && value_dim == key_dim &&
+        query_feature_stride == 1 &&
         query_position_stride % 2 == 0 && query_head_stride % 2 == 0 &&
         output_feature_stride == 1 &&
         (reinterpret_cast<uintptr_t>(query) &
@@ -1001,23 +1023,47 @@ bool try_launch_sdpa_prefill(
     if (key_length <= shared_score_limit) {
         const size_t shared_bytes =
             static_cast<size_t>(key_length) * sizeof(float);
-        sdpa_prefill_fp16_cuda<true>
-            <<<grid, prefill_sdpa_threads, shared_bytes>>>(
-                query, static_cast<const __half*>(key),
-                static_cast<const __half*>(value), scores, output, mask,
-                num_heads, num_kv_heads, query_length, key_length,
-                past_length, key_capacity, causal, scale,
-                query_position_stride, query_head_stride,
-                mask_column_stride, mask_row_stride,
-                output_position_stride, output_head_stride);
+        if (key_dim == 256)
+            sdpa_prefill_fp16_cuda<256, true>
+                <<<grid, prefill_sdpa_threads, shared_bytes>>>(
+                    query, static_cast<const __half*>(key),
+                    static_cast<const __half*>(value), scores, output, mask,
+                    num_heads, num_kv_heads, query_length, key_length,
+                    past_length, key_capacity, causal, scale,
+                    query_position_stride, query_head_stride,
+                    mask_column_stride, mask_row_stride,
+                    output_position_stride, output_head_stride);
+        else
+            sdpa_prefill_fp16_cuda<128, true>
+                <<<grid, prefill_sdpa_threads, shared_bytes>>>(
+                    query, static_cast<const __half*>(key),
+                    static_cast<const __half*>(value), scores, output, mask,
+                    num_heads, num_kv_heads, query_length, key_length,
+                    past_length, key_capacity, causal, scale,
+                    query_position_stride, query_head_stride,
+                    mask_column_stride, mask_row_stride,
+                    output_position_stride, output_head_stride);
     } else {
-        sdpa_prefill_fp16_cuda<false><<<grid, prefill_sdpa_threads>>>(
-            query, static_cast<const __half*>(key),
-            static_cast<const __half*>(value), scores, output, mask,
-            num_heads, num_kv_heads, query_length, key_length, past_length,
-            key_capacity, causal, scale, query_position_stride,
-            query_head_stride, mask_column_stride, mask_row_stride,
-            output_position_stride, output_head_stride);
+        if (key_dim == 256)
+            sdpa_prefill_fp16_cuda<256, false>
+                <<<grid, prefill_sdpa_threads>>>(
+                    query, static_cast<const __half*>(key),
+                    static_cast<const __half*>(value), scores, output, mask,
+                    num_heads, num_kv_heads, query_length, key_length,
+                    past_length, key_capacity, causal, scale,
+                    query_position_stride, query_head_stride,
+                    mask_column_stride, mask_row_stride,
+                    output_position_stride, output_head_stride);
+        else
+            sdpa_prefill_fp16_cuda<128, false>
+                <<<grid, prefill_sdpa_threads>>>(
+                    query, static_cast<const __half*>(key),
+                    static_cast<const __half*>(value), scores, output, mask,
+                    num_heads, num_kv_heads, query_length, key_length,
+                    past_length, key_capacity, causal, scale,
+                    query_position_stride, query_head_stride,
+                    mask_column_stride, mask_row_stride,
+                    output_position_stride, output_head_stride);
     }
     return true;
 }
