@@ -148,8 +148,9 @@ __global__ void dequantize_q4_g128_dense_weight_cuda(
 }
 
 __global__ void q4_g32_dense_gemv_cuda(
-    const float* activation, const Q4B8G32Block* weight, float* output,
-    int columns, int inner) {
+    const float* __restrict__ activation,
+    const Q4B8G32Block* __restrict__ weight,
+    float* __restrict__ output, int columns, int inner) {
     constexpr int warps_per_block = 4;
     const int warp = static_cast<int>(threadIdx.x) / warpSize;
     const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
@@ -162,8 +163,9 @@ __global__ void q4_g32_dense_gemv_cuda(
     for (int group = 0; group < groups; ++group) {
         const auto& block =
             weight[static_cast<size_t>(column / 8) * groups + group];
-        float scale = lane == 0 ? block.scales[row_lane] : 0.0f;
-        scale = __shfl_sync(0xffffffffu, scale, 0);
+        // Every lane requests the same address, so the uniform load is
+        // broadcast by the GPU without an explicit shuffle.
+        const float scale = block.scales[row_lane];
         const uint8_t packed = block.q[row_lane][lane / 2];
         const int k = group * 32 + lane;
         sum += activation[k] *
@@ -176,8 +178,9 @@ __global__ void q4_g32_dense_gemv_cuda(
 }
 
 __global__ void q4_g128_dense_gemv_cuda(
-    const float* activation, const Q4B8G128Block* weight, float* output,
-    int columns, int inner) {
+    const float* __restrict__ activation,
+    const Q4B8G128Block* __restrict__ weight,
+    float* __restrict__ output, int columns, int inner) {
     constexpr int warps_per_block = 4;
     const int warp = static_cast<int>(threadIdx.x) / warpSize;
     const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
@@ -190,8 +193,9 @@ __global__ void q4_g128_dense_gemv_cuda(
     for (int group = 0; group < groups; ++group) {
         const auto& block =
             weight[static_cast<size_t>(column / 8) * groups + group];
-        float scale = lane == 0 ? block.scales[row_lane] : 0.0f;
-        scale = __shfl_sync(0xffffffffu, scale, 0);
+        // Every lane requests the same address, so the uniform load is
+        // broadcast by the GPU without an explicit shuffle.
+        const float scale = block.scales[row_lane];
         for (int subgroup = 0; subgroup < 4; ++subgroup) {
             const uint8_t packed =
                 block.q[subgroup][row_lane][lane / 2];
