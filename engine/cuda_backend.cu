@@ -1026,6 +1026,27 @@ void CudaBackend::dispatch(const GraphNode& node,
                 record_native();
                 return;
             }
+            if (mollm_cuda::try_launch_sdpa_prefill(
+                    query_data, key_data, value_data, scores, output_data,
+                    mask_data, num_heads, num_kv_heads, query_length,
+                    key_length, past_length, key_dim, value_dim,
+                    key_capacity, cached, fp16_cache, causal, scale,
+                    query.stride[0] / sizeof(float),
+                    query.stride[1] / sizeof(float),
+                    query.stride[2] / sizeof(float),
+                    mask ? mask->stride[0] / sizeof(float) : 0,
+                    mask ? mask->stride[1] / sizeof(float) : 0,
+                    output->stride[0] / sizeof(float),
+                    output->stride[1] / sizeof(float),
+                    output->stride[2] / sizeof(float))) {
+                if (!mollm_cuda::report_cuda(
+                        cudaGetLastError(), "sdpa_prefill_fp16_cuda")) {
+                    impl_->failed = true;
+                    return;
+                }
+                record_native();
+                return;
+            }
             mollm_cuda::launch_sdpa_scores(
                 query_data, key_data, scores, mask_data, num_heads,
                 num_kv_heads, query_length, key_length, past_length, key_dim,

@@ -892,22 +892,26 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     return true;
 }
 
-bool test_wide_sdpa_decode(CudaBackend& backend,
-                           Precision cache_precision, int past_length) {
+bool test_wide_cached_sdpa(CudaBackend& backend,
+                           Precision cache_precision, int past_length,
+                           int current_length = 1,
+                           bool explicit_mask = false) {
     backend.clear_dispatch_error();
     constexpr int heads = 2;
     constexpr int kv_heads = 1;
-    // Match the common Qwen head width so both decode kernel sizes can test
-    // their parallel value reductions against the same reference.
+    // Match the common Qwen head width so decode and prefill specializations
+    // can test their parallel reductions against the same reference.
     constexpr int key_dim = 128;
     constexpr int value_dim = 128;
-    const int key_length = past_length + 1;
+    const int key_length = past_length + current_length;
     const int capacity = key_length + 1;
 
-    Tensor query = device_tensor(backend, key_dim, 1, heads);
-    Tensor key = device_tensor(backend, key_dim, 1, kv_heads);
-    Tensor value = device_tensor(backend, value_dim, 1, kv_heads);
-    Tensor output = device_tensor(backend, value_dim, 1, heads);
+    Tensor query = device_tensor(backend, key_dim, current_length, heads);
+    Tensor key = device_tensor(backend, key_dim, current_length, kv_heads);
+    Tensor value = device_tensor(
+        backend, value_dim, current_length, kv_heads);
+    Tensor output = device_tensor(
+        backend, value_dim, current_length, heads);
     std::vector<float> query_data(query.nelements());
     std::vector<float> key_data(key.nelements());
     std::vector<float> value_data(value.nelements());
@@ -924,6 +928,27 @@ bool test_wide_sdpa_decode(CudaBackend& backend,
         !upload(backend, key, key_data) ||
         !upload(backend, value, value_data))
         return false;
+
+    Tensor mask;
+    const Tensor* mask_input = nullptr;
+    std::vector<float> mask_data;
+    if (explicit_mask) {
+        mask = device_tensor(backend, key_length, current_length);
+        mask_data.resize(mask.nelements());
+        for (int query_position = 0; query_position < current_length;
+             ++query_position) {
+            for (int position = 0; position < key_length; ++position) {
+                mask_data[static_cast<size_t>(query_position) * key_length +
+                          position] =
+                    position > past_length + query_position
+                        ? -INFINITY
+                        : ((query_position * 3 + position) % 5 - 2) / 100.0f;
+            }
+        }
+        if (!upload(backend, mask, mask_data))
+            return false;
+        mask_input = &mask;
+    }
 
     std::vector<float> cached_key(
         static_cast<size_t>(capacity) * key_dim);
@@ -1019,44 +1044,70 @@ bool test_wide_sdpa_decode(CudaBackend& backend,
     const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
     sdpa.params.f32 = {scale};
     backend.dispatch(
-        sdpa, {&query, &key, &value, nullptr, &key_cache, &value_cache},
+        sdpa, {&query, &key, &value, mask_input, &key_cache, &value_cache},
         &output, nullptr);
     backend.end_graph();
     if (backend.dispatch_failed())
         return false;
 
     std::vector<float> expected(
-        static_cast<size_t>(heads) * value_dim, 0.0f);
+        static_cast<size_t>(heads) * current_length * value_dim, 0.0f);
     std::vector<float> scores(key_length);
     for (int head = 0; head < heads; ++head) {
-        float maximum = -INFINITY;
-        for (int position = 0; position < key_length; ++position) {
-            float dot = 0.0f;
-            for (int dimension = 0; dimension < key_dim; ++dimension) {
-                const float key_element = position < past_length
-                    ? cached_key[
-                          static_cast<size_t>(position) * key_dim +
-                          dimension]
-                    : round_for_cache(key_data[dimension]);
-                dot += query_data[head * key_dim + dimension] * key_element;
+        for (int query_position = 0; query_position < current_length;
+             ++query_position) {
+            float maximum = -INFINITY;
+            for (int position = 0; position < key_length; ++position) {
+                if (!explicit_mask &&
+                    position > past_length + query_position) {
+                    scores[position] = -INFINITY;
+                    continue;
+                }
+                float dot = 0.0f;
+                for (int dimension = 0; dimension < key_dim; ++dimension) {
+                    const int current_position = position - past_length;
+                    const float key_element = position < past_length
+                        ? cached_key[
+                              static_cast<size_t>(position) * key_dim +
+                              dimension]
+                        : round_for_cache(key_data[
+                              static_cast<size_t>(current_position) *
+                                  key_dim +
+                              dimension]);
+                    const size_t query_index =
+                        (static_cast<size_t>(head) * current_length +
+                         query_position) * key_dim + dimension;
+                    dot += query_data[query_index] * key_element;
+                }
+                scores[position] = dot * scale;
+                if (explicit_mask)
+                    scores[position] += mask_data[
+                        static_cast<size_t>(query_position) * key_length +
+                        position];
+                maximum = std::max(maximum, scores[position]);
             }
-            scores[position] = dot * scale;
-            maximum = std::max(maximum, scores[position]);
-        }
-        float sum = 0.0f;
-        for (float& score : scores) {
-            score = std::exp(score - maximum);
-            sum += score;
-        }
-        for (int position = 0; position < key_length; ++position) {
-            for (int dimension = 0; dimension < value_dim; ++dimension) {
-                const float value_element = position < past_length
-                    ? cached_value[
-                          static_cast<size_t>(position) * value_dim +
-                          dimension]
-                    : round_for_cache(value_data[dimension]);
-                expected[head * value_dim + dimension] +=
-                    scores[position] / sum * value_element;
+            float sum = 0.0f;
+            for (float& score : scores) {
+                score = std::exp(score - maximum);
+                sum += score;
+            }
+            for (int position = 0; position < key_length; ++position) {
+                for (int dimension = 0; dimension < value_dim; ++dimension) {
+                    const int current_position = position - past_length;
+                    const float value_element = position < past_length
+                        ? cached_value[
+                              static_cast<size_t>(position) * value_dim +
+                              dimension]
+                        : round_for_cache(value_data[
+                              static_cast<size_t>(current_position) *
+                                  value_dim +
+                              dimension]);
+                    const size_t output_index =
+                        (static_cast<size_t>(head) * current_length +
+                         query_position) * value_dim + dimension;
+                    expected[output_index] +=
+                        scores[position] / sum * value_element;
+                }
             }
         }
     }
@@ -1418,12 +1469,15 @@ int main() {
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
-        !test_wide_sdpa_decode(backend, Precision::FP16, 0) ||
-        !test_wide_sdpa_decode(backend, Precision::FP16, 255) ||
-        !test_wide_sdpa_decode(backend, Precision::FP32, 512) ||
-        !test_wide_sdpa_decode(backend, Precision::FP16, 512) ||
-        !test_wide_sdpa_decode(backend, Precision::FP16, 1023) ||
-        !test_wide_sdpa_decode(backend, Precision::FP16, 1280) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 0) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 255) ||
+        !test_wide_cached_sdpa(backend, Precision::FP32, 512) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 512) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 1023) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 1280) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 0, 4) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 257, 8) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 3, 5, true) ||
         !test_decode_add_rms_norm(backend) ||
         !test_lm_head_argmax(backend))
         return 1;
