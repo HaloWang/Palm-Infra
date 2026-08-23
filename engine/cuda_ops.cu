@@ -1,6 +1,7 @@
 #include "engine/cuda_internal.h"
 #include "engine/cuda_reduction.cuh"
 
+#include <cfloat>
 #include <cmath>
 
 namespace {
@@ -110,6 +111,74 @@ __global__ void swiglu_cuda(const float* input, float* output,
         output[index] = gate / (1.0f + expf(-gate)) *
             input[base + half + column];
     }
+}
+
+__device__ __forceinline__ bool argmax_better(
+    const mollm_cuda::ArgMaxPair& candidate,
+    const mollm_cuda::ArgMaxPair& current) {
+    return candidate.index >= 0 &&
+        (current.index < 0 || candidate.value > current.value ||
+         (candidate.value == current.value &&
+          candidate.index < current.index));
+}
+
+__device__ __forceinline__ mollm_cuda::ArgMaxPair warp_argmax(
+    mollm_cuda::ArgMaxPair best) {
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    for (int offset = warpSize / 2; offset > 0; offset >>= 1) {
+        mollm_cuda::ArgMaxPair candidate;
+        candidate.value = __shfl_down_sync(0xffffffffu, best.value, offset);
+        candidate.index = __shfl_down_sync(0xffffffffu, best.index, offset);
+        if (lane + offset < warpSize && argmax_better(candidate, best))
+            best = candidate;
+    }
+    return best;
+}
+
+__device__ __forceinline__ void block_argmax(
+    mollm_cuda::ArgMaxPair best, mollm_cuda::ArgMaxPair* warp_best,
+    mollm_cuda::ArgMaxPair* output) {
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    best = warp_argmax(best);
+    if (lane == 0)
+        warp_best[warp] = best;
+    __syncthreads();
+    if (warp == 0) {
+        const int warps = static_cast<int>(blockDim.x) / warpSize;
+        best = lane < warps
+            ? warp_best[lane]
+            : mollm_cuda::ArgMaxPair{-FLT_MAX, -1};
+        best = warp_argmax(best);
+        if (lane == 0)
+            *output = best;
+    }
+}
+
+__global__ void argmax_stage1_cuda(
+    const float* input, int count, mollm_cuda::ArgMaxPair* partial) {
+    mollm_cuda::ArgMaxPair best{-FLT_MAX, -1};
+    for (int index = static_cast<int>(blockIdx.x) * blockDim.x + threadIdx.x;
+         index < count; index += static_cast<int>(gridDim.x) * blockDim.x) {
+        const mollm_cuda::ArgMaxPair candidate{input[index], index};
+        if (argmax_better(candidate, best))
+            best = candidate;
+    }
+    __shared__ mollm_cuda::ArgMaxPair warp_best[32];
+    block_argmax(best, warp_best, partial + blockIdx.x);
+}
+
+__global__ void argmax_stage2_cuda(
+    const mollm_cuda::ArgMaxPair* partial, int count,
+    mollm_cuda::ArgMaxPair* result) {
+    mollm_cuda::ArgMaxPair best{-FLT_MAX, -1};
+    for (int index = threadIdx.x; index < count; index += blockDim.x) {
+        const mollm_cuda::ArgMaxPair candidate = partial[index];
+        if (argmax_better(candidate, best))
+            best = candidate;
+    }
+    __shared__ mollm_cuda::ArgMaxPair warp_best[32];
+    block_argmax(best, warp_best, result);
 }
 
 __global__ void rms_norm_cuda(const float* input, const float* weight,
@@ -267,6 +336,13 @@ void launch_contiguous(
     contiguous_cuda<<<static_cast<unsigned>((count + threads - 1) / threads),
                       threads>>>(
         input, output, count, d0, d1, d2, s0, s1, s2, s3);
+}
+
+void launch_argmax(const float* input, int count, ArgMaxPair* partial,
+                   int groups, ArgMaxPair* result) {
+    constexpr int threads = 256;
+    argmax_stage1_cuda<<<groups, threads>>>(input, count, partial);
+    argmax_stage2_cuda<<<1, threads>>>(partial, groups, result);
 }
 
 }  // namespace mollm_cuda

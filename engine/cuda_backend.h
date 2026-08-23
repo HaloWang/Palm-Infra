@@ -59,6 +59,7 @@ public:
                       const void* host_src, size_t nbytes) override;
 
     bool supports_lm_head(const Tensor& weight) const override;
+    bool supports_lm_head_argmax(const Tensor& weight) const override;
     void lm_head_gemv(const float* activation_host, const Tensor& weight,
                       float* output_host, int n, int k,
                       int activation = 0) override;
@@ -66,6 +67,10 @@ public:
         const Tensor& activation, size_t activation_element_offset,
         const Tensor& weight, float* output_host, int n, int k,
         int activation_kind = 0) override;
+    int lm_head_argmax_device_and_end_graph(
+        const Tensor& activation, size_t activation_element_offset,
+        const Tensor& weight, int n, int k, int activation_kind = 0,
+        Tensor* hidden_copy = nullptr) override;
 
 private:
     struct Impl;

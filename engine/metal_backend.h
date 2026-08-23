@@ -162,7 +162,7 @@ public:
     int lm_head_argmax_device_and_end_graph(
         const Tensor& a, size_t a_element_offset, const Tensor& weight,
         int N, int K, int activation = 0,
-        Tensor* hidden_copy = nullptr);
+        Tensor* hidden_copy = nullptr) override;
 
 private:
     void lm_head_gemv_impl(void* a_device, size_t a_byte_offset,

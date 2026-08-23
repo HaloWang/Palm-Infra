@@ -74,6 +74,17 @@ public:
         const Tensor& activation, size_t activation_element_offset,
         const Tensor& weight, float* output_host, int n, int k,
         int activation_kind = 0) = 0;
+    // Optional greedy-only boundary: keep logits on device and return just
+    // their stable argmax. Backends opt in explicitly so existing execution
+    // and sampling behavior is unchanged by default.
+    virtual bool supports_lm_head_argmax(const Tensor&) const {
+        return false;
+    }
+    virtual int lm_head_argmax_device_and_end_graph(
+        const Tensor&, size_t, const Tensor&, int, int, int = 0,
+        Tensor* = nullptr) {
+        return -1;
+    }
 
     // Optional SSD-MoE hooks. They remain no-ops for accelerators that do not
     // implement direct expert streaming.

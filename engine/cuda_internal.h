@@ -11,6 +11,11 @@
 
 namespace mollm_cuda {
 
+struct ArgMaxPair {
+    float value;
+    int index;
+};
+
 struct DeviceBufferPool;
 
 bool report_cuda(cudaError_t error, const char* operation);
@@ -129,5 +134,7 @@ void launch_add_rms_norm(
 void launch_contiguous(
     const float* input, float* output, size_t count, int64_t d0, int64_t d1,
     int64_t d2, size_t s0, size_t s1, size_t s2, size_t s3);
+void launch_argmax(const float* input, int count, ArgMaxPair* partial,
+                   int groups, ArgMaxPair* result);
 
 }  // namespace mollm_cuda

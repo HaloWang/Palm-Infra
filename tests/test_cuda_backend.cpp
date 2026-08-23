@@ -1050,6 +1050,42 @@ bool test_decode_add_rms_norm(CudaBackend& backend) {
         close_enough(output_actual, output_expected, 3e-5f);
 }
 
+bool test_lm_head_argmax(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    constexpr int n = 7;
+    constexpr int k = 8;
+    std::vector<float> activation_data(k, 1.0f);
+    std::vector<mollm::cpu::fp16_t> weight_data(
+        static_cast<size_t>(n) * k);
+    for (int row = 0; row < n; ++row) {
+        const float value = row == 1 || row == 2
+            ? 0.25f : (row == 3 ? 0.125f : -0.25f);
+        for (int column = 0; column < k; ++column) {
+            weight_data[static_cast<size_t>(row) * k + column] =
+                static_cast<mollm::cpu::fp16_t>(value);
+        }
+    }
+    Tensor activation = device_tensor(backend, k);
+    Tensor weight = Tensor::create(
+        Precision::FP16, MemoryType::EXTERNAL, n, k, 1, 1,
+        weight_data.data());
+    backend.wrap_weight(weight);
+    if (!upload(backend, activation, activation_data) ||
+        !backend.supports_lm_head_argmax(weight))
+        return false;
+
+    std::vector<float> logits(n);
+    backend.lm_head_gemv_device_and_end_graph(
+        activation, 0, weight, logits.data(), n, k);
+    if (backend.dispatch_failed())
+        return false;
+    const int expected = static_cast<int>(
+        std::max_element(logits.begin(), logits.end()) - logits.begin());
+    const int actual = backend.lm_head_argmax_device_and_end_graph(
+        activation, 0, weight, n, k);
+    return !backend.dispatch_failed() && expected == 1 && actual == expected;
+}
+
 bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor storage = device_tensor(backend, 6, 2);
@@ -1316,7 +1352,8 @@ int main() {
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
         !test_long_sdpa_decode(backend) ||
-        !test_decode_add_rms_norm(backend))
+        !test_decode_add_rms_norm(backend) ||
+        !test_lm_head_argmax(backend))
         return 1;
     if (!test_memory_and_fallback_bridge(backend))
         return 1;

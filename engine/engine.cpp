@@ -418,6 +418,15 @@ int LLMEngine::run_lmhead(const Tensor& hidden, int n_tokens,
     // lm_head_weight is [vocab_size, hidden_dim] — we use it as weight B
     // output will be [vocab_size, 1] — we take argmax
 
+    if (finish_accelerator_graph && sampler_.uses_plain_argmax() &&
+        accelerator_backend_->supports_lm_head_argmax(*lm_head_weight_)) {
+        const int token =
+            accelerator_backend_->lm_head_argmax_device_and_end_graph(
+                hidden, static_cast<size_t>(last_pos) * hidden_dim,
+                *lm_head_weight_, vocab_size, hidden_dim);
+        return accelerator_backend_->dispatch_failed() ? -1 : token;
+    }
+
     // Create a view of the last hidden row as A: [hidden_dim, 1]
     Tensor A = hidden;
     A.shape[1] = 1;
