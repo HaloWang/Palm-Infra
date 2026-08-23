@@ -275,14 +275,15 @@ __global__ void q4_g32_pair_rows_gemv_cuda(
         const float2 value = reinterpret_cast<const float2*>(
             activation + static_cast<size_t>(group) * 32)[pair];
         const float scale = block.scales[row];
-        sum = fmaf(
+        // Both nibbles share one group scale. Form their two-element dot
+        // first so the scale is applied once instead of multiplying both
+        // weights separately.
+        const float quantized_dot = fmaf(
             value.x,
-            static_cast<float>(biased_q4_g32_nibble(packed)) * scale,
-            sum);
-        sum = fmaf(
-            value.y,
-            static_cast<float>(biased_q4_g32_nibble(packed >> 4)) * scale,
-            sum);
+            static_cast<float>(biased_q4_g32_nibble(packed)),
+            value.y * static_cast<float>(
+                biased_q4_g32_nibble(packed >> 4)));
+        sum = fmaf(quantized_dot, scale, sum);
     }
     for (int offset = lanes_per_row / 2; offset != 0; offset /= 2)
         sum += __shfl_down_sync(
