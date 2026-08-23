@@ -6,6 +6,7 @@
 namespace {
 
 constexpr int shortconv_max_kernel = 8;
+constexpr int shortconv_parallel_min_sequence = 8;
 constexpr int gdn_head_dim = 128;
 // Each worker accumulates one contiguous interval serially, then lane 0 folds
 // the partials in lane order. Sixteen workers preserve stable FP32 behavior
@@ -13,7 +14,7 @@ constexpr int gdn_head_dim = 128;
 constexpr int gdn_dot_workers = 16;
 static_assert(gdn_head_dim % gdn_dot_workers == 0);
 
-__global__ void shortconv_cuda(
+__global__ void shortconv_serial_cuda(
     const float* input, const float* weight, float* state, float* output,
     int groups, int sequence_length, int kernel_size, int real_tokens,
     size_t input_feature_stride, size_t input_row_stride) {
@@ -58,6 +59,72 @@ __global__ void shortconv_cuda(
     for (int index = 0; index < shortconv_max_kernel - 1; ++index)
         if (index < prefix_length)
             group_state[index] = window[index];
+}
+
+// Causal convolution outputs are independent once the incoming history is
+// fixed. Prefill therefore parallelizes over both tokens and groups, then a
+// separate ordered pass commits the final history. Decode stays on the serial
+// kernel above so its output and state update share one launch.
+__global__ void shortconv_prefill_cuda(
+    const float* input, const float* weight, const float* state,
+    float* output, int groups, int sequence_length, int kernel_size,
+    int real_tokens, size_t input_feature_stride, size_t input_row_stride) {
+    const int group = static_cast<int>(blockIdx.x) * blockDim.x +
+        static_cast<int>(threadIdx.x);
+    const int token = static_cast<int>(blockIdx.y);
+    if (group >= groups)
+        return;
+    const size_t output_index =
+        static_cast<size_t>(group) * sequence_length + token;
+    if (token >= real_tokens) {
+        output[output_index] = 0.0f;
+        return;
+    }
+
+    const int prefix_length = kernel_size - 1;
+    const float* group_weight = weight +
+        static_cast<size_t>(group) * kernel_size;
+    const float current = input[
+        static_cast<size_t>(token) * input_row_stride +
+        static_cast<size_t>(group) * input_feature_stride];
+    float sum = current * group_weight[prefix_length];
+#pragma unroll
+    for (int tap = 0; tap < shortconv_max_kernel - 1; ++tap) {
+        if (tap < prefix_length) {
+            const int source_token = token + tap - prefix_length;
+            const float value = source_token < 0
+                ? state[static_cast<size_t>(group) * prefix_length +
+                        static_cast<size_t>(source_token + prefix_length)]
+                : input[static_cast<size_t>(source_token) * input_row_stride +
+                        static_cast<size_t>(group) * input_feature_stride];
+            sum = fmaf(value, group_weight[tap], sum);
+        }
+    }
+    output[output_index] = sum / (1.0f + expf(-sum));
+}
+
+__global__ void shortconv_commit_state_cuda(
+    const float* input, float* state, int groups, int kernel_size,
+    int real_tokens, size_t input_feature_stride, size_t input_row_stride) {
+    const int group = static_cast<int>(blockIdx.x) * blockDim.x +
+        static_cast<int>(threadIdx.x);
+    if (group >= groups)
+        return;
+    const int prefix_length = kernel_size - 1;
+    float* group_state = state +
+        static_cast<size_t>(group) * prefix_length;
+    // source_state is always ahead of destination for real_tokens > 0, so
+    // ascending in-place copies preserve the still-needed incoming history.
+#pragma unroll
+    for (int index = 0; index < shortconv_max_kernel - 1; ++index) {
+        if (index < prefix_length) {
+            const int source_token = real_tokens - prefix_length + index;
+            group_state[index] = source_token < 0
+                ? group_state[source_token + prefix_length]
+                : input[static_cast<size_t>(source_token) * input_row_stride +
+                        static_cast<size_t>(group) * input_feature_stride];
+        }
+    }
 }
 
 __device__ __forceinline__ float gdn_softplus(float value) {
@@ -424,9 +491,23 @@ bool launch_shortconv(
         real_tokens > 0 && real_tokens < sequence_length
         ? real_tokens : sequence_length;
     constexpr int threads = 256;
-    shortconv_cuda<<<(groups + threads - 1) / threads, threads>>>(
-        input, weight, state, output, groups, sequence_length, kernel_size,
-        process_length, input_feature_stride, input_row_stride);
+    const int group_blocks = (groups + threads - 1) / threads;
+    if (sequence_length >= shortconv_parallel_min_sequence) {
+        const dim3 grid(group_blocks, sequence_length);
+        shortconv_prefill_cuda<<<grid, threads>>>(
+            input, weight, state, output, groups, sequence_length,
+            kernel_size, process_length, input_feature_stride,
+            input_row_stride);
+        if (kernel_size > 1)
+            shortconv_commit_state_cuda<<<group_blocks, threads>>>(
+                input, state, groups, kernel_size, process_length,
+                input_feature_stride, input_row_stride);
+    } else {
+        shortconv_serial_cuda<<<group_blocks, threads>>>(
+            input, weight, state, output, groups, sequence_length,
+            kernel_size, process_length, input_feature_stride,
+            input_row_stride);
+    }
     return true;
 }
 

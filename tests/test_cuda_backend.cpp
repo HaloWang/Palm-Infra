@@ -1207,9 +1207,9 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
 bool test_shortconv(CudaBackend& backend) {
     backend.clear_dispatch_error();
     constexpr int groups = 7;
-    constexpr int sequence_length = 5;
+    constexpr int sequence_length = 65;
     constexpr int kernel_size = 4;
-    constexpr int real_tokens = 3;
+    constexpr int real_tokens = 61;
     constexpr int row_padding = 3;
     constexpr int row_stride = groups + row_padding;
 
@@ -1290,6 +1290,25 @@ bool test_shortconv(CudaBackend& backend) {
     backend.end_graph();
     std::vector<float> actual_output;
     std::vector<float> actual_state;
+    if (backend.dispatch_failed() ||
+        !download(backend, output, actual_output) ||
+        !download(backend, state, actual_state) ||
+        !close_enough(actual_output, expected_output, 1e-6f) ||
+        !close_enough(actual_state, expected_state, 1e-6f))
+        return false;
+
+    // Exercise the parallel prefill state commit when fewer real tokens than
+    // history elements are present; the untouched tail must shift forward.
+    expected_state = state_data;
+    std::fill(expected_output.begin(), expected_output.end(), 0.0f);
+    reference(input_data, sequence_length, 1, expected_state,
+              expected_output);
+    if (!upload(backend, state, state_data))
+        return false;
+    shortconv.params.i32 = {kernel_size, 1};
+    backend.dispatch(
+        shortconv, {&input, &weight, &state}, &output, nullptr);
+    backend.end_graph();
     if (backend.dispatch_failed() ||
         !download(backend, output, actual_output) ||
         !download(backend, state, actual_state) ||
