@@ -7,6 +7,11 @@ namespace {
 
 constexpr int shortconv_max_kernel = 8;
 constexpr int gdn_head_dim = 128;
+// Each worker accumulates one contiguous interval serially, then lane 0 folds
+// the partials in lane order. Sixteen workers preserve stable FP32 behavior
+// while avoiding both the serial single-lane dot and a tree reduction.
+constexpr int gdn_dot_workers = 16;
+static_assert(gdn_head_dim % gdn_dot_workers == 0);
 
 __global__ void shortconv_cuda(
     const float* input, const float* weight, float* state, float* output,
@@ -178,10 +183,13 @@ __global__ void gdn_recurrence_rows_128_cuda(
                 local_state[chunk];
         }
         __syncwarp();
-        if (lane == 0) {
+        if (lane < gdn_dot_workers) {
+            constexpr int dimensions_per_worker =
+                gdn_head_dim / gdn_dot_workers;
+            const int dimension_begin = lane * dimensions_per_worker;
 #pragma unroll
-            for (int key_dimension = 0;
-                 key_dimension < gdn_head_dim; ++key_dimension) {
+            for (int offset = 0; offset < dimensions_per_worker; ++offset) {
+                const int key_dimension = dimension_begin + offset;
                 const float state_value =
                     decayed_state[warp][key_dimension];
                 key_projection = fmaf(
@@ -195,6 +203,17 @@ __global__ void gdn_recurrence_rows_128_cuda(
             }
         }
         __syncwarp();
+#pragma unroll
+        for (int worker = 1; worker < gdn_dot_workers; ++worker) {
+            const float key_partial = __shfl_sync(
+                0xffffffffu, key_projection, worker);
+            const float attention_partial = __shfl_sync(
+                0xffffffffu, attention_decay, worker);
+            if (lane == 0) {
+                key_projection += key_partial;
+                attention_decay += attention_partial;
+            }
+        }
         key_projection = __shfl_sync(0xffffffffu, key_projection, 0);
         const size_t value_index =
             (static_cast<size_t>(2 * qkv_key_width) +
