@@ -2009,6 +2009,7 @@ int main() {
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 0) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 255) ||
+        !test_wide_cached_sdpa(backend, Precision::FP16, 511) ||
         !test_wide_cached_sdpa(backend, Precision::FP32, 512) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 512) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 1023) ||

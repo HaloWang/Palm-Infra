@@ -374,11 +374,12 @@ __global__ void sdpa_output_cuda(
 }
 
 // Decode has one query position, so the score and softmax/value passes can be
-// owned by one block per query head.  Keeping the temporary score row in the
-// backend scratch buffer avoids a context-length shared-memory limit while a
-// single launch removes the inter-kernel boundary.  Softmax exponentials are
-// also computed once per key instead of once per output dimension.
-template <int Threads>
+// owned by one block per query head. Short contexts keep the temporary score
+// row in shared memory; long contexts retain the backend scratch buffer to
+// avoid a context-length shared-memory limit. A single launch removes the
+// inter-kernel boundary, and softmax exponentials are computed once per key
+// instead of once per output dimension.
+template <int Threads, bool SharedScores>
 __global__ void sdpa_decode_cuda(
     const float* query, const void* key, const void* value, float* scores,
     float* output, const float* mask, int num_heads, int num_kv_heads,
@@ -396,7 +397,14 @@ __global__ void sdpa_decode_cuda(
     const int key_head = head / (num_heads / num_kv_heads);
     const float* query_row = query +
         static_cast<size_t>(head) * query_head_stride;
-    float* score_row = scores + static_cast<size_t>(head) * key_length;
+    // The 512-thread launch guarantees key_length <= Threads, so its complete
+    // score row fits on chip. Long-context instances retain the global row.
+    __shared__ float score_cache[SharedScores ? Threads : 1];
+    float* score_row;
+    if constexpr (SharedScores)
+        score_row = score_cache;
+    else
+        score_row = scores + static_cast<size_t>(head) * key_length;
     __shared__ float reduction[Threads];
     __shared__ float2 pair_reduction[Threads];
 
@@ -1184,7 +1192,7 @@ void launch_sdpa_decode(
     // stage for short contexts; longer contexts benefit from the 1024-thread
     // specialization despite its larger block.
     if (key_length <= 512) {
-        sdpa_decode_cuda<512><<<num_heads, 512>>>(
+        sdpa_decode_cuda<512, true><<<num_heads, 512>>>(
             query, key, value, scores, output, mask, num_heads, num_kv_heads,
             key_length, past_length, key_dim, value_dim, key_capacity,
             cached, fp16_cache, causal, scale, query_feature_stride,
@@ -1193,7 +1201,7 @@ void launch_sdpa_decode(
             value_head_stride, mask_column_stride, output_feature_stride,
             output_head_stride);
     } else {
-        sdpa_decode_cuda<1024><<<num_heads, 1024>>>(
+        sdpa_decode_cuda<1024, false><<<num_heads, 1024>>>(
             query, key, value, scores, output, mask, num_heads, num_kv_heads,
             key_length, past_length, key_dim, value_dim, key_capacity,
             cached, fp16_cache, causal, scale, query_feature_stride,
