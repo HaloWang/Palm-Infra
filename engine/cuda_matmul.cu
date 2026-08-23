@@ -24,6 +24,13 @@ constexpr int q4_g32_rows_per_storage_block = 8;
 constexpr int q4_g32_quad_rows_target_blocks_per_sm = 6;
 constexpr int q4_g32_quad_rows_fallback_min_columns = 16384;
 constexpr int q4_g32_quad_rows_min_groups = 64;
+// Caching avoids repeated L1 activation reads for the two profitable middle
+// shapes. Shorter pair-row dots do not amortize the preload, while the very
+// wide vocabulary grid is already bandwidth-bound and only adds cache traffic.
+constexpr int q4_g32_activation_cache_max_inner = 4096;
+constexpr int q4_g32_pair_activation_cache_min_inner = 4096;
+constexpr int q4_g32_pair_activation_cache_max_columns = 4096;
+constexpr int q4_g32_quad_activation_cache_max_columns = 65536;
 // Four canonical storage blocks exactly fill one 256-thread CUDA block.
 constexpr int q4_g32_storage_blocks_per_cuda_block = 4;
 constexpr int q4_g32_dequant_threads =
@@ -272,6 +279,7 @@ __global__ void q4_g32_dense_gemv_cuda(
         output[column] = sum;
 }
 
+template <bool CacheActivation>
 __global__ void q4_g32_pair_rows_gemv_cuda(
     const float* __restrict__ activation,
     const Q4B8G32Block* __restrict__ weight,
@@ -288,6 +296,14 @@ __global__ void q4_g32_pair_rows_gemv_cuda(
     const int column = static_cast<int>(blockIdx.x) *
         q4_g32_rows_per_storage_block + row;
     const int groups = inner / 32;
+    extern __shared__ float activation_cache[];
+    if constexpr (CacheActivation) {
+        for (int index = static_cast<int>(threadIdx.x); index < inner;
+             index += static_cast<int>(blockDim.x))
+            activation_cache[index] = activation[index];
+        __syncthreads();
+        activation = activation_cache;
+    }
     float sum = 0.0f;
     for (int group = 0; group < groups; ++group) {
         const auto& block =
@@ -313,6 +329,7 @@ __global__ void q4_g32_pair_rows_gemv_cuda(
         output[column] = sum;
 }
 
+template <bool CacheActivation>
 __global__ void q4_g32_quad_rows_gemv_cuda(
     const float* __restrict__ activation,
     const Q4B8G32Block* __restrict__ weight,
@@ -330,6 +347,14 @@ __global__ void q4_g32_quad_rows_gemv_cuda(
     const int block_row = row % q4_g32_rows_per_storage_block;
     const int column = static_cast<int>(blockIdx.x) *
         storage_blocks_per_cuda_block * q4_g32_rows_per_storage_block + row;
+    extern __shared__ float activation_cache[];
+    if constexpr (CacheActivation) {
+        for (int index = static_cast<int>(threadIdx.x); index < inner;
+             index += static_cast<int>(blockDim.x))
+            activation_cache[index] = activation[index];
+        __syncthreads();
+        activation = activation_cache;
+    }
     if (storage_block * q4_g32_rows_per_storage_block >= columns)
         return;
     const int groups = inner / 32;
@@ -526,15 +551,34 @@ void launch_q4_g32_dense_gemv(
             : columns >= q4_g32_quad_rows_fallback_min_columns;
         const bool use_quad_rows =
             inner / 32 >= q4_g32_quad_rows_min_groups && enough_grid;
+        const bool cache_pair_activation =
+            inner >= q4_g32_pair_activation_cache_min_inner &&
+            inner <= q4_g32_activation_cache_max_inner &&
+            columns <= q4_g32_pair_activation_cache_max_columns;
+        const bool cache_quad_activation =
+            inner <= q4_g32_activation_cache_max_inner &&
+            columns < q4_g32_quad_activation_cache_max_columns;
         if (use_quad_rows) {
-            q4_g32_quad_rows_gemv_cuda<<<quad_blocks, threads>>>(
-                activation, weight, output, columns, inner);
+            if (cache_quad_activation)
+                q4_g32_quad_rows_gemv_cuda<true><<<
+                    quad_blocks, threads,
+                    static_cast<size_t>(inner) * sizeof(float)>>>(
+                        activation, weight, output, columns, inner);
+            else
+                q4_g32_quad_rows_gemv_cuda<false><<<quad_blocks, threads>>>(
+                    activation, weight, output, columns, inner);
         } else {
             const unsigned blocks = static_cast<unsigned>(
                 (columns + q4_g32_rows_per_storage_block - 1) /
                 q4_g32_rows_per_storage_block);
-            q4_g32_pair_rows_gemv_cuda<<<blocks, threads>>>(
-                activation, weight, output, columns, inner);
+            if (cache_pair_activation)
+                q4_g32_pair_rows_gemv_cuda<true><<<
+                    blocks, threads,
+                    static_cast<size_t>(inner) * sizeof(float)>>>(
+                        activation, weight, output, columns, inner);
+            else
+                q4_g32_pair_rows_gemv_cuda<false><<<blocks, threads>>>(
+                    activation, weight, output, columns, inner);
         }
     } else {
         const unsigned blocks = static_cast<unsigned>(
