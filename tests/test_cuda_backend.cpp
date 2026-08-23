@@ -1418,6 +1418,7 @@ int main() {
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
+        !test_wide_sdpa_decode(backend, Precision::FP16, 0) ||
         !test_wide_sdpa_decode(backend, Precision::FP16, 255) ||
         !test_wide_sdpa_decode(backend, Precision::FP32, 512) ||
         !test_wide_sdpa_decode(backend, Precision::FP16, 512) ||

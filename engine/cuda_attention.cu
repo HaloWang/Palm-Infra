@@ -7,6 +7,13 @@
 
 namespace {
 
+constexpr int staged_sdpa_head_dim = 128;
+constexpr int staged_sdpa_pairs = staged_sdpa_head_dim / 2;
+constexpr int staged_sdpa_threads = 256;
+constexpr int staged_sdpa_score_lanes_per_key = 4;
+constexpr int staged_sdpa_value_pairs_per_block = 8;
+static_assert(staged_sdpa_pairs % staged_sdpa_value_pairs_per_block == 0);
+
 __global__ void rope_cuda(
     const float* input, const float* cosine, const float* sine,
     float* output, int feature_dim, int sequence_length, int channels,
@@ -560,6 +567,139 @@ __global__ void sdpa_decode_cuda(
     }
 }
 
+// FP16 decode benefits from exposing work from the key and value axes as
+// independent blocks. A single fused block per query head leaves most SMs idle
+// on large GPUs; these three stages keep the same SDPA semantics while
+// increasing grid-level parallelism for the common 128-wide Qwen layout.
+__global__ void sdpa_decode_scores_fp16_cuda(
+    const float* query, const __half* key, float* scores, const float* mask,
+    int num_heads, int num_kv_heads, int key_length, int past_length,
+    int key_capacity, bool causal, float scale, size_t query_head_stride,
+    size_t mask_column_stride) {
+    constexpr int lanes_per_key = staged_sdpa_score_lanes_per_key;
+    constexpr int keys_per_block = staged_sdpa_threads / lanes_per_key;
+    const int head = static_cast<int>(blockIdx.x);
+    const int key_head = head / (num_heads / num_kv_heads);
+    const int lane = static_cast<int>(threadIdx.x) % lanes_per_key;
+    const int key_position = static_cast<int>(blockIdx.y) * keys_per_block +
+        static_cast<int>(threadIdx.x) / lanes_per_key;
+    if (key_position >= key_length)
+        return;
+
+    const auto* query2 = reinterpret_cast<const float2*>(
+        query + static_cast<size_t>(head) * query_head_stride);
+    const size_t key_base =
+        (static_cast<size_t>(key_head) * key_capacity + key_position) *
+        staged_sdpa_head_dim;
+    const auto* key2 = reinterpret_cast<const __half2*>(key) + key_base / 2;
+    float dot = 0.0f;
+#pragma unroll
+    for (int pair = lane; pair < staged_sdpa_pairs;
+         pair += lanes_per_key) {
+        const float2 q = query2[pair];
+        const float2 k = __half22float2(key2[pair]);
+        dot = fmaf(q.x, k.x, dot);
+        dot = fmaf(q.y, k.y, dot);
+    }
+    const unsigned active = __activemask();
+#pragma unroll
+    for (int offset = lanes_per_key / 2; offset > 0; offset /= 2)
+        dot += __shfl_down_sync(active, dot, offset, lanes_per_key);
+    if (lane != 0)
+        return;
+    float score = dot * scale;
+    if (mask)
+        score += mask[static_cast<size_t>(key_position) *
+                      mask_column_stride];
+    else if (causal && key_position > past_length)
+        score = -FLT_MAX;
+    scores[static_cast<size_t>(head) * key_length + key_position] = score;
+}
+
+template <int Threads>
+__global__ void sdpa_decode_softmax_cuda(float* scores, int key_length) {
+    const int head = static_cast<int>(blockIdx.x);
+    float* row = scores + static_cast<size_t>(head) * key_length;
+    __shared__ float reduction[Threads];
+    float local_maximum = -FLT_MAX;
+    for (int position = threadIdx.x; position < key_length;
+         position += Threads)
+        local_maximum = fmaxf(local_maximum, row[position]);
+    const float maximum = mollm_cuda::detail::block_reduce_max<Threads>(
+        local_maximum, reduction);
+    float local_sum = 0.0f;
+    for (int position = threadIdx.x; position < key_length;
+         position += Threads) {
+        const float numerator = expf(row[position] - maximum);
+        row[position] = numerator;
+        local_sum += numerator;
+    }
+    const float sum = mollm_cuda::detail::block_reduce_sum<Threads>(
+        local_sum, reduction);
+    const float inverse_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+    for (int position = threadIdx.x; position < key_length;
+         position += Threads)
+        row[position] *= inverse_sum;
+}
+
+__global__ void sdpa_decode_value_fp16_cuda(
+    const float* probabilities, const __half* value, float* output,
+    int num_heads, int num_kv_heads, int key_length, int value_capacity,
+    size_t output_head_stride) {
+    constexpr int pairs_per_block = staged_sdpa_value_pairs_per_block;
+    constexpr int position_lanes = staged_sdpa_threads / pairs_per_block;
+    const int head = static_cast<int>(blockIdx.x);
+    const int key_head = head / (num_heads / num_kv_heads);
+    const int local_pair =
+        static_cast<int>(threadIdx.x) % pairs_per_block;
+    const int pair = static_cast<int>(blockIdx.y) * pairs_per_block +
+        local_pair;
+    const int position_lane =
+        static_cast<int>(threadIdx.x) / pairs_per_block;
+    const float* score_row =
+        probabilities + static_cast<size_t>(head) * key_length;
+    const auto* value2 = reinterpret_cast<const __half2*>(value) +
+        static_cast<size_t>(key_head) * value_capacity * staged_sdpa_pairs;
+    float2 sum{0.0f, 0.0f};
+    for (int position = position_lane; position < key_length;
+         position += position_lanes) {
+        const float2 element = __half22float2(
+            value2[static_cast<size_t>(position) * staged_sdpa_pairs + pair]);
+        const float probability = score_row[position];
+        sum.x = fmaf(probability, element.x, sum.x);
+        sum.y = fmaf(probability, element.y, sum.y);
+    }
+    // A warp contains four position lanes for each of its eight adjacent
+    // value pairs. Fold those four first, then combine the eight warp totals
+    // through a compact shared-memory slab.
+    const unsigned active = __activemask();
+    sum.x += __shfl_down_sync(active, sum.x, 16);
+    sum.y += __shfl_down_sync(active, sum.y, 16);
+    sum.x += __shfl_down_sync(active, sum.x, 8);
+    sum.y += __shfl_down_sync(active, sum.y, 8);
+    constexpr int warps_per_block = staged_sdpa_threads / 32;
+    __shared__ float2 partial[warps_per_block * pairs_per_block];
+    const int position_lane_in_warp = position_lane % 4;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    if (position_lane_in_warp == 0)
+        partial[warp * pairs_per_block + local_pair] = sum;
+    __syncthreads();
+    if (threadIdx.x < pairs_per_block) {
+        float2 result = partial[local_pair];
+#pragma unroll
+        for (int lane = 1; lane < warps_per_block; ++lane) {
+            const float2 next =
+                partial[lane * pairs_per_block + local_pair];
+            result.x += next.x;
+            result.y += next.y;
+        }
+        const size_t output_base =
+            static_cast<size_t>(head) * output_head_stride + pair * 2;
+        output[output_base] = result.x;
+        output[output_base + 1] = result.y;
+    }
+}
+
 }  // namespace
 
 namespace mollm_cuda {
@@ -669,6 +809,39 @@ void launch_sdpa_decode(
     size_t value_position_stride, size_t value_head_stride,
     size_t mask_column_stride, size_t output_feature_stride,
     size_t output_head_stride) {
+    const bool staged_fp16_128 = cached && fp16_cache &&
+        key_dim == staged_sdpa_head_dim &&
+        value_dim == staged_sdpa_head_dim && query_feature_stride == 1 &&
+        query_head_stride % 2 == 0 && output_feature_stride == 1 &&
+        (reinterpret_cast<uintptr_t>(query) &
+         (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(key) &
+         (alignof(__half2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(value) &
+         (alignof(__half2) - 1)) == 0;
+    if (staged_fp16_128) {
+        constexpr int keys_per_score_block =
+            staged_sdpa_threads / staged_sdpa_score_lanes_per_key;
+        const dim3 score_grid(
+            static_cast<unsigned>(num_heads),
+            static_cast<unsigned>(
+                (key_length + keys_per_score_block - 1) /
+                keys_per_score_block));
+        sdpa_decode_scores_fp16_cuda<<<score_grid, staged_sdpa_threads>>>(
+            query, static_cast<const __half*>(key), scores, mask, num_heads,
+            num_kv_heads, key_length, past_length, key_capacity, causal,
+            scale, query_head_stride, mask_column_stride);
+        sdpa_decode_softmax_cuda<staged_sdpa_threads>
+            <<<num_heads, staged_sdpa_threads>>>(scores, key_length);
+        const dim3 value_grid(
+            static_cast<unsigned>(num_heads),
+            staged_sdpa_pairs / staged_sdpa_value_pairs_per_block);
+        sdpa_decode_value_fp16_cuda<<<value_grid, staged_sdpa_threads>>>(
+            scores, static_cast<const __half*>(value), output, num_heads,
+            num_kv_heads, key_length, key_capacity, output_head_stride);
+        return;
+    }
+
     // A decode head owns only one block, so expose as many independent key
     // dot products as practical. 512 threads avoids an unnecessary reduction
     // stage for short contexts; longer contexts benefit from the 1024-thread
