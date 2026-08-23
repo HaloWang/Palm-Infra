@@ -866,7 +866,8 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             cp.k->shape[3] = 1;
             cp.k->compute_strides();
             if (!alloc_cache_buf(
-                    cp.k, total, PersistentHostAccess::MIRRORED_PREFIX,
+                    cp.k, total,
+                    PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
                     CacheMetadata::SIZE))
                 return false;
             CacheMetadata metadata;
@@ -891,7 +892,8 @@ bool LLMEngine::allocate_caches(Graph& g, ExecContext& exec_ctx,
             cp.v->shape[3] = 1;
             cp.v->compute_strides();
             if (!alloc_cache_buf(
-                    cp.v, total, PersistentHostAccess::MIRRORED_PREFIX,
+                    cp.v, total,
+                    PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
                     CacheMetadata::SIZE))
                 return false;
             CacheMetadata metadata;

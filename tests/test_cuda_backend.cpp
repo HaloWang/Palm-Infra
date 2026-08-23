@@ -506,10 +506,12 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
         cache_precision, MemoryType::EXTERNAL,
         value_cache_bytes / cache_element_size);
     backend.alloc_persistent(
-        key_cache, key_cache_bytes, PersistentHostAccess::MIRRORED_PREFIX,
+        key_cache, key_cache_bytes,
+        PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
         CacheMetadata::SIZE);
     backend.alloc_persistent(
-        value_cache, value_cache_bytes, PersistentHostAccess::MIRRORED_PREFIX,
+        value_cache, value_cache_bytes,
+        PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
         CacheMetadata::SIZE);
     CacheMetadata key_metadata;
     key_metadata.current_seq_len = past_length;
@@ -988,10 +990,12 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
         value_cache_bytes / cache_element_size);
     backend.alloc_persistent(
         key_cache, key_cache_bytes,
-        PersistentHostAccess::MIRRORED_PREFIX, CacheMetadata::SIZE);
+        PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
+        CacheMetadata::SIZE);
     backend.alloc_persistent(
         value_cache, value_cache_bytes,
-        PersistentHostAccess::MIRRORED_PREFIX, CacheMetadata::SIZE);
+        PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX,
+        CacheMetadata::SIZE);
 
     CacheMetadata key_metadata;
     key_metadata.current_seq_len = past_length;
@@ -1377,6 +1381,7 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     Tensor full = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, 16);
     Tensor mirrored = full;
+    Tensor host_authoritative = full;
     Tensor device_only = full;
     backend.alloc_persistent(
         full, full.nbytes(), PersistentHostAccess::FULL);
@@ -1384,9 +1389,14 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         mirrored, mirrored.nbytes(),
         PersistentHostAccess::MIRRORED_PREFIX, 16);
     backend.alloc_persistent(
+        host_authoritative, host_authoritative.nbytes(),
+        PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX, 16);
+    backend.alloc_persistent(
         device_only, device_only.nbytes(), PersistentHostAccess::NONE);
     if (!full.data || full.data != full.device_data ||
         !mirrored.data || mirrored.data == mirrored.device_data ||
+        !host_authoritative.data ||
+        host_authoritative.data == host_authoritative.device_data ||
         !device_only.data || device_only.data != device_only.device_data)
         return false;
     const uint32_t prefix[4] = {7, 8, 9, 10};
@@ -1394,6 +1404,21 @@ bool test_memory_and_fallback_bridge(CudaBackend& backend) {
         std::memcmp(mirrored.data, prefix, sizeof(prefix)) != 0 ||
         !backend.zero_tensor(mirrored, sizeof(uint32_t), sizeof(uint32_t)) ||
         static_cast<const uint32_t*>(mirrored.data)[1] != 0)
+        return false;
+    const uint32_t split_source[6] = {21, 22, 23, 24, 25, 26};
+    uint32_t split_copy[6] = {};
+    if (!backend.copy_from_host(
+            split_source, host_authoritative, sizeof(split_source)) ||
+        !backend.copy_to_host(
+            host_authoritative, split_copy, sizeof(split_copy)) ||
+        std::memcmp(split_source, split_copy, sizeof(split_source)) != 0 ||
+        !backend.zero_tensor(
+            host_authoritative, 2 * sizeof(uint32_t),
+            3 * sizeof(uint32_t)) ||
+        !backend.copy_to_host(
+            host_authoritative, split_copy, sizeof(split_copy)) ||
+        split_copy[0] != 21 || split_copy[1] != 22 || split_copy[2] != 23 ||
+        split_copy[3] != 0 || split_copy[4] != 0 || split_copy[5] != 26)
         return false;
     const float payload[2] = {31.0f, 32.0f};
     float payload_copy[2] = {};

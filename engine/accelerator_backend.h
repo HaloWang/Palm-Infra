@@ -32,6 +32,12 @@ enum class PersistentHostAccess {
     // it through Backend transfer/zero methods so the device copy stays in
     // sync. The prefix size is passed to alloc_persistent().
     MIRRORED_PREFIX,
+    // The prefix is host-owned control metadata and device operators access
+    // only the payload after it. Transfer methods expose a coherent logical
+    // tensor, but discrete backends need not copy prefix-only updates to the
+    // device. This avoids tiny synchronous transfers for frequently updated
+    // state such as KV-cache lengths.
+    HOST_AUTHORITATIVE_PREFIX,
     // The host never dereferences this allocation.
     NONE,
 };

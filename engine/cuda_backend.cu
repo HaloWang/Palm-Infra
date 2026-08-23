@@ -46,8 +46,9 @@ struct CudaBackend::Impl {
     };
 
     struct PersistentHostMirror {
-        explicit PersistentHostMirror(size_t bytes)
+        PersistentHostMirror(size_t bytes, bool coherent)
             : size(bytes),
+              device_coherent(coherent),
               words((bytes + sizeof(uint64_t) - 1) / sizeof(uint64_t)) {}
 
         uint8_t* data() {
@@ -55,6 +56,7 @@ struct CudaBackend::Impl {
         }
 
         size_t size = 0;
+        bool device_coherent = true;
         std::vector<uint64_t> words;
     };
 
@@ -525,6 +527,21 @@ bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
         impl_->failed = true;
         return false;
     }
+    size_t host_prefix_bytes = 0;
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        source.device_data);
+    const size_t absolute_offset = source.device_offset + source_offset;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        !mirror->second.device_coherent &&
+        absolute_offset < mirror->second.size) {
+        host_prefix_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        std::memcpy(
+            destination, mirror->second.data() + absolute_offset,
+            host_prefix_bytes);
+        if (host_prefix_bytes == nbytes)
+            return true;
+    }
     const auto* device = device_pointer_const<uint8_t>(source);
     if (!device) {
         if (!source.data) {
@@ -532,13 +549,16 @@ bool CudaBackend::copy_to_host(const Tensor& source, void* destination,
             return false;
         }
         std::memcpy(
-            destination,
-            static_cast<const uint8_t*>(source.data) + source_offset,
-            nbytes);
+            static_cast<uint8_t*>(destination) + host_prefix_bytes,
+            static_cast<const uint8_t*>(source.data) + source_offset +
+                host_prefix_bytes,
+            nbytes - host_prefix_bytes);
         return true;
     }
     if (!mollm_cuda::copy_memory(
-            destination, device + source_offset, nbytes,
+            static_cast<uint8_t*>(destination) + host_prefix_bytes,
+            device + source_offset + host_prefix_bytes,
+            nbytes - host_prefix_bytes,
             cudaMemcpyDeviceToHost, "cudaMemcpy tensor to host")) {
         impl_->failed = true;
         return false;
@@ -554,6 +574,23 @@ bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
         impl_->failed = true;
         return false;
     }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        destination.device_data);
+    const size_t absolute_offset =
+        destination.device_offset + destination_offset;
+    size_t host_prefix_bytes = 0;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        host_prefix_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        if (!mirror->second.device_coherent) {
+            std::memcpy(
+                mirror->second.data() + absolute_offset, source,
+                host_prefix_bytes);
+            if (host_prefix_bytes == nbytes)
+                return true;
+        }
+    }
     auto* device = device_pointer<uint8_t>(destination);
     if (!device) {
         if (!destination.data) {
@@ -565,23 +602,23 @@ bool CudaBackend::copy_from_host(const void* source, Tensor& destination,
             source, nbytes);
         return true;
     }
+    const size_t device_skip =
+        mirror != impl_->persistent_host_mirrors.end() &&
+            !mirror->second.device_coherent
+        ? host_prefix_bytes : 0;
     if (!mollm_cuda::copy_memory(
-            device + destination_offset, source, nbytes,
+            device + destination_offset + device_skip,
+            static_cast<const uint8_t*>(source) + device_skip,
+            nbytes - device_skip,
             cudaMemcpyHostToDevice, "cudaMemcpy tensor from host")) {
         impl_->failed = true;
         return false;
     }
-    const auto mirror = impl_->persistent_host_mirrors.find(
-        destination.device_data);
-    const size_t absolute_offset =
-        destination.device_offset + destination_offset;
     if (mirror != impl_->persistent_host_mirrors.end() &&
-        absolute_offset < mirror->second.size) {
-        const size_t mirror_bytes = std::min(
-            nbytes, mirror->second.size - absolute_offset);
+        mirror->second.device_coherent && host_prefix_bytes > 0)
         std::memcpy(
-            mirror->second.data() + absolute_offset, source, mirror_bytes);
-    }
+            mirror->second.data() + absolute_offset, source,
+            host_prefix_bytes);
     return true;
 }
 
@@ -591,6 +628,22 @@ bool CudaBackend::zero_tensor(Tensor& tensor, size_t nbytes,
         nbytes > tensor.view_span_bytes() - destination_offset) {
         impl_->failed = true;
         return false;
+    }
+    const auto mirror = impl_->persistent_host_mirrors.find(
+        tensor.device_data);
+    const size_t absolute_offset = tensor.device_offset + destination_offset;
+    size_t host_prefix_bytes = 0;
+    if (mirror != impl_->persistent_host_mirrors.end() &&
+        absolute_offset < mirror->second.size) {
+        host_prefix_bytes = std::min(
+            nbytes, mirror->second.size - absolute_offset);
+        if (!mirror->second.device_coherent) {
+            std::memset(
+                mirror->second.data() + absolute_offset, 0,
+                host_prefix_bytes);
+            if (host_prefix_bytes == nbytes)
+                return true;
+        }
     }
     auto* device = device_pointer<uint8_t>(tensor);
     if (!device) {
@@ -603,21 +656,20 @@ bool CudaBackend::zero_tensor(Tensor& tensor, size_t nbytes,
             0, nbytes);
         return true;
     }
+    const size_t device_skip =
+        mirror != impl_->persistent_host_mirrors.end() &&
+            !mirror->second.device_coherent
+        ? host_prefix_bytes : 0;
     if (!mollm_cuda::zero_memory(
-            device + destination_offset, nbytes, "cudaMemset tensor")) {
+            device + destination_offset + device_skip, nbytes - device_skip,
+            "cudaMemset tensor")) {
         impl_->failed = true;
         return false;
     }
-    const auto mirror = impl_->persistent_host_mirrors.find(
-        tensor.device_data);
-    const size_t absolute_offset = tensor.device_offset + destination_offset;
     if (mirror != impl_->persistent_host_mirrors.end() &&
-        absolute_offset < mirror->second.size) {
-        const size_t mirror_bytes = std::min(
-            nbytes, mirror->second.size - absolute_offset);
+        mirror->second.device_coherent && host_prefix_bytes > 0)
         std::memset(
-            mirror->second.data() + absolute_offset, 0, mirror_bytes);
-    }
+            mirror->second.data() + absolute_offset, 0, host_prefix_bytes);
     return true;
 }
 
@@ -650,8 +702,11 @@ void CudaBackend::alloc_persistent(
     Tensor& tensor, size_t nbytes, PersistentHostAccess host_access,
     size_t host_prefix_bytes) {
     void* storage = nullptr;
+    const bool has_host_prefix =
+        host_access == PersistentHostAccess::MIRRORED_PREFIX ||
+        host_access == PersistentHostAccess::HOST_AUTHORITATIVE_PREFIX;
     if (!available() || nbytes == 0 ||
-        (host_access == PersistentHostAccess::MIRRORED_PREFIX &&
+        (has_host_prefix &&
          (host_prefix_bytes == 0 || host_prefix_bytes > nbytes))) {
         impl_->failed = true;
         return;
@@ -677,10 +732,14 @@ void CudaBackend::alloc_persistent(
             return;
         }
         impl_->device_allocations.push_back(storage);
-        if (host_access == PersistentHostAccess::MIRRORED_PREFIX) {
+        if (has_host_prefix) {
             auto [entry, inserted] =
                 impl_->persistent_host_mirrors.emplace(
-                    storage, Impl::PersistentHostMirror(host_prefix_bytes));
+                    storage,
+                    Impl::PersistentHostMirror(
+                        host_prefix_bytes,
+                        host_access ==
+                            PersistentHostAccess::MIRRORED_PREFIX));
             (void)inserted;
             tensor.data = entry->second.data();
         } else {
