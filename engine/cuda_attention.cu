@@ -257,28 +257,17 @@ __global__ void sdpa_output_cuda(
     for (int position = threadIdx.x; position < key_length;
          position += blockDim.x)
         local_maximum = fmaxf(local_maximum, score_row[position]);
-    reduction[threadIdx.x] = local_maximum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] = fmaxf(
-                reduction[threadIdx.x], reduction[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float maximum = reduction[0];
+    const float maximum =
+        mollm_cuda::detail::block_reduce_max_256(
+            local_maximum, reduction);
     float local_sum = 0.0f;
     for (int position = threadIdx.x; position < key_length;
          position += blockDim.x)
         local_sum += expf(score_row[position] - maximum);
-    reduction[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inverse_sum = reduction[0] > 0.0f
-        ? 1.0f / reduction[0] : 0.0f;
+    const float block_sum =
+        mollm_cuda::detail::block_reduce_sum_256(local_sum, reduction);
+    const float inverse_sum = block_sum > 0.0f
+        ? 1.0f / block_sum : 0.0f;
     for (int dimension = threadIdx.x; dimension < value_dim;
          dimension += blockDim.x) {
         float result = 0.0f;
@@ -360,15 +349,9 @@ __global__ void sdpa_decode_cuda(
         score_row[key_position] = score;
         local_maximum = fmaxf(local_maximum, score);
     }
-    reduction[threadIdx.x] = local_maximum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] = fmaxf(
-                reduction[threadIdx.x], reduction[threadIdx.x + stride]);
-        __syncthreads();
-    }
-    const float maximum = reduction[0];
+    const float maximum =
+        mollm_cuda::detail::block_reduce_max_256(
+            local_maximum, reduction);
 
     float local_sum = 0.0f;
     for (int key_position = threadIdx.x; key_position < key_length;
@@ -377,15 +360,10 @@ __global__ void sdpa_decode_cuda(
         score_row[key_position] = numerator;
         local_sum += numerator;
     }
-    reduction[threadIdx.x] = local_sum;
-    __syncthreads();
-    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
-        if (threadIdx.x < stride)
-            reduction[threadIdx.x] += reduction[threadIdx.x + stride];
-        __syncthreads();
-    }
-    const float inverse_sum = reduction[0] > 0.0f
-        ? 1.0f / reduction[0] : 0.0f;
+    const float block_sum =
+        mollm_cuda::detail::block_reduce_sum_256(local_sum, reduction);
+    const float inverse_sum = block_sum > 0.0f
+        ? 1.0f / block_sum : 0.0f;
 
     for (int dimension = threadIdx.x; dimension < value_dim;
          dimension += blockDim.x) {
