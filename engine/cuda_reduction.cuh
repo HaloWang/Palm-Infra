@@ -17,20 +17,23 @@ __device__ __forceinline__ float warp_reduce_max(float value) {
     return value;
 }
 
-// Preserve the original 256-thread tree's addition order through stride 32,
-// then finish the first warp with shuffles. This keeps quantized-model parity
-// stable while avoiding five full-block barriers.
-__device__ __forceinline__ float block_reduce_sum_256(
+// Keep the cross-warp tree explicit through stride 32, then finish the first
+// warp with shuffles. Threads is compile-time fixed so every specialization
+// has the same reduction order as the equivalent shared-memory tree.
+template <int Threads>
+__device__ __forceinline__ float block_reduce_sum(
     float value, float* reduction) {
+    static_assert(Threads >= 64 && Threads <= 1024);
+    static_assert((Threads & (Threads - 1)) == 0);
     const int thread = static_cast<int>(threadIdx.x);
     reduction[thread] = value;
     __syncthreads();
-    if (thread < 128)
-        reduction[thread] += reduction[thread + 128];
-    __syncthreads();
-    if (thread < 64)
-        reduction[thread] += reduction[thread + 64];
-    __syncthreads();
+#pragma unroll
+    for (int offset = Threads / 2; offset >= 64; offset >>= 1) {
+        if (thread < offset)
+            reduction[thread] += reduction[thread + offset];
+        __syncthreads();
+    }
     if (thread < 32) {
         value = reduction[thread] + reduction[thread + 32];
         value = warp_reduce_sum(value);
@@ -41,19 +44,21 @@ __device__ __forceinline__ float block_reduce_sum_256(
     return reduction[0];
 }
 
-__device__ __forceinline__ float block_reduce_max_256(
+template <int Threads>
+__device__ __forceinline__ float block_reduce_max(
     float value, float* reduction) {
+    static_assert(Threads >= 64 && Threads <= 1024);
+    static_assert((Threads & (Threads - 1)) == 0);
     const int thread = static_cast<int>(threadIdx.x);
     reduction[thread] = value;
     __syncthreads();
-    if (thread < 128)
-        reduction[thread] = fmaxf(
-            reduction[thread], reduction[thread + 128]);
-    __syncthreads();
-    if (thread < 64)
-        reduction[thread] = fmaxf(
-            reduction[thread], reduction[thread + 64]);
-    __syncthreads();
+#pragma unroll
+    for (int offset = Threads / 2; offset >= 64; offset >>= 1) {
+        if (thread < offset)
+            reduction[thread] = fmaxf(
+                reduction[thread], reduction[thread + offset]);
+        __syncthreads();
+    }
     if (thread < 32) {
         value = fmaxf(reduction[thread], reduction[thread + 32]);
         value = warp_reduce_max(value);

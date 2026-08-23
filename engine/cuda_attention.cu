@@ -90,7 +90,7 @@ __global__ void qk_rms_norm_rope_cuda(
     }
     __shared__ float reduction[256];
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum_256(sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
     const float inverse = rsqrtf(block_sum / feature_dim + epsilon);
 
     const int position = source_row % sequence_length;
@@ -258,14 +258,14 @@ __global__ void sdpa_output_cuda(
          position += blockDim.x)
         local_maximum = fmaxf(local_maximum, score_row[position]);
     const float maximum =
-        mollm_cuda::detail::block_reduce_max_256(
+        mollm_cuda::detail::block_reduce_max<256>(
             local_maximum, reduction);
     float local_sum = 0.0f;
     for (int position = threadIdx.x; position < key_length;
          position += blockDim.x)
         local_sum += expf(score_row[position] - maximum);
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum_256(local_sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<256>(local_sum, reduction);
     const float inverse_sum = block_sum > 0.0f
         ? 1.0f / block_sum : 0.0f;
     for (int dimension = threadIdx.x; dimension < value_dim;
@@ -300,6 +300,7 @@ __global__ void sdpa_output_cuda(
 // backend scratch buffer avoids a context-length shared-memory limit while a
 // single launch removes the inter-kernel boundary.  Softmax exponentials are
 // also computed once per key instead of once per output dimension.
+template <int Threads>
 __global__ void sdpa_decode_cuda(
     const float* query, const void* key, const void* value, float* scores,
     float* output, const float* mask, int num_heads, int num_kv_heads,
@@ -318,7 +319,7 @@ __global__ void sdpa_decode_cuda(
     const float* query_row = query +
         static_cast<size_t>(head) * query_head_stride;
     float* score_row = scores + static_cast<size_t>(head) * key_length;
-    __shared__ float reduction[256];
+    __shared__ float reduction[Threads];
 
     float local_maximum = -FLT_MAX;
     for (int key_position = threadIdx.x; key_position < key_length;
@@ -350,7 +351,7 @@ __global__ void sdpa_decode_cuda(
         local_maximum = fmaxf(local_maximum, score);
     }
     const float maximum =
-        mollm_cuda::detail::block_reduce_max_256(
+        mollm_cuda::detail::block_reduce_max<Threads>(
             local_maximum, reduction);
 
     float local_sum = 0.0f;
@@ -361,7 +362,7 @@ __global__ void sdpa_decode_cuda(
         local_sum += numerator;
     }
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum_256(local_sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<Threads>(local_sum, reduction);
     const float inverse_sum = block_sum > 0.0f
         ? 1.0f / block_sum : 0.0f;
 
@@ -498,14 +499,29 @@ void launch_sdpa_decode(
     size_t value_position_stride, size_t value_head_stride,
     size_t mask_column_stride, size_t output_feature_stride,
     size_t output_head_stride) {
-    constexpr int threads = 256;
-    sdpa_decode_cuda<<<num_heads, threads>>>(
-        query, key, value, scores, output, mask, num_heads, num_kv_heads,
-        key_length, past_length, key_dim, value_dim, key_capacity, cached,
-        fp16_cache, causal, scale, query_feature_stride, query_head_stride,
-        key_feature_stride, key_position_stride, key_head_stride,
-        value_feature_stride, value_position_stride, value_head_stride,
-        mask_column_stride, output_feature_stride, output_head_stride);
+    // A decode head owns only one block, so expose as many independent key
+    // dot products as practical. 512 threads avoids an unnecessary reduction
+    // stage for short contexts; longer contexts benefit from the 1024-thread
+    // specialization despite its larger block.
+    if (key_length <= 512) {
+        sdpa_decode_cuda<512><<<num_heads, 512>>>(
+            query, key, value, scores, output, mask, num_heads, num_kv_heads,
+            key_length, past_length, key_dim, value_dim, key_capacity,
+            cached, fp16_cache, causal, scale, query_feature_stride,
+            query_head_stride, key_feature_stride, key_position_stride,
+            key_head_stride, value_feature_stride, value_position_stride,
+            value_head_stride, mask_column_stride, output_feature_stride,
+            output_head_stride);
+    } else {
+        sdpa_decode_cuda<1024><<<num_heads, 1024>>>(
+            query, key, value, scores, output, mask, num_heads, num_kv_heads,
+            key_length, past_length, key_dim, value_dim, key_capacity,
+            cached, fp16_cache, causal, scale, query_feature_stride,
+            query_head_stride, key_feature_stride, key_position_stride,
+            key_head_stride, value_feature_stride, value_position_stride,
+            value_head_stride, mask_column_stride, output_feature_stride,
+            output_head_stride);
+    }
 }
 
 }  // namespace mollm_cuda

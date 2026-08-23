@@ -859,6 +859,145 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     return true;
 }
 
+bool test_long_sdpa_decode(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    constexpr int heads = 2;
+    constexpr int kv_heads = 1;
+    constexpr int key_dim = 8;
+    constexpr int value_dim = 8;
+    constexpr int past_length = 512;
+    constexpr int key_length = past_length + 1;
+    constexpr int capacity = key_length + 1;
+
+    Tensor query = device_tensor(backend, key_dim, 1, heads);
+    Tensor key = device_tensor(backend, key_dim, 1, kv_heads);
+    Tensor value = device_tensor(backend, value_dim, 1, kv_heads);
+    Tensor output = device_tensor(backend, value_dim, 1, heads);
+    std::vector<float> query_data(query.nelements());
+    std::vector<float> key_data(key.nelements());
+    std::vector<float> value_data(value.nelements());
+    for (size_t index = 0; index < query_data.size(); ++index)
+        query_data[index] =
+            (static_cast<int>(index % 11) - 5) / 13.0f;
+    for (size_t index = 0; index < key_data.size(); ++index)
+        key_data[index] =
+            (static_cast<int>(index % 7) - 3) / 9.0f;
+    for (size_t index = 0; index < value_data.size(); ++index)
+        value_data[index] =
+            (static_cast<int>(index % 9) - 4) / 10.0f;
+    if (!upload(backend, query, query_data) ||
+        !upload(backend, key, key_data) ||
+        !upload(backend, value, value_data))
+        return false;
+
+    std::vector<float> cached_key(
+        static_cast<size_t>(capacity) * key_dim);
+    std::vector<float> cached_value(
+        static_cast<size_t>(capacity) * value_dim);
+    for (int position = 0; position < capacity; ++position) {
+        for (int dimension = 0; dimension < key_dim; ++dimension) {
+            cached_key[static_cast<size_t>(position) * key_dim + dimension] =
+                ((position * 5 + dimension * 3) % 23 - 11) / 17.0f;
+        }
+        for (int dimension = 0; dimension < value_dim; ++dimension) {
+            cached_value[
+                static_cast<size_t>(position) * value_dim + dimension] =
+                ((position * 7 + dimension * 2) % 19 - 9) / 14.0f;
+        }
+    }
+
+    const size_t key_cache_bytes = CacheMetadata::SIZE +
+        cached_key.size() * sizeof(float);
+    const size_t value_cache_bytes = CacheMetadata::SIZE +
+        cached_value.size() * sizeof(float);
+    Tensor key_cache = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        key_cache_bytes / sizeof(float));
+    Tensor value_cache = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_cache_bytes / sizeof(float));
+    backend.alloc_persistent(
+        key_cache, key_cache_bytes,
+        PersistentHostAccess::MIRRORED_PREFIX, CacheMetadata::SIZE);
+    backend.alloc_persistent(
+        value_cache, value_cache_bytes,
+        PersistentHostAccess::MIRRORED_PREFIX, CacheMetadata::SIZE);
+
+    CacheMetadata key_metadata;
+    key_metadata.current_seq_len = past_length;
+    key_metadata.max_seq_len = capacity;
+    key_metadata.num_kv_heads = kv_heads;
+    key_metadata.head_dim = key_dim;
+    CacheMetadata value_metadata;
+    value_metadata.current_seq_len = past_length;
+    value_metadata.max_seq_len = capacity;
+    value_metadata.num_kv_heads = kv_heads;
+    value_metadata.v_head_dim = value_dim;
+    if (!backend.copy_from_host(
+            &key_metadata, key_cache, sizeof(key_metadata)) ||
+        !backend.copy_from_host(
+            &value_metadata, value_cache, sizeof(value_metadata)) ||
+        !backend.copy_from_host(
+            cached_key.data(), key_cache,
+            cached_key.size() * sizeof(float), CacheMetadata::SIZE) ||
+        !backend.copy_from_host(
+            cached_value.data(), value_cache,
+            cached_value.size() * sizeof(float), CacheMetadata::SIZE))
+        return false;
+
+    GraphNode sdpa;
+    sdpa.op_type = OpType::SDPA;
+    sdpa.params.i32 = {
+        2, 1, heads, kv_heads, key_dim, value_dim};
+    const float scale = 1.0f / std::sqrt(static_cast<float>(key_dim));
+    sdpa.params.f32 = {scale};
+    backend.dispatch(
+        sdpa, {&query, &key, &value, nullptr, &key_cache, &value_cache},
+        &output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed())
+        return false;
+
+    std::vector<float> expected(
+        static_cast<size_t>(heads) * value_dim, 0.0f);
+    std::vector<float> scores(key_length);
+    for (int head = 0; head < heads; ++head) {
+        float maximum = -INFINITY;
+        for (int position = 0; position < key_length; ++position) {
+            float dot = 0.0f;
+            for (int dimension = 0; dimension < key_dim; ++dimension) {
+                const float key_element = position < past_length
+                    ? cached_key[
+                          static_cast<size_t>(position) * key_dim +
+                          dimension]
+                    : key_data[dimension];
+                dot += query_data[head * key_dim + dimension] * key_element;
+            }
+            scores[position] = dot * scale;
+            maximum = std::max(maximum, scores[position]);
+        }
+        float sum = 0.0f;
+        for (float& score : scores) {
+            score = std::exp(score - maximum);
+            sum += score;
+        }
+        for (int position = 0; position < key_length; ++position) {
+            for (int dimension = 0; dimension < value_dim; ++dimension) {
+                const float value_element = position < past_length
+                    ? cached_value[
+                          static_cast<size_t>(position) * value_dim +
+                          dimension]
+                    : value_data[dimension];
+                expected[head * value_dim + dimension] +=
+                    scores[position] / sum * value_element;
+            }
+        }
+    }
+    std::vector<float> actual;
+    return download(backend, output, actual) &&
+        close_enough(actual, expected, 3e-5f);
+}
+
 bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor storage = device_tensor(backend, 6, 2);
@@ -1123,7 +1262,8 @@ int main() {
     if (backend.kv_cache_precision(Precision::FP16) != Precision::FP16 ||
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
-        !test_layout_rope_and_sdpa(backend, Precision::FP16))
+        !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
+        !test_long_sdpa_decode(backend))
         return 1;
     if (!test_memory_and_fallback_bridge(backend))
         return 1;

@@ -126,7 +126,7 @@ __global__ void rms_norm_cuda(const float* input, const float* weight,
     }
     __shared__ float reduction[256];
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum_256(sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
     const float inverse = rsqrtf(block_sum / width + epsilon);
     for (int column = threadIdx.x; column < width; column += blockDim.x)
         output[static_cast<size_t>(row) * width + column] =
@@ -152,7 +152,7 @@ __global__ void add_rms_norm_cuda(
     }
     __shared__ float reduction[256];
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum_256(sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
     const float inverse = rsqrtf(block_sum / width + epsilon);
     float* output_row = output + static_cast<size_t>(row) *
         output_row_stride;
