@@ -436,19 +436,19 @@ __global__ void sdpa_decode_cuda(
         score_row[key_position] *= inverse_sum;
     __syncthreads();
 
-    // The 512-thread specialization has four scalar workers per Qwen value
-    // dimension; pairing dimensions raises that to eight. The 1024-thread
-    // kernel already reaches the eight-group cap, so keep its leaner scalar
-    // path.
-    const bool vector_value = Threads == 512 && cached && fp16_cache &&
-        value_dim > 0 && value_dim % 2 == 0 && value_dim / 2 <= Threads &&
+    // Pairing adjacent FP16 dimensions lets a full block split the position
+    // axis more finely without leaving threads idle: eight groups in the
+    // 512-thread kernel and sixteen in the 1024-thread specialization.
+    const bool vector_value = cached && fp16_cache && value_dim > 0 &&
+        value_dim % 2 == 0 && value_dim / 2 <= Threads &&
         output_feature_stride == 1 &&
         (reinterpret_cast<uintptr_t>(value) &
          (alignof(__half2) - 1)) == 0;
     if (vector_value) {
         const int pairs = value_dim / 2;
+        constexpr int max_pair_groups = Threads == 512 ? 8 : 16;
         const int output_groups = pairs > 0
-            ? min(8, Threads / pairs) : 0;
+            ? min(max_pair_groups, Threads / pairs) : 0;
         const int output_threads = output_groups * pairs;
         if (threadIdx.x < output_threads) {
             const int pair = threadIdx.x % pairs;
