@@ -892,18 +892,17 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     return true;
 }
 
-bool test_long_sdpa_decode(CudaBackend& backend,
-                           Precision cache_precision) {
+bool test_wide_sdpa_decode(CudaBackend& backend,
+                           Precision cache_precision, int past_length) {
     backend.clear_dispatch_error();
     constexpr int heads = 2;
     constexpr int kv_heads = 1;
-    // Match the common Qwen head width so the long-context test exercises
-    // the parallel value reduction used by the 1024-thread decode kernel.
+    // Match the common Qwen head width so both decode kernel sizes can test
+    // their parallel value reductions against the same reference.
     constexpr int key_dim = 128;
     constexpr int value_dim = 128;
-    constexpr int past_length = 512;
-    constexpr int key_length = past_length + 1;
-    constexpr int capacity = key_length + 1;
+    const int key_length = past_length + 1;
+    const int capacity = key_length + 1;
 
     Tensor query = device_tensor(backend, key_dim, 1, heads);
     Tensor key = device_tensor(backend, key_dim, 1, kv_heads);
@@ -1419,8 +1418,9 @@ int main() {
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
-        !test_long_sdpa_decode(backend, Precision::FP32) ||
-        !test_long_sdpa_decode(backend, Precision::FP16) ||
+        !test_wide_sdpa_decode(backend, Precision::FP16, 255) ||
+        !test_wide_sdpa_decode(backend, Precision::FP32, 512) ||
+        !test_wide_sdpa_decode(backend, Precision::FP16, 512) ||
         !test_decode_add_rms_norm(backend) ||
         !test_lm_head_argmax(backend))
         return 1;
