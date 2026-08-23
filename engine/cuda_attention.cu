@@ -392,25 +392,71 @@ __global__ void sdpa_decode_cuda(
     __shared__ float2 pair_reduction[Threads];
 
     float local_maximum = -FLT_MAX;
-    for (int key_position = threadIdx.x; key_position < key_length;
-         key_position += blockDim.x) {
-        const size_t cached_key_base =
-            (static_cast<size_t>(key_head) * key_capacity + key_position) *
-            key_dim;
-        const size_t current_key_base =
-            static_cast<size_t>(key_head) * key_head_stride +
-            static_cast<size_t>(key_position) * key_position_stride;
-        const float dot = query_key_dot(
-            query_row, key, cached, fp16_cache, key_dim, cached_key_base,
-            current_key_base, query_feature_stride, key_feature_stride);
-        float score = dot * scale;
-        if (mask)
-            score += mask[static_cast<size_t>(key_position) *
-                          mask_column_stride];
-        else if (causal && key_position > past_length)
-            score = -FLT_MAX;
-        score_row[key_position] = score;
-        local_maximum = fmaxf(local_maximum, score);
+    const bool cooperative_qk = Threads == 1024 && cached && fp16_cache &&
+        query_feature_stride == 1 && key_dim == 128 &&
+        (reinterpret_cast<uintptr_t>(query_row) &
+         (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(key) &
+         (alignof(__half2) - 1)) == 0;
+    if (cooperative_qk) {
+        // Four adjacent lanes cooperate on one key. Their half2 reads cover a
+        // contiguous 16-byte span instead of four cache rows 256 bytes apart,
+        // while still exposing 256 independent keys per 1024-thread block.
+        constexpr int lanes_per_key = 4;
+        const int lane = threadIdx.x % lanes_per_key;
+        const int first_key = threadIdx.x / lanes_per_key;
+        const auto* query2 = reinterpret_cast<const float2*>(query_row);
+        const auto* key2 = reinterpret_cast<const __half2*>(key);
+        for (int key_position = first_key; key_position < key_length;
+             key_position += Threads / lanes_per_key) {
+            const size_t cached_key_base =
+                (static_cast<size_t>(key_head) * key_capacity +
+                 key_position) * key_dim;
+            float dot = 0.0f;
+            for (int pair = lane; pair < key_dim / 2;
+                 pair += lanes_per_key) {
+                const float2 q = query2[pair];
+                const float2 k = __half22float2(
+                    key2[cached_key_base / 2 + pair]);
+                dot = fmaf(q.x, k.x, dot);
+                dot = fmaf(q.y, k.y, dot);
+            }
+            const unsigned active = __activemask();
+            for (int offset = lanes_per_key / 2; offset > 0; offset /= 2)
+                dot += __shfl_down_sync(
+                    active, dot, offset, lanes_per_key);
+            if (lane == 0) {
+                float score = dot * scale;
+                if (mask)
+                    score += mask[static_cast<size_t>(key_position) *
+                                  mask_column_stride];
+                else if (causal && key_position > past_length)
+                    score = -FLT_MAX;
+                score_row[key_position] = score;
+                local_maximum = fmaxf(local_maximum, score);
+            }
+        }
+    } else {
+        for (int key_position = threadIdx.x; key_position < key_length;
+             key_position += blockDim.x) {
+            const size_t cached_key_base =
+                (static_cast<size_t>(key_head) * key_capacity + key_position) *
+                key_dim;
+            const size_t current_key_base =
+                static_cast<size_t>(key_head) * key_head_stride +
+                static_cast<size_t>(key_position) * key_position_stride;
+            const float dot = query_key_dot(
+                query_row, key, cached, fp16_cache, key_dim, cached_key_base,
+                current_key_base, query_feature_stride, key_feature_stride);
+            float score = dot * scale;
+            if (mask)
+                score += mask[static_cast<size_t>(key_position) *
+                              mask_column_stride];
+            else if (causal && key_position > past_length)
+                score = -FLT_MAX;
+            score_row[key_position] = score;
+            local_maximum = fmaxf(local_maximum, score);
+        }
     }
     const float maximum =
         mollm_cuda::detail::block_reduce_max<Threads>(

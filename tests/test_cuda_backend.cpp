@@ -1421,6 +1421,8 @@ int main() {
         !test_wide_sdpa_decode(backend, Precision::FP16, 255) ||
         !test_wide_sdpa_decode(backend, Precision::FP32, 512) ||
         !test_wide_sdpa_decode(backend, Precision::FP16, 512) ||
+        !test_wide_sdpa_decode(backend, Precision::FP16, 1023) ||
+        !test_wide_sdpa_decode(backend, Precision::FP16, 1280) ||
         !test_decode_add_rms_norm(backend) ||
         !test_lm_head_argmax(backend))
         return 1;
