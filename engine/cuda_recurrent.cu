@@ -334,6 +334,7 @@ __global__ void gdn_post_128_cuda(
 // Qwen3.5's recurrent dimensions are 128-wide. One block owns one value head
 // so every state column is independent across threads while the token axis is
 // traversed in recurrence order. Q/K and RMS reductions stay on chip.
+template <bool CacheState>
 __global__ void gdn_128_cuda(
     const float* qkv, const float* a, const float* b, const float* z,
     const float* a_log, const float* dt_bias, const float* norm_weight,
@@ -351,11 +352,21 @@ __global__ void gdn_128_cuda(
     const int output_width = num_value_heads * gdn_head_dim;
     float* head_state = state +
         static_cast<size_t>(value_head) * gdn_head_dim * gdn_head_dim;
+    extern __shared__ float state_cache[];
 
     __shared__ float query[gdn_head_dim];
     __shared__ float key[gdn_head_dim];
     __shared__ float reduction[gdn_head_dim];
     __shared__ float gate[2];
+
+    if constexpr (CacheState) {
+        for (int state_row = 0; state_row < gdn_head_dim; ++state_row) {
+            const size_t index =
+                static_cast<size_t>(state_row) * gdn_head_dim + dimension;
+            state_cache[index] = head_state[index];
+        }
+        __syncthreads();
+    }
 
     for (int token = 0; token < sequence_length; ++token) {
         if (token >= real_tokens) {
@@ -408,8 +419,16 @@ __global__ void gdn_128_cuda(
         float key_value = 0.0f;
         float attention_decay = 0.0f;
         for (int state_row = 0; state_row < gdn_head_dim; ++state_row) {
-            const float decayed =
-                head_state[state_row * gdn_head_dim + dimension] * gate[0];
+            const size_t index =
+                static_cast<size_t>(state_row) * gdn_head_dim + dimension;
+            float state_value;
+            if constexpr (CacheState)
+                state_value = state_cache[index];
+            else
+                state_value = head_state[index];
+            const float decayed = state_value * gate[0];
+            if constexpr (CacheState)
+                state_cache[index] = decayed;
             key_value = fmaf(decayed, key[state_row], key_value);
             attention_decay =
                 fmaf(decayed, query[state_row], attention_decay);
@@ -422,8 +441,12 @@ __global__ void gdn_128_cuda(
         for (int state_row = 0; state_row < gdn_head_dim; ++state_row) {
             const size_t index =
                 static_cast<size_t>(state_row) * gdn_head_dim + dimension;
-            head_state[index] =
-                head_state[index] * gate[0] + key[state_row] * delta;
+            if constexpr (CacheState) {
+                state_cache[index] += key[state_row] * delta;
+            } else {
+                head_state[index] =
+                    head_state[index] * gate[0] + key[state_row] * delta;
+            }
         }
         const float attention =
             (attention_decay + delta * query_key) * scale;
@@ -441,6 +464,46 @@ __global__ void gdn_128_cuda(
             (z_value / (1.0f + expf(-z_value)));
         __syncthreads();
     }
+    if constexpr (CacheState) {
+        for (int state_row = 0; state_row < gdn_head_dim; ++state_row) {
+            const size_t index =
+                static_cast<size_t>(state_row) * gdn_head_dim + dimension;
+            head_state[index] = state_cache[index];
+        }
+    }
+}
+
+bool configure_gdn_shared_state() {
+    constexpr size_t state_cache_bytes =
+        gdn_head_dim * gdn_head_dim * sizeof(float);
+    int device = 0;
+    int max_shared_bytes = 0;
+    cudaFuncAttributes attributes{};
+    const cudaError_t device_status = cudaGetDevice(&device);
+    const cudaError_t limit_status = device_status == cudaSuccess
+        ? cudaDeviceGetAttribute(
+              &max_shared_bytes,
+              cudaDevAttrMaxSharedMemoryPerBlockOptin,
+              device)
+        : device_status;
+    const cudaError_t function_status = limit_status == cudaSuccess
+        ? cudaFuncGetAttributes(&attributes, gdn_128_cuda<true>)
+        : limit_status;
+    if (function_status != cudaSuccess) {
+        cudaGetLastError();
+        return false;
+    }
+    if (state_cache_bytes + attributes.sharedSizeBytes >
+        static_cast<size_t>(max_shared_bytes))
+        return false;
+
+    const cudaError_t configure_status = cudaFuncSetAttribute(
+        gdn_128_cuda<true>,
+        cudaFuncAttributeMaxDynamicSharedMemorySize,
+        static_cast<int>(state_cache_bytes));
+    if (configure_status != cudaSuccess)
+        cudaGetLastError();
+    return configure_status == cudaSuccess;
 }
 
 }  // namespace
@@ -557,11 +620,23 @@ bool launch_gdn(
             sequence_length, rms_epsilon, z_row_stride);
         return true;
     }
-    gdn_128_cuda<<<num_value_heads, gdn_head_dim>>>(
-        qkv, a, b, z, a_log, dt_bias, norm_weight, state, output, num_heads,
-        num_value_heads, sequence_length, process_length, normalize_qk,
-        rms_epsilon, l2_epsilon, scale, a_row_stride, b_row_stride,
-        z_row_stride);
+    constexpr size_t state_cache_bytes =
+        gdn_head_dim * gdn_head_dim * sizeof(float);
+    static const bool shared_state_configured = configure_gdn_shared_state();
+    if (shared_state_configured) {
+        gdn_128_cuda<true><<<
+            num_value_heads, gdn_head_dim, state_cache_bytes>>>(
+            qkv, a, b, z, a_log, dt_bias, norm_weight, state, output,
+            num_heads, num_value_heads, sequence_length, process_length,
+            normalize_qk, rms_epsilon, l2_epsilon, scale, a_row_stride,
+            b_row_stride, z_row_stride);
+    } else {
+        gdn_128_cuda<false><<<num_value_heads, gdn_head_dim>>>(
+            qkv, a, b, z, a_log, dt_bias, norm_weight, state, output,
+            num_heads, num_value_heads, sequence_length, process_length,
+            normalize_qk, rms_epsilon, l2_epsilon, scale, a_row_stride,
+            b_row_stride, z_row_stride);
+    }
     return true;
 }
 
