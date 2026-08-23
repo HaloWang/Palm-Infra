@@ -700,26 +700,20 @@ def _build_full_attn_layer(g, x, layer_idx, weights_dir,
     w_kn = g.weight(os.path.join(weights_dir, f"{pfx}_k_norm_weight.weights"),
                     (head_dim,), Precision.FP32)
 
-    # --- Query ---
-    # No contiguous() before reshape/permute: reshape inherits stride,
-    # permute is zero-copy. The downstream rms_norm kernel reads via
-    # stride[1] (ldx), so it handles the strided permuted view directly.
+    # No contiguous() before reshape/permute: reshape inherits stride and
+    # permute is zero-copy. The fused Q/K norm+RoPE kernels consume both
+    # strided views directly and materialize one dense combined output.
     query = g.reshape(query, (head_dim, num_heads, _S))  # [HD, NH, seq]
     query = g.permute(query, (0, 2, 1, 3))                   # [HD, seq, NH]
-    # No contiguous() before rms_norm: kernel_rms_norm uses ldx=stride[1].
     query = g.reshape(query, (head_dim, num_heads * _S)) # [HD, NH*seq], cols s-major
-    query = g.rms_norm_rope(
-        query, w_qn, cos, sin, _S, num_heads,
-        rope_dim=rope_dim, interleave=False, eps=eps)
 
-    # --- Key ---
-    # No contiguous() before reshape/permute/rms_norm: same rationale as Query.
     k = g.reshape(k, (head_dim, num_kv_heads, _S))       # [HD, NKV, seq]
     k = g.permute(k, (0, 2, 1, 3))                            # [HD, seq, NKV]
     k = g.reshape(k, (head_dim, num_kv_heads * _S))      # [HD, NKV*seq], cols s-major
-    k = g.rms_norm_rope(
-        k, w_kn, cos, sin, _S, num_kv_heads,
+    qk = g.qk_rms_norm_rope(
+        query, k, w_qn, w_kn, cos, sin, _S, num_heads, num_kv_heads,
         rope_dim=rope_dim, interleave=False, eps=eps)
+    query, k = g.slice(qk, [num_heads, num_kv_heads], dim=2)
     # v is matmul output: declared shape [nkv*hd, seq], data [seq, nkv*hd] row-major.
     # Step 1: reshape (hd, nkv, seq) — zero-copy, d0=hd innermost.
     #   flat[0..hd-1] = (d=0..hd-1, nkv=0, s=0) = (s=0, nkv=0, d=0..hd-1) ✓

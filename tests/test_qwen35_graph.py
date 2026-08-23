@@ -128,11 +128,13 @@ def main():
         "Qwen3.5 full attention fuses sigmoid and multiply",
     )
     check(
-        sum(node.op_type == OpType.RMS_NORM_ROPE
-            for node in full_graph._nodes) == 2
+        sum(node.op_type == OpType.QK_RMS_NORM_ROPE
+            for node in full_graph._nodes) == 1
+        and not any(node.op_type == OpType.RMS_NORM_ROPE
+                    for node in full_graph._nodes)
         and not any(node.op_type == OpType.ROTARY_EMBED
                     for node in full_graph._nodes),
-        "full attention fuses Q/K RMSNorm, materialization, and RoPE",
+        "full attention fuses Q and K RMSNorm/materialization/RoPE",
     )
     check(
         not any(node.op_type == OpType.SIGMOID
