@@ -40,6 +40,7 @@ void launch_q8_dense_gemv(
     const float* activation, const int8_t* weight, const float* scales,
     int group_size, int groups_per_row, float* output, int columns,
     int inner);
+void launch_bias_q4_g32_weight(Q4B8G32Block* weight, size_t block_count);
 void launch_prepare_q4_g32_dense_gemm(
     const Q4B8G32Block* weight, __half2* weight_output,
     const float* activation, __half* activation_output,

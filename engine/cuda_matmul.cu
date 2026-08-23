@@ -7,6 +7,10 @@ __device__ int signed_nibble(uint8_t value) {
     return nibble >= 8 ? nibble - 16 : nibble;
 }
 
+__device__ int biased_q4_g32_nibble(uint8_t value) {
+    return static_cast<int>(value & 0x0f) - 8;
+}
+
 struct alignas(8) Half2Pair {
     __half2 first;
     __half2 second;
@@ -51,6 +55,18 @@ __global__ void dequantize_q8_dense_weight_cuda(
     output[index] = __float2half(
         static_cast<float>(weight[index]) *
         scales[static_cast<size_t>(row) * groups_per_row + group]);
+}
+
+__global__ void bias_q4_g32_weight_cuda(
+    Q4B8G32Block* weight, size_t byte_count) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index >= byte_count)
+        return;
+    constexpr size_t bytes_per_block = 8 * 16;
+    const size_t block = index / bytes_per_block;
+    const size_t byte = index % bytes_per_block;
+    reinterpret_cast<uint8_t*>(weight[block].q)[byte] ^= 0x88;
 }
 
 __global__ void q8_dense_gemv_cuda(
@@ -147,11 +163,13 @@ __global__ void prepare_q4_g32_dense_gemm_cuda(
         reinterpret_cast<Half2Pair*>(weight_output)[
             (static_cast<size_t>(row) * groups + group) * 8 + pair] = {
                 __halves2half2(
-                    __float2half(signed_nibble(first) * scale),
-                    __float2half(signed_nibble(first >> 4) * scale)),
+                    __float2half(biased_q4_g32_nibble(first) * scale),
+                    __float2half(
+                        biased_q4_g32_nibble(first >> 4) * scale)),
                 __halves2half2(
-                    __float2half(signed_nibble(second) * scale),
-                    __float2half(signed_nibble(second >> 4) * scale))};
+                    __float2half(biased_q4_g32_nibble(second) * scale),
+                    __float2half(
+                        biased_q4_g32_nibble(second >> 4) * scale))};
     }
 
     const size_t block = static_cast<size_t>(blockIdx.y) * gridDim.x +
@@ -225,7 +243,7 @@ __global__ void q4_g32_dense_gemv_cuda(
         const uint8_t packed = block.q[row_lane][lane / 2];
         const int k = group * 32 + lane;
         sum += activation[k] *
-            signed_nibble(lane & 1 ? packed >> 4 : packed) * scale;
+            biased_q4_g32_nibble(lane & 1 ? packed >> 4 : packed) * scale;
     }
     for (int offset = warpSize / 2; offset != 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffffu, sum, offset);
@@ -258,11 +276,13 @@ __global__ void q4_g32_pair_rows_gemv_cuda(
             activation + static_cast<size_t>(group) * 32)[pair];
         const float scale = block.scales[row];
         sum = fmaf(
-            value.x, static_cast<float>(signed_nibble(packed)) * scale,
+            value.x,
+            static_cast<float>(biased_q4_g32_nibble(packed)) * scale,
             sum);
         sum = fmaf(
             value.y,
-            static_cast<float>(signed_nibble(packed >> 4)) * scale, sum);
+            static_cast<float>(biased_q4_g32_nibble(packed >> 4)) * scale,
+            sum);
     }
     for (int offset = lanes_per_row / 2; offset != 0; offset /= 2)
         sum += __shfl_down_sync(
@@ -335,6 +355,16 @@ void launch_dequantize_q8_dense_weight(
     dequantize_q8_dense_weight_cuda<<<
         static_cast<unsigned>((count + threads - 1) / threads), threads>>>(
         weight, scales, group_size, groups_per_row, output, count, width);
+}
+
+void launch_bias_q4_g32_weight(
+    Q4B8G32Block* weight, size_t block_count) {
+    constexpr size_t bytes_per_block = 8 * 16;
+    constexpr int threads = 256;
+    const size_t byte_count = block_count * bytes_per_block;
+    bias_q4_g32_weight_cuda<<<
+        static_cast<unsigned>((byte_count + threads - 1) / threads),
+        threads>>>(weight, byte_count);
 }
 
 void launch_q8_dense_gemv(

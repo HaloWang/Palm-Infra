@@ -25,7 +25,7 @@ struct CudaBackend::Impl {
     enum class WeightLayout : uint8_t {
         Dense = 0,
         Q8RowMajor,
-        Q4Bg32,
+        Q4Bg32Biased,
         Q4Bg128,
     };
 
@@ -176,6 +176,20 @@ struct CudaBackend::Impl {
                     cudaFree(device);
                 return false;
             }
+            // CUDA's hot W4G32 kernels consume an unsigned nibble minus 8.
+            // Bias the private device copy once so every decode FMA avoids
+            // recovering two's-complement INT4 signs. The package and all
+            // other backends retain the canonical representation.
+            if (layout == WeightLayout::Q4Bg32Biased) {
+                mollm_cuda::launch_bias_q4_g32_weight(
+                    static_cast<Q4B8G32Block*>(device),
+                    bytes / sizeof(Q4B8G32Block));
+                if (!mollm_cuda::report_cuda(
+                        cudaGetLastError(), "bias_q4_g32_weight_cuda")) {
+                    cudaFree(device);
+                    return false;
+                }
+            }
             device_allocations.push_back(device);
             found = weights.emplace(
                 cache_key,
@@ -239,7 +253,7 @@ struct CudaBackend::Impl {
             prepared->groups_per_row ==
                 (k + prepared->group_size - 1) / prepared->group_size;
         const bool valid_q4_g32 =
-            prepared->layout == WeightLayout::Q4Bg32 && k % 32 == 0;
+            prepared->layout == WeightLayout::Q4Bg32Biased && k % 32 == 0;
         const bool valid_q4_g128 =
             prepared->layout == WeightLayout::Q4Bg128 && k % 128 == 0;
         const bool valid_quantized =
@@ -495,7 +509,7 @@ void CudaBackend::wrap_weight_int4(Tensor& tensor,
             sizeof(Q4B8G32Block);
         impl_->upload_weight(
             tensor, tensor.q4_g32_data, tensor.q4_g32_data, bytes,
-            CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg32);
+            CUDA_R_8I, n, k, Impl::WeightLayout::Q4Bg32Biased);
     } else if (tensor.is_q4_g128_packed && tensor.q4_g128_data &&
                k % 128 == 0 && tensor.group_size == 128 &&
                tensor.groups_per_row == static_cast<uint32_t>(k / 128)) {
