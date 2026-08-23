@@ -133,6 +133,7 @@ __global__ void rms_norm_cuda(const float* input, const float* weight,
             source[column] * inverse * weight[column];
 }
 
+template <int Threads>
 __global__ void add_rms_norm_cuda(
     float* residual, const float* update, const float* weight, float* output,
     int width, int rows, size_t residual_row_stride,
@@ -150,9 +151,9 @@ __global__ void add_rms_norm_cuda(
         residual_row[column] = value;
         sum += value * value;
     }
-    __shared__ float reduction[256];
+    __shared__ float reduction[Threads];
     const float block_sum =
-        mollm_cuda::detail::block_reduce_sum<256>(sum, reduction);
+        mollm_cuda::detail::block_reduce_sum<Threads>(sum, reduction);
     const float inverse = rsqrtf(block_sum / width + epsilon);
     float* output_row = output + static_cast<size_t>(row) *
         output_row_stride;
@@ -243,10 +244,20 @@ void launch_add_rms_norm(
     float* residual, const float* update, const float* weight, float* output,
     int width, int rows, size_t residual_row_stride,
     size_t update_row_stride, size_t output_row_stride, float epsilon) {
-    constexpr int threads = 256;
-    add_rms_norm_cuda<<<rows, threads>>>(
-        residual, update, weight, output, width, rows, residual_row_stride,
-        update_row_stride, output_row_stride, epsilon);
+    // Decode has one wide row and benefits from exposing one column per
+    // thread. Keep smaller tensors and multi-row prefill on the lower-cost
+    // 256-thread specialization.
+    if (rows == 1 && width >= 1024) {
+        add_rms_norm_cuda<1024><<<rows, 1024>>>(
+            residual, update, weight, output, width, rows,
+            residual_row_stride, update_row_stride, output_row_stride,
+            epsilon);
+    } else {
+        add_rms_norm_cuda<256><<<rows, 256>>>(
+            residual, update, weight, output, width, rows,
+            residual_row_stride, update_row_stride, output_row_stride,
+            epsilon);
+    }
 }
 
 void launch_contiguous(

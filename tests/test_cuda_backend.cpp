@@ -998,6 +998,58 @@ bool test_long_sdpa_decode(CudaBackend& backend) {
         close_enough(actual, expected, 3e-5f);
 }
 
+bool test_decode_add_rms_norm(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    constexpr int width = 1024;
+    std::vector<float> residual_data(width);
+    std::vector<float> update_data(width);
+    std::vector<float> weight_data(width);
+    std::vector<float> residual_expected(width);
+    std::vector<float> output_expected(width);
+    float square_sum = 0.0f;
+    for (int column = 0; column < width; ++column) {
+        residual_data[column] =
+            (static_cast<int>(column % 29) - 14) / 19.0f;
+        update_data[column] =
+            (static_cast<int>(column % 17) - 8) / 23.0f;
+        weight_data[column] = 0.75f + (column % 13) / 32.0f;
+        residual_expected[column] =
+            residual_data[column] + update_data[column];
+        square_sum += residual_expected[column] * residual_expected[column];
+    }
+    const float inverse =
+        1.0f / std::sqrt(square_sum / width + 1e-6f);
+    for (int column = 0; column < width; ++column) {
+        output_expected[column] =
+            residual_expected[column] * inverse * weight_data[column];
+    }
+
+    Tensor residual = device_tensor(backend, width);
+    Tensor update = device_tensor(backend, width);
+    Tensor output = device_tensor(backend, width);
+    Tensor weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, width, 1, 1, 1,
+        weight_data.data());
+    backend.wrap_weight(weight);
+    if (!upload(backend, residual, residual_data) ||
+        !upload(backend, update, update_data))
+        return false;
+
+    GraphNode add_norm;
+    add_norm.op_type = OpType::ADD_RMS_NORM;
+    add_norm.params.f32 = {1e-6f};
+    backend.dispatch(add_norm, {&residual, &update, &weight}, &output,
+                     nullptr);
+    backend.end_graph();
+    std::vector<float> residual_actual;
+    std::vector<float> output_actual;
+    return !backend.dispatch_failed() &&
+        download(backend, residual, residual_actual) &&
+        download(backend, output, output_actual) &&
+        close_enough(residual_actual, residual_expected, 2e-6f) &&
+        close_enough(output_actual, output_expected, 3e-5f);
+}
+
 bool test_memory_and_fallback_bridge(CudaBackend& backend) {
     backend.clear_dispatch_error();
     Tensor storage = device_tensor(backend, 6, 2);
@@ -1263,7 +1315,8 @@ int main() {
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
-        !test_long_sdpa_decode(backend))
+        !test_long_sdpa_decode(backend) ||
+        !test_decode_add_rms_norm(backend))
         return 1;
     if (!test_memory_and_fallback_bridge(backend))
         return 1;
