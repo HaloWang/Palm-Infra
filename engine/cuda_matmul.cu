@@ -20,6 +20,16 @@ __global__ void fp32_to_fp16(const float* source, __half* destination,
         destination[index] = __float2half(source[index]);
 }
 
+__global__ void fp32_to_fp16_vectorized(
+    const float2* source, __half2* destination, size_t pair_count) {
+    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
+        threadIdx.x;
+    if (index < pair_count) {
+        const float2 value = source[index];
+        destination[index] = __floats2half2_rn(value.x, value.y);
+    }
+}
+
 __global__ void dequantize_q8_dense_weight_cuda(
     const int8_t* weight, const float* scales, int group_size,
     int groups_per_row, __half* output, size_t count, int width) {
@@ -231,8 +241,21 @@ namespace mollm_cuda {
 void launch_fp32_to_fp16(const float* source, __half* destination,
                          size_t count) {
     constexpr int threads = 256;
-    fp32_to_fp16<<<static_cast<unsigned>((count + threads - 1) / threads),
-                   threads>>>(source, destination, count);
+    const bool vector_aligned = count % 2 == 0 &&
+        reinterpret_cast<uintptr_t>(source) % alignof(float2) == 0 &&
+        reinterpret_cast<uintptr_t>(destination) % alignof(__half2) == 0;
+    if (vector_aligned) {
+        const size_t pair_count = count / 2;
+        fp32_to_fp16_vectorized<<<
+            static_cast<unsigned>((pair_count + threads - 1) / threads),
+            threads>>>(
+                reinterpret_cast<const float2*>(source),
+                reinterpret_cast<__half2*>(destination), pair_count);
+    } else {
+        fp32_to_fp16<<<
+            static_cast<unsigned>((count + threads - 1) / threads),
+            threads>>>(source, destination, count);
+    }
 }
 
 void launch_dequantize_q8_dense_weight(
