@@ -8,15 +8,12 @@ namespace {
 constexpr int shortconv_max_kernel = 8;
 constexpr int shortconv_parallel_min_sequence = 8;
 constexpr int gdn_head_dim = 128;
-// Each worker accumulates one contiguous interval serially, then lane 0 folds
-// the partials in lane order. Sixteen workers preserve stable FP32 behavior
-// while avoiding both the serial single-lane dot and a tree reduction.
-constexpr int gdn_dot_workers = 16;
 constexpr int gdn_warp_size = 32;
+constexpr int gdn_state_values_per_lane = gdn_head_dim / gdn_warp_size;
 // Two independent value rows per block balance grid-level parallelism against
 // launch and scheduling overhead across both small and large hybrid models.
 constexpr int gdn_value_warps_per_block = 2;
-static_assert(gdn_head_dim % gdn_dot_workers == 0);
+static_assert(gdn_head_dim % gdn_warp_size == 0);
 
 __global__ void shortconv_serial_cuda(
     const float* input, const float* weight, float* state, float* output,
@@ -231,11 +228,13 @@ __global__ void gdn_recurrence_rows_128_cuda(
     const int qkv_key_width = num_heads * gdn_head_dim;
     float* head_state = state +
         static_cast<size_t>(value_head) * gdn_head_dim * gdn_head_dim;
-    __shared__ float
-        decayed_state[gdn_value_warps_per_block][gdn_head_dim];
-    float local_state[4];
+    // A warp owns one value-state column. Each lane keeps its four strided
+    // key dimensions in registers, which makes Q/K loads coalesced and lets
+    // the two dot products use a five-step warp reduction without shared
+    // memory or a serial lane-zero fold.
+    float local_state[gdn_state_values_per_lane];
 #pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int chunk = 0; chunk < gdn_state_values_per_lane; ++chunk) {
         const int key_dimension = lane + chunk * warpSize;
         local_state[chunk] = head_state[
             static_cast<size_t>(key_dimension) * gdn_head_dim +
@@ -250,42 +249,22 @@ __global__ void gdn_recurrence_rows_128_cuda(
         float key_projection = 0.0f;
         float attention_decay = 0.0f;
 #pragma unroll
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < gdn_state_values_per_lane; ++chunk) {
+            const int key_dimension = lane + chunk * warpSize;
             local_state[chunk] *= decay[gate_index];
-            decayed_state[warp][lane + chunk * warpSize] =
-                local_state[chunk];
+            key_projection = fmaf(
+                local_state[chunk],
+                normalized_key[qk_base + key_dimension], key_projection);
+            attention_decay = fmaf(
+                local_state[chunk],
+                normalized_query[qk_base + key_dimension], attention_decay);
         }
-        __syncwarp();
-        if (lane < gdn_dot_workers) {
-            constexpr int dimensions_per_worker =
-                gdn_head_dim / gdn_dot_workers;
-            const int dimension_begin = lane * dimensions_per_worker;
 #pragma unroll
-            for (int offset = 0; offset < dimensions_per_worker; ++offset) {
-                const int key_dimension = dimension_begin + offset;
-                const float state_value =
-                    decayed_state[warp][key_dimension];
-                key_projection = fmaf(
-                    state_value,
-                    normalized_key[qk_base + key_dimension],
-                    key_projection);
-                attention_decay = fmaf(
-                    state_value,
-                    normalized_query[qk_base + key_dimension],
-                    attention_decay);
-            }
-        }
-        __syncwarp();
-#pragma unroll
-        for (int worker = 1; worker < gdn_dot_workers; ++worker) {
-            const float key_partial = __shfl_sync(
-                0xffffffffu, key_projection, worker);
-            const float attention_partial = __shfl_sync(
-                0xffffffffu, attention_decay, worker);
-            if (lane == 0) {
-                key_projection += key_partial;
-                attention_decay += attention_partial;
-            }
+        for (int offset = warpSize / 2; offset > 0; offset /= 2) {
+            key_projection += __shfl_down_sync(
+                0xffffffffu, key_projection, offset);
+            attention_decay += __shfl_down_sync(
+                0xffffffffu, attention_decay, offset);
         }
         key_projection = __shfl_sync(0xffffffffu, key_projection, 0);
         const size_t value_index =
@@ -295,7 +274,7 @@ __global__ void gdn_recurrence_rows_128_cuda(
         const float delta =
             (qkv[value_index] - key_projection) * beta[gate_index];
 #pragma unroll
-        for (int chunk = 0; chunk < 4; ++chunk) {
+        for (int chunk = 0; chunk < gdn_state_values_per_lane; ++chunk) {
             const int key_dimension = lane + chunk * warpSize;
             local_state[chunk] = fmaf(
                 normalized_key[qk_base + key_dimension], delta,
@@ -320,7 +299,7 @@ __global__ void gdn_recurrence_rows_128_cuda(
         }
     }
 #pragma unroll
-    for (int chunk = 0; chunk < 4; ++chunk) {
+    for (int chunk = 0; chunk < gdn_state_values_per_lane; ++chunk) {
         const int key_dimension = lane + chunk * warpSize;
         head_state[static_cast<size_t>(key_dimension) * gdn_head_dim +
                    value_dimension] = local_state[chunk];
