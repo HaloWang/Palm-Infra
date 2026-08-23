@@ -895,10 +895,10 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
 bool test_wide_cached_sdpa(CudaBackend& backend,
                            Precision cache_precision, int past_length,
                            int current_length = 1,
-                           bool explicit_mask = false) {
+                           bool explicit_mask = false,
+                           int kv_heads = 1) {
     backend.clear_dispatch_error();
-    constexpr int heads = 2;
-    constexpr int kv_heads = 1;
+    const int heads = 2 * kv_heads;
     // Match the common Qwen head width so decode and prefill specializations
     // can test their parallel reductions against the same reference.
     constexpr int key_dim = 128;
@@ -951,18 +951,25 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
     }
 
     std::vector<float> cached_key(
-        static_cast<size_t>(capacity) * key_dim);
+        static_cast<size_t>(kv_heads) * capacity * key_dim);
     std::vector<float> cached_value(
-        static_cast<size_t>(capacity) * value_dim);
-    for (int position = 0; position < capacity; ++position) {
-        for (int dimension = 0; dimension < key_dim; ++dimension) {
-            cached_key[static_cast<size_t>(position) * key_dim + dimension] =
-                ((position * 5 + dimension * 3) % 23 - 11) / 17.0f;
-        }
-        for (int dimension = 0; dimension < value_dim; ++dimension) {
-            cached_value[
-                static_cast<size_t>(position) * value_dim + dimension] =
-                ((position * 7 + dimension * 2) % 19 - 9) / 14.0f;
+        static_cast<size_t>(kv_heads) * capacity * value_dim);
+    for (int key_head = 0; key_head < kv_heads; ++key_head) {
+        for (int position = 0; position < capacity; ++position) {
+            for (int dimension = 0; dimension < key_dim; ++dimension) {
+                cached_key[
+                    (static_cast<size_t>(key_head) * capacity + position) *
+                        key_dim + dimension] =
+                    ((key_head * 11 + position * 5 + dimension * 3) % 23 -
+                     11) / 17.0f;
+            }
+            for (int dimension = 0; dimension < value_dim; ++dimension) {
+                cached_value[
+                    (static_cast<size_t>(key_head) * capacity + position) *
+                        value_dim + dimension] =
+                    ((key_head * 13 + position * 7 + dimension * 2) % 19 -
+                     9) / 14.0f;
+            }
         }
     }
 
@@ -1054,6 +1061,7 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
         static_cast<size_t>(heads) * current_length * value_dim, 0.0f);
     std::vector<float> scores(key_length);
     for (int head = 0; head < heads; ++head) {
+        const int key_head = head / (heads / kv_heads);
         for (int query_position = 0; query_position < current_length;
              ++query_position) {
             float maximum = -INFINITY;
@@ -1068,12 +1076,12 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
                     const int current_position = position - past_length;
                     const float key_element = position < past_length
                         ? cached_key[
-                              static_cast<size_t>(position) * key_dim +
-                              dimension]
+                              (static_cast<size_t>(key_head) * capacity +
+                               position) * key_dim + dimension]
                         : round_for_cache(key_data[
-                              static_cast<size_t>(current_position) *
-                                  key_dim +
-                              dimension]);
+                              (static_cast<size_t>(key_head) *
+                                   current_length +
+                               current_position) * key_dim + dimension]);
                     const size_t query_index =
                         (static_cast<size_t>(head) * current_length +
                          query_position) * key_dim + dimension;
@@ -1096,12 +1104,12 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
                     const int current_position = position - past_length;
                     const float value_element = position < past_length
                         ? cached_value[
-                              static_cast<size_t>(position) * value_dim +
-                              dimension]
+                              (static_cast<size_t>(key_head) * capacity +
+                               position) * value_dim + dimension]
                         : round_for_cache(value_data[
-                              static_cast<size_t>(current_position) *
-                                  value_dim +
-                              dimension]);
+                              (static_cast<size_t>(key_head) *
+                                   current_length +
+                               current_position) * value_dim + dimension]);
                     const size_t output_index =
                         (static_cast<size_t>(head) * current_length +
                          query_position) * value_dim + dimension;
@@ -1112,8 +1120,64 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
         }
     }
     std::vector<float> actual;
-    return download(backend, output, actual) &&
-        close_enough(actual, expected, 3e-5f);
+    if (!download(backend, output, actual) ||
+        !close_enough(actual, expected, 3e-5f))
+        return false;
+
+    std::vector<uint8_t> key_payload(
+        cached_key.size() * cache_element_size);
+    std::vector<uint8_t> value_payload(
+        cached_value.size() * cache_element_size);
+    if (!backend.copy_to_host(
+            key_cache, key_payload.data(), key_payload.size(),
+            CacheMetadata::SIZE) ||
+        !backend.copy_to_host(
+            value_cache, value_payload.data(), value_payload.size(),
+            CacheMetadata::SIZE))
+        return false;
+    const auto payload_value = [fp16_cache](
+        const std::vector<uint8_t>& payload, size_t index) {
+        if (fp16_cache) {
+            mollm::cpu::fp16_t value;
+            std::memcpy(
+                &value, payload.data() + index * sizeof(value),
+                sizeof(value));
+            return static_cast<float>(value);
+        }
+        float value;
+        std::memcpy(
+            &value, payload.data() + index * sizeof(value), sizeof(value));
+        return value;
+    };
+    for (int key_head = 0; key_head < kv_heads; ++key_head) {
+        for (int position = 0; position < current_length; ++position) {
+            for (int dimension = 0; dimension < key_dim; ++dimension) {
+                const size_t cache_index =
+                    (static_cast<size_t>(key_head) * capacity + past_length +
+                     position) * key_dim + dimension;
+                const size_t source_index =
+                    (static_cast<size_t>(key_head) * current_length +
+                     position) * key_dim + dimension;
+                if (std::fabs(payload_value(key_payload, cache_index) -
+                              round_for_cache(key_data[source_index])) >
+                    1e-6f)
+                    return false;
+            }
+            for (int dimension = 0; dimension < value_dim; ++dimension) {
+                const size_t cache_index =
+                    (static_cast<size_t>(key_head) * capacity + past_length +
+                     position) * value_dim + dimension;
+                const size_t source_index =
+                    (static_cast<size_t>(key_head) * current_length +
+                     position) * value_dim + dimension;
+                if (std::fabs(payload_value(value_payload, cache_index) -
+                              round_for_cache(value_data[source_index])) >
+                    1e-6f)
+                    return false;
+            }
+        }
+    }
+    return true;
 }
 
 bool test_decode_add_rms_norm(CudaBackend& backend) {
@@ -1475,6 +1539,8 @@ int main() {
         !test_wide_cached_sdpa(backend, Precision::FP16, 512) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 1023) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 1280) ||
+        !test_wide_cached_sdpa(
+            backend, Precision::FP16, 255, 1, false, 4) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 0, 4) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 257, 8) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 3, 5, true) ||

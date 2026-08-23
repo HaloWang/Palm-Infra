@@ -573,18 +573,54 @@ __global__ void sdpa_decode_cuda(
 // independent blocks. A single fused block per query head leaves most SMs idle
 // on large GPUs; these three stages keep the same SDPA semantics while
 // increasing grid-level parallelism for the common 128-wide Qwen layout.
+template <bool AppendCurrent>
 __global__ void sdpa_decode_scores_fp16_cuda(
-    const float* query, const __half* key, float* scores, const float* mask,
-    int num_heads, int num_kv_heads, int key_length, int past_length,
-    int key_capacity, bool causal, float scale, size_t query_head_stride,
-    size_t mask_column_stride) {
+    const float* query, const float* current_key,
+    const float* current_value, const __half* key, __half* key_append,
+    __half* value_append, float* scores,
+    const float* mask, int num_heads, int num_kv_heads, int key_length,
+    int past_length, int key_capacity, bool causal, float scale,
+    size_t query_head_stride, size_t current_key_head_stride,
+    size_t current_value_head_stride, size_t mask_column_stride) {
     constexpr int lanes_per_key = staged_sdpa_score_lanes_per_key;
     constexpr int keys_per_block = staged_sdpa_threads / lanes_per_key;
     const int head = static_cast<int>(blockIdx.x);
     const int key_head = head / (num_heads / num_kv_heads);
+    const int heads_per_key = num_heads / num_kv_heads;
     const int lane = static_cast<int>(threadIdx.x) % lanes_per_key;
     const int key_position = static_cast<int>(blockIdx.y) * keys_per_block +
         static_cast<int>(threadIdx.x) / lanes_per_key;
+
+    // The score launch is already ordered before softmax/value. Let one block
+    // for each KV head append the one-token K/V payload while every score
+    // block reads the current K directly. This removes the separate append
+    // launch without introducing an inter-block synchronization dependency.
+    if constexpr (AppendCurrent) {
+        if (blockIdx.y == 0 && head % heads_per_key == 0) {
+            const size_t cache_pair_base =
+                (static_cast<size_t>(key_head) * key_capacity + past_length) *
+                staged_sdpa_pairs;
+            auto* key_cache2 =
+                reinterpret_cast<__half2*>(key_append) + cache_pair_base;
+            auto* value_cache2 =
+                reinterpret_cast<__half2*>(value_append) + cache_pair_base;
+            const auto* current_key2 = reinterpret_cast<const float2*>(
+                current_key + static_cast<size_t>(key_head) *
+                    current_key_head_stride);
+            const auto* current_value2 = reinterpret_cast<const float2*>(
+                current_value + static_cast<size_t>(key_head) *
+                    current_value_head_stride);
+            for (int pair = threadIdx.x; pair < staged_sdpa_pairs;
+                 pair += staged_sdpa_threads) {
+                const float2 current_k = current_key2[pair];
+                const float2 current_v = current_value2[pair];
+                key_cache2[pair] =
+                    __floats2half2_rn(current_k.x, current_k.y);
+                value_cache2[pair] =
+                    __floats2half2_rn(current_v.x, current_v.y);
+            }
+        }
+    }
     if (key_position >= key_length)
         return;
 
@@ -599,7 +635,20 @@ __global__ void sdpa_decode_scores_fp16_cuda(
     for (int pair = lane; pair < staged_sdpa_pairs;
          pair += lanes_per_key) {
         const float2 q = query2[pair];
-        const float2 k = __half22float2(key2[pair]);
+        float2 k;
+        if constexpr (AppendCurrent) {
+            if (key_position == past_length) {
+                const float2 current = reinterpret_cast<const float2*>(
+                    current_key + static_cast<size_t>(key_head) *
+                        current_key_head_stride)[pair];
+                k = __half22float2(
+                    __floats2half2_rn(current.x, current.y));
+            } else {
+                k = __half22float2(key2[pair]);
+            }
+        } else {
+            k = __half22float2(key2[pair]);
+        }
         dot = fmaf(q.x, k.x, dot);
         dot = fmaf(q.y, k.y, dot);
     }
@@ -973,6 +1022,67 @@ bool try_launch_sdpa_prefill(
     return true;
 }
 
+bool try_launch_sdpa_decode_fp16_cached(
+    const float* query, const float* current_key,
+    const float* current_value, void* key_cache, void* value_cache,
+    float* scores, float* output, const float* mask, int num_heads,
+    int num_kv_heads, int key_length, int past_length, int key_dim,
+    int value_dim, int key_capacity, bool causal, float scale,
+    size_t query_feature_stride, size_t query_head_stride,
+    size_t current_key_feature_stride, size_t current_key_head_stride,
+    size_t current_value_feature_stride, size_t current_value_head_stride,
+    size_t mask_column_stride, size_t output_feature_stride,
+    size_t output_head_stride) {
+    const bool supported = query && current_key && current_value &&
+        key_cache && value_cache && scores && output && num_heads > 0 &&
+        num_kv_heads > 0 && num_heads % num_kv_heads == 0 &&
+        key_length == past_length + 1 &&
+        key_dim == staged_sdpa_head_dim &&
+        value_dim == staged_sdpa_head_dim && query_feature_stride == 1 &&
+        current_key_feature_stride == 1 &&
+        current_value_feature_stride == 1 && output_feature_stride == 1 &&
+        query_head_stride % 2 == 0 && current_key_head_stride % 2 == 0 &&
+        current_value_head_stride % 2 == 0 &&
+        (reinterpret_cast<uintptr_t>(query) &
+         (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(current_key) &
+         (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(current_value) &
+         (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(key_cache) &
+         (alignof(__half2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(value_cache) &
+         (alignof(__half2) - 1)) == 0;
+    if (!supported)
+        return false;
+
+    constexpr int keys_per_score_block =
+        staged_sdpa_threads / staged_sdpa_score_lanes_per_key;
+    const dim3 score_grid(
+        static_cast<unsigned>(num_heads),
+        static_cast<unsigned>(
+            (key_length + keys_per_score_block - 1) /
+            keys_per_score_block));
+    sdpa_decode_scores_fp16_cuda<true>
+        <<<score_grid, staged_sdpa_threads>>>(
+            query, current_key, current_value,
+            static_cast<const __half*>(key_cache),
+            static_cast<__half*>(key_cache),
+            static_cast<__half*>(value_cache), scores, mask, num_heads,
+            num_kv_heads, key_length, past_length, key_capacity, causal,
+            scale, query_head_stride, current_key_head_stride,
+            current_value_head_stride, mask_column_stride);
+    sdpa_decode_softmax_cuda<staged_sdpa_threads>
+        <<<num_heads, staged_sdpa_threads>>>(scores, key_length);
+    const dim3 value_grid(
+        static_cast<unsigned>(num_heads),
+        staged_sdpa_pairs / staged_sdpa_value_pairs_per_block);
+    sdpa_decode_value_fp16_cuda<<<value_grid, staged_sdpa_threads>>>(
+        scores, static_cast<const __half*>(value_cache), output, num_heads,
+        num_kv_heads, key_length, key_capacity, output_head_stride);
+    return true;
+}
+
 void launch_sdpa_decode(
     const float* query, const void* key, const void* value, float* scores,
     float* output, const float* mask, int num_heads, int num_kv_heads,
@@ -1002,10 +1112,12 @@ void launch_sdpa_decode(
             static_cast<unsigned>(
                 (key_length + keys_per_score_block - 1) /
                 keys_per_score_block));
-        sdpa_decode_scores_fp16_cuda<<<score_grid, staged_sdpa_threads>>>(
-            query, static_cast<const __half*>(key), scores, mask, num_heads,
-            num_kv_heads, key_length, past_length, key_capacity, causal,
-            scale, query_head_stride, mask_column_stride);
+        sdpa_decode_scores_fp16_cuda<false>
+            <<<score_grid, staged_sdpa_threads>>>(
+                query, nullptr, nullptr, static_cast<const __half*>(key),
+                nullptr, nullptr, scores, mask, num_heads, num_kv_heads,
+                key_length, past_length, key_capacity, causal, scale,
+                query_head_stride, 0, 0, mask_column_stride);
         sdpa_decode_softmax_cuda<staged_sdpa_threads>
             <<<num_heads, staged_sdpa_threads>>>(scores, key_length);
         const dim3 value_grid(

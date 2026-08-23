@@ -108,6 +108,17 @@ bool try_launch_sdpa_prefill(
     size_t mask_column_stride, size_t mask_row_stride,
     size_t output_feature_stride, size_t output_position_stride,
     size_t output_head_stride);
+bool try_launch_sdpa_decode_fp16_cached(
+    const float* query, const float* current_key,
+    const float* current_value, void* key_cache, void* value_cache,
+    float* scores, float* output, const float* mask, int num_heads,
+    int num_kv_heads, int key_length, int past_length, int key_dim,
+    int value_dim, int key_capacity, bool causal, float scale,
+    size_t query_feature_stride, size_t query_head_stride,
+    size_t current_key_feature_stride, size_t current_key_head_stride,
+    size_t current_value_feature_stride, size_t current_value_head_stride,
+    size_t mask_column_stride, size_t output_feature_stride,
+    size_t output_head_stride);
 void launch_sdpa_decode(
     const float* query, const void* key, const void* value, float* scores,
     float* output, const float* mask, int num_heads, int num_kv_heads,

@@ -969,7 +969,10 @@ void CudaBackend::dispatch(const GraphNode& node,
                          key_length <= key_capacity)) &&
             (!mask || mask_data);
         if (valid) {
-            if (cached) {
+            bool cache_appended = false;
+            const auto append_cache = [&]() {
+                if (!cached || cache_appended)
+                    return true;
                 mollm_cuda::launch_append_kv(
                     current_key_data, current_value_data, key_cache_data,
                     value_cache_data, fp16_cache, num_kv_heads,
@@ -980,12 +983,21 @@ void CudaBackend::dispatch(const GraphNode& node,
                     current_value.stride[1] / sizeof(float),
                     current_value.stride[2] / sizeof(float));
                 if (!mollm_cuda::report_cuda(
-                        cudaGetLastError(), "append_kv_cuda")) {
+                        cudaGetLastError(), "append_kv_cuda"))
+                    return false;
+                cache_appended = true;
+                return true;
+            };
+            if (cached) {
+                key_data = key_cache_data;
+                value_data = value_cache_data;
+                // Decode may fold the one-token append into its score stage.
+                // Prefill and generic decode layouts keep the standalone
+                // append path below.
+                if (query_length != 1 && !append_cache()) {
                     impl_->failed = true;
                     return;
                 }
-                key_data = key_cache_data;
-                value_data = value_cache_data;
             }
             const size_t score_count = static_cast<size_t>(num_heads) *
                 query_length * key_length;
@@ -998,26 +1010,48 @@ void CudaBackend::dispatch(const GraphNode& node,
             }
             auto* scores = static_cast<float*>(impl_->attention_scores);
             if (query_length == 1) {
-                mollm_cuda::launch_sdpa_decode(
-                    query_data, key_data, value_data, scores, output_data,
-                    mask_data, num_heads, num_kv_heads, key_length,
-                    past_length, key_dim, value_dim, key_capacity, cached,
-                    fp16_cache, causal, scale,
-                    query.stride[0] / sizeof(float),
-                    query.stride[2] / sizeof(float),
-                    cached ? 1 : current_key.stride[0] / sizeof(float),
-                    cached ? static_cast<size_t>(key_dim)
-                           : current_key.stride[1] / sizeof(float),
-                    cached ? static_cast<size_t>(key_capacity) * key_dim
-                           : current_key.stride[2] / sizeof(float),
-                    cached ? 1 : current_value.stride[0] / sizeof(float),
-                    cached ? static_cast<size_t>(value_dim)
-                           : current_value.stride[1] / sizeof(float),
-                    cached ? static_cast<size_t>(key_capacity) * value_dim
-                           : current_value.stride[2] / sizeof(float),
-                    mask ? mask->stride[0] / sizeof(float) : 0,
-                    output->stride[0] / sizeof(float),
-                    output->stride[2] / sizeof(float));
+                const bool fused_append = cached && fp16_cache &&
+                    mollm_cuda::try_launch_sdpa_decode_fp16_cached(
+                        query_data, current_key_data, current_value_data,
+                        key_cache_data, value_cache_data, scores, output_data,
+                        mask_data, num_heads, num_kv_heads, key_length,
+                        past_length, key_dim, value_dim, key_capacity, causal,
+                        scale, query.stride[0] / sizeof(float),
+                        query.stride[2] / sizeof(float),
+                        current_key.stride[0] / sizeof(float),
+                        current_key.stride[2] / sizeof(float),
+                        current_value.stride[0] / sizeof(float),
+                        current_value.stride[2] / sizeof(float),
+                        mask ? mask->stride[0] / sizeof(float) : 0,
+                        output->stride[0] / sizeof(float),
+                        output->stride[2] / sizeof(float));
+                if (!fused_append) {
+                    if (!append_cache()) {
+                        impl_->failed = true;
+                        return;
+                    }
+                    mollm_cuda::launch_sdpa_decode(
+                        query_data, key_data, value_data, scores, output_data,
+                        mask_data, num_heads, num_kv_heads, key_length,
+                        past_length, key_dim, value_dim, key_capacity, cached,
+                        fp16_cache, causal, scale,
+                        query.stride[0] / sizeof(float),
+                        query.stride[2] / sizeof(float),
+                        cached ? 1 : current_key.stride[0] / sizeof(float),
+                        cached ? static_cast<size_t>(key_dim)
+                               : current_key.stride[1] / sizeof(float),
+                        cached ? static_cast<size_t>(key_capacity) * key_dim
+                               : current_key.stride[2] / sizeof(float),
+                        cached ? 1 : current_value.stride[0] / sizeof(float),
+                        cached ? static_cast<size_t>(value_dim)
+                               : current_value.stride[1] / sizeof(float),
+                        cached
+                            ? static_cast<size_t>(key_capacity) * value_dim
+                            : current_value.stride[2] / sizeof(float),
+                        mask ? mask->stride[0] / sizeof(float) : 0,
+                        output->stride[0] / sizeof(float),
+                        output->stride[2] / sizeof(float));
+                }
                 if (!mollm_cuda::report_cuda(
                         cudaGetLastError(), "sdpa_decode_cuda")) {
                     impl_->failed = true;
