@@ -271,6 +271,8 @@ struct CudaBackend::Impl {
         } else {
             const void* linear_weight = prepared->data;
             cudaDataType linear_weight_type = prepared->type;
+            const size_t a_elements = static_cast<size_t>(m) * lda;
+            bool activation_prepared = false;
             if (valid_quantized) {
                 const size_t weight_elements = static_cast<size_t>(n) * k;
                 if (!reserve(
@@ -288,11 +290,17 @@ struct CudaBackend::Impl {
                         weight_elements, k);
                     label = "dequantize_q8_dense_weight_cuda";
                 } else if (valid_q4_g32) {
-                    mollm_cuda::launch_dequantize_q4_g32_dense_weight(
+                    if (!reserve(
+                            activation_fp16, activation_fp16_bytes,
+                            a_elements * sizeof(__half)))
+                        return false;
+                    mollm_cuda::launch_prepare_q4_g32_dense_gemm(
                         static_cast<const Q4B8G32Block*>(prepared->data),
                         reinterpret_cast<__half2*>(quantized_weight_scratch),
-                        n, k / 32);
-                    label = "dequantize_q4_g32_dense_weight_cuda";
+                        device_a, static_cast<__half*>(activation_fp16),
+                        a_elements, n, k / 32);
+                    activation_prepared = true;
+                    label = "prepare_q4_g32_dense_gemm_cuda";
                 } else {
                     const size_t packed_count =
                         static_cast<size_t>((n + 7) / 8) * (k / 128) *
@@ -312,19 +320,20 @@ struct CudaBackend::Impl {
                 return false;
             }
 
-            const size_t a_elements = static_cast<size_t>(m) * lda;
             const void* gemm_activation = device_a;
             cudaDataType activation_type = CUDA_R_32F;
             if (linear_weight_type == CUDA_R_16F) {
-                if (!reserve(activation_fp16, activation_fp16_bytes,
-                             a_elements * sizeof(__half)))
-                    return false;
-                mollm_cuda::launch_fp32_to_fp16(
-                    device_a, static_cast<__half*>(activation_fp16),
-                    a_elements);
-                if (!mollm_cuda::report_cuda(
-                        cudaGetLastError(), "fp32_to_fp16"))
-                    return false;
+                if (!activation_prepared) {
+                    if (!reserve(activation_fp16, activation_fp16_bytes,
+                                 a_elements * sizeof(__half)))
+                        return false;
+                    mollm_cuda::launch_fp32_to_fp16(
+                        device_a, static_cast<__half*>(activation_fp16),
+                        a_elements);
+                    if (!mollm_cuda::report_cuda(
+                            cudaGetLastError(), "fp32_to_fp16"))
+                        return false;
+                }
                 gemm_activation = activation_fp16;
                 activation_type = CUDA_R_16F;
             }

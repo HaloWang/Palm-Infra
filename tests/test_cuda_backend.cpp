@@ -2142,6 +2142,35 @@ int main() {
     if (!dispatch_matmul(backend, q4, activation, actual, m, n, k) ||
         !close_enough(actual, expected, 8e-3f))
         return 1;
+    // The fused W4G32 preparation vectorizes aligned activation rows but must
+    // preserve the scalar conversion fallback for borrowed device views.
+    Tensor misaligned_activation_storage = device_tensor(
+        backend, static_cast<int64_t>(activation.size()) + 1);
+    std::vector<float> padded_activation(
+        activation.size() + 1, 0.0f);
+    std::copy(
+        activation.begin(), activation.end(),
+        padded_activation.begin() + 1);
+    if (!upload(
+            backend, misaligned_activation_storage, padded_activation))
+        return 1;
+    Tensor misaligned_activation = misaligned_activation_storage;
+    misaligned_activation.shape[0] = k;
+    misaligned_activation.shape[1] = m;
+    misaligned_activation.compute_strides();
+    misaligned_activation.device_offset += sizeof(float);
+    Tensor misaligned_output = device_tensor(backend, n, m);
+    GraphNode q4_matmul;
+    q4_matmul.op_type = OpType::MATMUL;
+    backend.clear_dispatch_error();
+    backend.dispatch(
+        q4_matmul, {&misaligned_activation, &q4},
+        &misaligned_output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed() ||
+        !download(backend, misaligned_output, actual) ||
+        !close_enough(actual, expected, 8e-3f))
+        return 1;
     reference(activation, q4_weight, decode_expected, 1, n, k);
     if (!dispatch_matmul(
             backend, q4, activation, decode_actual, 1, n, k) ||

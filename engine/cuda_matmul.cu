@@ -116,8 +116,11 @@ __global__ void q8_per_channel_dense_gemv_cuda(
         output[column] = sum;
 }
 
-__global__ void dequantize_q4_g32_dense_weight_cuda(
-    const Q4B8G32Block* weight, __half2* output, int rows, int groups) {
+template <bool VectorizedActivation>
+__global__ void prepare_q4_g32_dense_gemm_cuda(
+    const Q4B8G32Block* weight, __half2* weight_output,
+    const float* activation, __half* activation_output,
+    size_t activation_count, int rows, int groups) {
     // A canonical block has sixteen packed bytes per row. Convert two bytes
     // per thread so the expanded FP16 weight uses one naturally aligned
     // 64-bit store while sharing the scale and index arithmetic.
@@ -129,28 +132,46 @@ __global__ void dequantize_q4_g32_dense_weight_cuda(
             q4_g32_pairs_per_storage_block;
     const int group = static_cast<int>(blockIdx.x) *
         q4_g32_storage_blocks_per_cuda_block + local_block;
-    if (group >= groups)
-        return;
     const int lane = packed_index / 8;
     const int pair = packed_index % 8;
     const int row_block = static_cast<int>(blockIdx.y);
     const int row = row_block * 8 + lane;
-    if (row >= rows)
-        return;
-    const size_t block_index =
-        static_cast<size_t>(row_block) * groups + group;
-    const auto& block = weight[block_index];
-    const uint8_t first = block.q[lane][pair * 2];
-    const uint8_t second = block.q[lane][pair * 2 + 1];
-    const float scale = block.scales[lane];
-    reinterpret_cast<Half2Pair*>(output)[
-        (static_cast<size_t>(row) * groups + group) * 8 + pair] = {
-            __halves2half2(
-                __float2half(signed_nibble(first) * scale),
-                __float2half(signed_nibble(first >> 4) * scale)),
-            __halves2half2(
-                __float2half(signed_nibble(second) * scale),
-                __float2half(signed_nibble(second >> 4) * scale))};
+    if (group < groups && row < rows) {
+        const size_t block_index =
+            static_cast<size_t>(row_block) * groups + group;
+        const auto& block = weight[block_index];
+        const uint8_t first = block.q[lane][pair * 2];
+        const uint8_t second = block.q[lane][pair * 2 + 1];
+        const float scale = block.scales[lane];
+        reinterpret_cast<Half2Pair*>(weight_output)[
+            (static_cast<size_t>(row) * groups + group) * 8 + pair] = {
+                __halves2half2(
+                    __float2half(signed_nibble(first) * scale),
+                    __float2half(signed_nibble(first >> 4) * scale)),
+                __halves2half2(
+                    __float2half(signed_nibble(second) * scale),
+                    __float2half(signed_nibble(second >> 4) * scale))};
+    }
+
+    const size_t block = static_cast<size_t>(blockIdx.y) * gridDim.x +
+        blockIdx.x;
+    const size_t thread = block * blockDim.x + threadIdx.x;
+    const size_t thread_count = static_cast<size_t>(gridDim.x) * gridDim.y *
+        blockDim.x;
+    if constexpr (VectorizedActivation) {
+        const size_t pair_count = activation_count / 2;
+        const auto* source = reinterpret_cast<const float2*>(activation);
+        auto* destination = reinterpret_cast<__half2*>(activation_output);
+        for (size_t index = thread; index < pair_count;
+             index += thread_count) {
+            const float2 value = source[index];
+            destination[index] = __floats2half2_rn(value.x, value.y);
+        }
+    } else {
+        for (size_t index = thread; index < activation_count;
+             index += thread_count)
+            activation_output[index] = __float2half(activation[index]);
+    }
 }
 
 __global__ void dequantize_q4_g128_dense_weight_cuda(
@@ -306,15 +327,29 @@ void launch_q8_dense_gemv(
     }
 }
 
-void launch_dequantize_q4_g32_dense_weight(
-    const Q4B8G32Block* weight, __half2* output, int rows, int groups) {
+void launch_prepare_q4_g32_dense_gemm(
+    const Q4B8G32Block* weight, __half2* weight_output,
+    const float* activation, __half* activation_output,
+    size_t activation_count, int rows, int groups) {
     const dim3 grid(
         (groups + q4_g32_storage_blocks_per_cuda_block - 1) /
             q4_g32_storage_blocks_per_cuda_block,
         (rows + 7) / 8);
-    dequantize_q4_g32_dense_weight_cuda<<<
-        grid, q4_g32_dequant_threads>>>(
-        weight, output, rows, groups);
+    const bool vector_aligned = activation_count % 2 == 0 &&
+        reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0 &&
+        reinterpret_cast<uintptr_t>(activation_output) %
+            alignof(__half2) == 0;
+    if (vector_aligned) {
+        prepare_q4_g32_dense_gemm_cuda<true><<<
+            grid, q4_g32_dequant_threads>>>(
+            weight, weight_output, activation, activation_output,
+            activation_count, rows, groups);
+    } else {
+        prepare_q4_g32_dense_gemm_cuda<false><<<
+            grid, q4_g32_dequant_threads>>>(
+            weight, weight_output, activation, activation_output,
+            activation_count, rows, groups);
+    }
 }
 
 void launch_dequantize_q4_g128_dense_weight(
