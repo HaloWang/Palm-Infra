@@ -25,6 +25,25 @@ bool close_enough(const std::vector<float>& actual,
     return true;
 }
 
+bool close_enough_relative(
+    const std::vector<float>& actual, const std::vector<float>& expected,
+    float absolute_tolerance, float relative_tolerance) {
+    for (size_t index = 0; index < actual.size(); ++index) {
+        const float difference = std::fabs(actual[index] - expected[index]);
+        const float tolerance = absolute_tolerance +
+            relative_tolerance * std::fabs(expected[index]);
+        if (difference > tolerance) {
+            std::fprintf(
+                stderr,
+                "CUDA mismatch at %zu: actual=%g expected=%g "
+                "tolerance=%g\n",
+                index, actual[index], expected[index], tolerance);
+            return false;
+        }
+    }
+    return true;
+}
+
 void reference(const std::vector<float>& activation,
                const std::vector<float>& weight, std::vector<float>& output,
                int m, int n, int k) {
@@ -1300,11 +1319,11 @@ bool test_shortconv(CudaBackend& backend) {
 
 bool test_gdn(CudaBackend& backend) {
     backend.clear_dispatch_error();
-    constexpr int key_heads = 1;
-    constexpr int value_heads = 2;
+    constexpr int key_heads = 3;
+    constexpr int value_heads = 6;
     constexpr int dimension = 128;
-    constexpr int sequence_length = 3;
-    constexpr int real_tokens = 2;
+    constexpr int sequence_length = 65;
+    constexpr int real_tokens = 61;
     constexpr int qkv_width =
         2 * key_heads * dimension + value_heads * dimension;
     constexpr int output_width = value_heads * dimension;
@@ -1411,8 +1430,62 @@ bool test_gdn(CudaBackend& backend) {
     if (backend.dispatch_failed() ||
         !download(backend, output, actual_output) ||
         !download(backend, state, actual_state) ||
-        !close_enough(actual_output, expected_output, 2e-4f) ||
-        !close_enough(actual_state, expected_state, 2e-4f))
+        !close_enough_relative(
+            actual_output, expected_output, 5e-6f, 2e-6f) ||
+        !close_enough_relative(
+            actual_state, expected_state, 5e-4f, 2e-6f))
+        return false;
+
+    // Reusing shared reduction storage used to race between consecutive
+    // reductions. Reset the recurrent state and require deterministic output
+    // across several identical launches so that regression cannot hide behind
+    // a one-shot numerical tolerance check.
+    const std::vector<float> deterministic_output = actual_output;
+    const std::vector<float> deterministic_state = actual_state;
+    for (int iteration = 0; iteration < 3; ++iteration) {
+        if (!upload(backend, state, initial_state))
+            return false;
+        backend.dispatch(
+            gdn, {&qkv, &a, &b, &z, &device_a_log, &device_dt_bias,
+                  &norm, &state},
+            &output, nullptr);
+        backend.end_graph();
+        if (backend.dispatch_failed() ||
+            !download(backend, output, actual_output) ||
+            !download(backend, state, actual_state) ||
+            !close_enough(actual_output, deterministic_output, 0.0f) ||
+            !close_enough(actual_state, deterministic_state, 0.0f))
+            return false;
+    }
+
+    // The optimized prefill path must preserve the optional-normalization
+    // contract as well as Qwen3.5's normal use_qk_l2norm=true case.
+    std::vector<float> expected_raw_state = initial_state;
+    std::vector<float> expected_raw_output(
+        static_cast<size_t>(output_width) * sequence_length);
+    h_state.data = expected_raw_state.data();
+    h_output.data = expected_raw_output.data();
+    params.i32[4] = 0;
+    kernel_gdn_prefill(params, host_inputs, host_outputs);
+    if (!upload(backend, state, initial_state))
+        return false;
+    gdn.params = params;
+    backend.dispatch(
+        gdn, {&qkv, &a, &b, &z, &device_a_log, &device_dt_bias,
+              &norm, &state},
+        &output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed() ||
+        !download(backend, output, actual_output) ||
+        !download(backend, state, actual_state) ||
+        !close_enough_relative(
+            actual_output, expected_raw_output, 5e-6f, 2e-6f) ||
+        !close_enough_relative(
+            actual_state, expected_raw_state, 5e-4f, 2e-6f))
+        return false;
+
+    params.i32[4] = 1;
+    if (!upload(backend, state, expected_state))
         return false;
 
     std::vector<float> decode_qkv(qkv_width);

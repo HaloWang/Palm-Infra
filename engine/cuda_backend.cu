@@ -1524,6 +1524,24 @@ void CudaBackend::dispatch(const GraphNode& node,
                 }
             }
         } else if (valid) {
+            const bool prefill =
+                node.op_type == OpType::GATED_DELTANET_PREFILL;
+            const size_t prefill_scratch_bytes = prefill
+                ? mollm_cuda::gdn_prefill_scratch_bytes(
+                      num_heads, num_value_heads, key_dimension,
+                      value_dimension, sequence_length)
+                : 0;
+            void* prefill_scratch = nullptr;
+            if (prefill_scratch_bytes > 0) {
+                if (!impl_->reserve(
+                        impl_->recurrent_scratch,
+                        impl_->recurrent_scratch_bytes,
+                        prefill_scratch_bytes)) {
+                    impl_->failed = true;
+                    return;
+                }
+                prefill_scratch = impl_->recurrent_scratch;
+            }
             launched = mollm_cuda::launch_gdn(
                 qkv, a, b, z, a_log, dt_bias, norm_weight, state,
                 destination, num_heads, num_value_heads, key_dimension,
@@ -1533,7 +1551,8 @@ void CudaBackend::dispatch(const GraphNode& node,
                 graph_params::get_f32(node.params, 1, 1e-6f), scale,
                 inputs[1]->stride[1] / sizeof(float),
                 inputs[2]->stride[1] / sizeof(float),
-                inputs[3]->stride[1] / sizeof(float));
+                inputs[3]->stride[1] / sizeof(float), prefill_scratch,
+                prefill_scratch_bytes);
         }
         if (launched) {
             if (!mollm_cuda::report_cuda(cudaGetLastError(), "gdn_128_cuda")) {

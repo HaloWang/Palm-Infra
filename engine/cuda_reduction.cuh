@@ -41,7 +41,12 @@ __device__ __forceinline__ float block_reduce_sum(
             reduction[0] = value;
     }
     __syncthreads();
-    return reduction[0];
+    const float result = reduction[0];
+    // Callers commonly reuse the same shared-memory array for consecutive
+    // reductions. Ensure every thread has consumed the result before any
+    // thread can enter the next reduction and overwrite reduction[0].
+    __syncthreads();
+    return result;
 }
 
 template <int Threads>
@@ -66,7 +71,9 @@ __device__ __forceinline__ float block_reduce_max(
             reduction[0] = value;
     }
     __syncthreads();
-    return reduction[0];
+    const float result = reduction[0];
+    __syncthreads();
+    return result;
 }
 
 }  // namespace mollm_cuda::detail

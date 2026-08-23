@@ -63,6 +63,203 @@ __device__ __forceinline__ float gdn_softplus(float value) {
     return log1pf(expf(value));
 }
 
+// Prefill exposes the independent value columns of the recurrent state as
+// separate warps. Q/K normalization and output RMSNorm remain separate so the
+// recurrence can keep one state column in registers for the entire sequence.
+__global__ void gdn_prepare_qk_128_cuda(
+    const float* qkv, float* normalized_query, float* normalized_key,
+    float* query_key_dot, int num_heads, int sequence_length,
+    bool normalize_qk, float l2_epsilon) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int dimension = static_cast<int>(threadIdx.x);
+    const int key_head = row / sequence_length;
+    const int token = row - key_head * sequence_length;
+    if (key_head >= num_heads)
+        return;
+
+    const int qkv_key_width = num_heads * gdn_head_dim;
+    const size_t query_index =
+        (static_cast<size_t>(key_head) * gdn_head_dim + dimension) *
+            sequence_length + token;
+    const size_t key_index =
+        (static_cast<size_t>(qkv_key_width) +
+         static_cast<size_t>(key_head) * gdn_head_dim + dimension) *
+            sequence_length + token;
+    const float query = qkv[query_index];
+    const float key = qkv[key_index];
+    float query_inverse = 1.0f;
+    float key_inverse = 1.0f;
+    if (normalize_qk) {
+        __shared__ float reduction[gdn_head_dim];
+        const float query_sum =
+            mollm_cuda::detail::block_reduce_sum<gdn_head_dim>(
+                query * query, reduction);
+        const float key_sum =
+            mollm_cuda::detail::block_reduce_sum<gdn_head_dim>(
+                key * key, reduction);
+        query_inverse = rsqrtf(query_sum + l2_epsilon);
+        key_inverse = rsqrtf(key_sum + l2_epsilon);
+    }
+    const size_t destination =
+        (static_cast<size_t>(key_head) * sequence_length + token) *
+            gdn_head_dim + dimension;
+    const float normalized_query_value = query * query_inverse;
+    const float normalized_key_value = key * key_inverse;
+    normalized_query[destination] = normalized_query_value;
+    normalized_key[destination] = normalized_key_value;
+    __shared__ float dot_reduction[gdn_head_dim];
+    const float dot = mollm_cuda::detail::block_reduce_sum<gdn_head_dim>(
+        normalized_query_value * normalized_key_value, dot_reduction);
+    if (dimension == 0)
+        query_key_dot[row] = dot;
+}
+
+__global__ void gdn_prepare_gates_cuda(
+    const float* a, const float* b, const float* a_log,
+    const float* dt_bias, float* decay, float* beta,
+    int num_value_heads, int sequence_length, size_t a_row_stride,
+    size_t b_row_stride) {
+    const int index = static_cast<int>(blockIdx.x) * blockDim.x +
+        static_cast<int>(threadIdx.x);
+    const int count = sequence_length * num_value_heads;
+    if (index >= count)
+        return;
+    const int token = index / num_value_heads;
+    const int value_head = index - token * num_value_heads;
+    const float a_value =
+        a[static_cast<size_t>(token) * a_row_stride + value_head];
+    const float b_value =
+        b[static_cast<size_t>(token) * b_row_stride + value_head];
+    decay[index] = expf(
+        -expf(a_log[value_head]) *
+        gdn_softplus(a_value + dt_bias[value_head]));
+    beta[index] = 1.0f / (1.0f + expf(-b_value));
+}
+
+__global__ void gdn_recurrence_rows_128_cuda(
+    const float* qkv, const float* normalized_query,
+    const float* normalized_key, const float* query_key_dot,
+    const float* decay, const float* beta, float* state, float* raw_output,
+    int num_heads, int num_value_heads, int sequence_length,
+    int real_tokens, float scale) {
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int value_dimension = static_cast<int>(blockIdx.x) * 4 + warp;
+    const int value_head = static_cast<int>(blockIdx.y);
+    if (value_dimension >= gdn_head_dim || value_head >= num_value_heads)
+        return;
+
+    const int repeat = num_value_heads / num_heads;
+    const int key_head = value_head / repeat;
+    const int qkv_key_width = num_heads * gdn_head_dim;
+    float* head_state = state +
+        static_cast<size_t>(value_head) * gdn_head_dim * gdn_head_dim;
+    __shared__ float decayed_state[4][gdn_head_dim];
+    float local_state[4];
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const int key_dimension = lane + chunk * warpSize;
+        local_state[chunk] = head_state[
+            static_cast<size_t>(key_dimension) * gdn_head_dim +
+            value_dimension];
+    }
+
+    for (int token = 0; token < real_tokens; ++token) {
+        const int gate_index = token * num_value_heads + value_head;
+        const size_t qk_base =
+            (static_cast<size_t>(key_head) * sequence_length + token) *
+            gdn_head_dim;
+        float key_projection = 0.0f;
+        float attention_decay = 0.0f;
+#pragma unroll
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            local_state[chunk] *= decay[gate_index];
+            decayed_state[warp][lane + chunk * warpSize] =
+                local_state[chunk];
+        }
+        __syncwarp();
+        if (lane == 0) {
+#pragma unroll
+            for (int key_dimension = 0;
+                 key_dimension < gdn_head_dim; ++key_dimension) {
+                const float state_value =
+                    decayed_state[warp][key_dimension];
+                key_projection = fmaf(
+                    state_value,
+                    normalized_key[qk_base + key_dimension],
+                    key_projection);
+                attention_decay = fmaf(
+                    state_value,
+                    normalized_query[qk_base + key_dimension],
+                    attention_decay);
+            }
+        }
+        __syncwarp();
+        key_projection = __shfl_sync(0xffffffffu, key_projection, 0);
+        const size_t value_index =
+            (static_cast<size_t>(2 * qkv_key_width) +
+             static_cast<size_t>(value_head) * gdn_head_dim +
+             value_dimension) * sequence_length + token;
+        const float delta =
+            (qkv[value_index] - key_projection) * beta[gate_index];
+#pragma unroll
+        for (int chunk = 0; chunk < 4; ++chunk) {
+            const int key_dimension = lane + chunk * warpSize;
+            local_state[chunk] = fmaf(
+                normalized_key[qk_base + key_dimension], delta,
+                local_state[chunk]);
+        }
+        if (lane == 0) {
+            const size_t output_index =
+                (static_cast<size_t>(token) * num_value_heads + value_head) *
+                    gdn_head_dim + value_dimension;
+            raw_output[output_index] =
+                (attention_decay + delta * query_key_dot[
+                    static_cast<size_t>(key_head) * sequence_length + token]) *
+                scale;
+        }
+    }
+    if (lane == 0) {
+        for (int token = real_tokens; token < sequence_length; ++token) {
+            const size_t output_index =
+                (static_cast<size_t>(token) * num_value_heads + value_head) *
+                    gdn_head_dim + value_dimension;
+            raw_output[output_index] = 0.0f;
+        }
+    }
+#pragma unroll
+    for (int chunk = 0; chunk < 4; ++chunk) {
+        const int key_dimension = lane + chunk * warpSize;
+        head_state[static_cast<size_t>(key_dimension) * gdn_head_dim +
+                   value_dimension] = local_state[chunk];
+    }
+}
+
+__global__ void gdn_post_128_cuda(
+    const float* z, const float* norm_weight, const float* raw_output,
+    float* output, int num_value_heads, int sequence_length,
+    float rms_epsilon, size_t z_row_stride) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int dimension = static_cast<int>(threadIdx.x);
+    const int value_head = row % num_value_heads;
+    const int token = row / num_value_heads;
+    if (token >= sequence_length)
+        return;
+    const size_t base = static_cast<size_t>(row) * gdn_head_dim;
+    const float value = raw_output[base + dimension];
+    __shared__ float reduction[gdn_head_dim];
+    const float square_sum =
+        mollm_cuda::detail::block_reduce_sum<gdn_head_dim>(
+            value * value, reduction);
+    const float inverse_rms =
+        rsqrtf(square_sum / gdn_head_dim + rms_epsilon);
+    const float z_value = z[
+        static_cast<size_t>(token) * z_row_stride +
+        static_cast<size_t>(value_head) * gdn_head_dim + dimension];
+    output[base + dimension] = value * inverse_rms *
+        norm_weight[dimension] * (z_value / (1.0f + expf(-z_value)));
+}
+
 // Qwen3.5's recurrent dimensions are 128-wide. One block owns one value head
 // so every state column is independent across threads while the token axis is
 // traversed in recurrence order. Q/K and RMS reductions stay on chip.
@@ -179,6 +376,23 @@ __global__ void gdn_128_cuda(
 
 namespace mollm_cuda {
 
+size_t gdn_prefill_scratch_bytes(
+    int num_heads, int num_value_heads, int key_dimension,
+    int value_dimension, int sequence_length) {
+    if (num_heads <= 0 || num_value_heads <= 0 || key_dimension != 128 ||
+        value_dimension != 128 || sequence_length <= 1)
+        return 0;
+    const size_t qk_elements = static_cast<size_t>(sequence_length) *
+        num_heads * key_dimension;
+    const size_t qk_rows =
+        static_cast<size_t>(sequence_length) * num_heads;
+    const size_t gate_elements = static_cast<size_t>(sequence_length) *
+        num_value_heads;
+    const size_t output_elements = gate_elements * value_dimension;
+    return (2 * qk_elements + qk_rows + 2 * gate_elements + output_elements) *
+        sizeof(float);
+}
+
 bool launch_shortconv(
     const float* input, const float* weight, float* state, float* output,
     int groups, int sequence_length, int kernel_size, int real_tokens,
@@ -204,7 +418,8 @@ bool launch_gdn(
     int key_dimension, int value_dimension, int sequence_length,
     int real_tokens, bool normalize_qk, float rms_epsilon, float l2_epsilon,
     float scale, size_t a_row_stride, size_t b_row_stride,
-    size_t z_row_stride) {
+    size_t z_row_stride, void* prefill_scratch,
+    size_t prefill_scratch_bytes) {
     if (!qkv || !a || !b || !z || !a_log || !dt_bias || !norm_weight ||
         !state || !output || num_heads <= 0 || num_value_heads <= 0 ||
         num_value_heads % num_heads != 0 ||
@@ -214,6 +429,44 @@ bool launch_gdn(
     const int process_length =
         real_tokens > 0 && real_tokens < sequence_length
         ? real_tokens : sequence_length;
+    const size_t required_scratch = gdn_prefill_scratch_bytes(
+        num_heads, num_value_heads, key_dimension, value_dimension,
+        sequence_length);
+    if (required_scratch > 0 && prefill_scratch &&
+        prefill_scratch_bytes >= required_scratch) {
+        auto* scratch = static_cast<float*>(prefill_scratch);
+        const size_t qk_elements =
+            static_cast<size_t>(sequence_length) * num_heads * key_dimension;
+        const size_t qk_rows =
+            static_cast<size_t>(sequence_length) * num_heads;
+        const size_t gate_elements =
+            static_cast<size_t>(sequence_length) * num_value_heads;
+        float* normalized_query = scratch;
+        float* normalized_key = normalized_query + qk_elements;
+        float* query_key_dot = normalized_key + qk_elements;
+        float* decay = query_key_dot + qk_rows;
+        float* beta = decay + gate_elements;
+        float* raw_output = beta + gate_elements;
+        gdn_prepare_qk_128_cuda<<<sequence_length * num_heads, 128>>>(
+            qkv, normalized_query, normalized_key, query_key_dot,
+            num_heads, sequence_length, normalize_qk, l2_epsilon);
+        constexpr int gate_threads = 256;
+        const int gate_count = sequence_length * num_value_heads;
+        gdn_prepare_gates_cuda<<<
+            (gate_count + gate_threads - 1) / gate_threads, gate_threads>>>(
+            a, b, a_log, dt_bias, decay, beta, num_value_heads,
+            sequence_length, a_row_stride, b_row_stride);
+        const dim3 recurrence_grid(
+            (value_dimension + 3) / 4, num_value_heads);
+        gdn_recurrence_rows_128_cuda<<<recurrence_grid, 128>>>(
+            qkv, normalized_query, normalized_key, query_key_dot, decay,
+            beta, state, raw_output, num_heads, num_value_heads,
+            sequence_length, process_length, scale);
+        gdn_post_128_cuda<<<sequence_length * num_value_heads, 128>>>(
+            z, norm_weight, raw_output, output, num_value_heads,
+            sequence_length, rms_epsilon, z_row_stride);
+        return true;
+    }
     gdn_128_cuda<<<num_value_heads, gdn_head_dim>>>(
         qkv, a, b, z, a_log, dt_bias, norm_weight, state, output, num_heads,
         num_value_heads, sequence_length, process_length, normalize_qk,
