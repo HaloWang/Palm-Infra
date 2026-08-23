@@ -897,8 +897,10 @@ bool test_long_sdpa_decode(CudaBackend& backend,
     backend.clear_dispatch_error();
     constexpr int heads = 2;
     constexpr int kv_heads = 1;
-    constexpr int key_dim = 8;
-    constexpr int value_dim = 8;
+    // Match the common Qwen head width so the long-context test exercises
+    // the parallel value reduction used by the 1024-thread decode kernel.
+    constexpr int key_dim = 128;
+    constexpr int value_dim = 128;
     constexpr int past_length = 512;
     constexpr int key_length = past_length + 1;
     constexpr int capacity = key_length + 1;

@@ -177,6 +177,30 @@ __device__ __forceinline__ float query_key_dot(
     return dot;
 }
 
+__device__ __forceinline__ float attention_value_dot(
+    const float* probabilities, const void* value, int key_head,
+    int key_length, int value_dim, int dimension, int first_position,
+    int position_stride, int value_capacity, bool cached, bool fp16_cache,
+    size_t value_feature_stride, size_t value_position_stride,
+    size_t value_head_stride) {
+    float result = 0.0f;
+    for (int position = first_position; position < key_length;
+         position += position_stride) {
+        const size_t cached_index =
+            (static_cast<size_t>(key_head) * value_capacity + position) *
+                value_dim + dimension;
+        const size_t current_index =
+            static_cast<size_t>(key_head) * value_head_stride +
+            static_cast<size_t>(position) * value_position_stride +
+            static_cast<size_t>(dimension) * value_feature_stride;
+        const float value_element = cached
+            ? load_kv_cache_value(value, cached_index, fp16_cache)
+            : static_cast<const float*>(value)[current_index];
+        result = fmaf(probabilities[position], value_element, result);
+    }
+    return result;
+}
+
 __global__ void append_kv_cuda(
     const float* key, const float* value, void* key_cache,
     void* value_cache, bool fp16_cache, int num_kv_heads,
@@ -384,27 +408,50 @@ __global__ void sdpa_decode_cuda(
     const float inverse_sum = block_sum > 0.0f
         ? 1.0f / block_sum : 0.0f;
 
-    for (int dimension = threadIdx.x; dimension < value_dim;
-         dimension += blockDim.x) {
-        float result = 0.0f;
-        for (int key_position = 0; key_position < key_length;
-             ++key_position) {
-            const size_t cached_value_index =
-                (static_cast<size_t>(key_head) * key_capacity +
-                 key_position) * value_dim + dimension;
-            const size_t current_value_index =
-                static_cast<size_t>(key_head) * value_head_stride +
-                static_cast<size_t>(key_position) * value_position_stride +
-                static_cast<size_t>(dimension) * value_feature_stride;
-            const float value_element = cached
-                ? load_kv_cache_value(
-                      value, cached_value_index, fp16_cache)
-                : static_cast<const float*>(value)[current_value_index];
-            result += score_row[key_position] * inverse_sum * value_element;
+    // Normalize each score once. The value pass reuses every probability for
+    // all output dimensions, so applying inverse_sum there would repeat the
+    // same multiply value_dim times.
+    for (int key_position = threadIdx.x; key_position < key_length;
+         key_position += blockDim.x)
+        score_row[key_position] *= inverse_sum;
+    __syncthreads();
+
+    // Split the value accumulation across otherwise idle threads. Decode
+    // commonly has value_dim << Threads (128 vs. 512/1024), so assigning one
+    // thread per dimension leaves most of the block unused during this pass.
+    const int output_groups = value_dim > 0
+        ? min(8, Threads / value_dim) : 0;
+    const int output_threads = output_groups * value_dim;
+    if (output_groups > 1 && threadIdx.x < output_threads) {
+        const int dimension = threadIdx.x % value_dim;
+        const int group = threadIdx.x / value_dim;
+        reduction[threadIdx.x] = attention_value_dot(
+            score_row, value, key_head, key_length, value_dim, dimension,
+            group, output_groups, key_capacity, cached, fp16_cache,
+            value_feature_stride, value_position_stride, value_head_stride);
+    }
+    __syncthreads();
+    if (output_groups > 1) {
+        if (threadIdx.x < value_dim) {
+            float result = reduction[threadIdx.x];
+            for (int group = 1; group < output_groups; ++group)
+                result += reduction[group * value_dim + threadIdx.x];
+            output[static_cast<size_t>(head) * output_head_stride +
+                   static_cast<size_t>(threadIdx.x) *
+                       output_feature_stride] = result;
         }
-        output[static_cast<size_t>(head) * output_head_stride +
-               static_cast<size_t>(dimension) * output_feature_stride] =
-            result;
+    } else {
+        for (int dimension = threadIdx.x; dimension < value_dim;
+             dimension += blockDim.x) {
+            const float result = attention_value_dot(
+                score_row, value, key_head, key_length, value_dim,
+                dimension, 0, 1, key_capacity, cached, fp16_cache,
+                value_feature_stride, value_position_stride,
+                value_head_stride);
+            output[static_cast<size_t>(head) * output_head_stride +
+                   static_cast<size_t>(dimension) *
+                       output_feature_stride] = result;
+        }
     }
 }
 
