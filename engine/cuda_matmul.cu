@@ -67,7 +67,7 @@ __global__ void q8_per_channel_dense_gemv_cuda(
     const int8_t* __restrict__ weight,
     const float* __restrict__ scales,
     float* __restrict__ output, int columns, int inner) {
-    constexpr int warps_per_block = 4;
+    constexpr int warps_per_block = 8;
     const int warp = static_cast<int>(threadIdx.x) / warpSize;
     const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
     const int column = static_cast<int>(blockIdx.x) * warps_per_block + warp;
@@ -234,18 +234,25 @@ void launch_q8_dense_gemv(
     const float* activation, const int8_t* weight, const float* scales,
     int group_size, int groups_per_row, float* output, int columns,
     int inner) {
-    constexpr int warps_per_block = 4;
-    constexpr int threads = warps_per_block * 32;
-    const unsigned blocks = static_cast<unsigned>(
-        (columns + warps_per_block - 1) / warps_per_block);
     const bool vector_aligned =
         reinterpret_cast<uintptr_t>(activation) % alignof(float4) == 0 &&
         reinterpret_cast<uintptr_t>(weight) % alignof(char4) == 0;
     if (groups_per_row == 1 && group_size >= inner && inner % 4 == 0 &&
         vector_aligned) {
+        // The vector path has enough independent row work to amortize a
+        // larger block; keep the ragged/grouped fallback at its lower
+        // register-pressure configuration below.
+        constexpr int warps_per_block = 8;
+        constexpr int threads = warps_per_block * 32;
+        const unsigned blocks = static_cast<unsigned>(
+            (columns + warps_per_block - 1) / warps_per_block);
         q8_per_channel_dense_gemv_cuda<<<blocks, threads>>>(
             activation, weight, scales, output, columns, inner);
     } else {
+        constexpr int warps_per_block = 4;
+        constexpr int threads = warps_per_block * 32;
+        const unsigned blocks = static_cast<unsigned>(
+            (columns + warps_per_block - 1) / warps_per_block);
         q8_dense_gemv_cuda<<<blocks, threads>>>(
             activation, weight, scales, group_size, groups_per_row, output,
             columns, inner);
