@@ -7,6 +7,11 @@ __device__ int signed_nibble(uint8_t value) {
     return nibble >= 8 ? nibble - 16 : nibble;
 }
 
+struct alignas(8) Half2Pair {
+    __half2 first;
+    __half2 second;
+};
+
 __global__ void fp32_to_fp16(const float* source, __half* destination,
                              size_t count) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -99,24 +104,33 @@ __global__ void dequantize_q4_g32_dense_weight_cuda(
     int rows, int groups) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
         threadIdx.x;
-    if (index >= packed_count)
+    // A canonical block has sixteen packed bytes per row. Convert two bytes
+    // per thread so the expanded FP16 weight uses one naturally aligned
+    // 64-bit store while sharing the scale and index arithmetic.
+    const size_t pair_count = packed_count / 2;
+    if (index >= pair_count)
         return;
-    constexpr int packed_per_block = 8 * 16;
-    const size_t block_index = index / packed_per_block;
-    const int packed_index = static_cast<int>(index % packed_per_block);
-    const int lane = packed_index / 16;
-    const int byte = packed_index % 16;
+    constexpr int pairs_per_block = 8 * 8;
+    const size_t block_index = index / pairs_per_block;
+    const int packed_index = static_cast<int>(index % pairs_per_block);
+    const int lane = packed_index / 8;
+    const int pair = packed_index % 8;
     const int group = static_cast<int>(block_index % groups);
     const int row = static_cast<int>(block_index / groups) * 8 + lane;
     if (row >= rows)
         return;
     const auto& block = weight[block_index];
-    const uint8_t packed = block.q[lane][byte];
+    const uint8_t first = block.q[lane][pair * 2];
+    const uint8_t second = block.q[lane][pair * 2 + 1];
     const float scale = block.scales[lane];
-    output[(static_cast<size_t>(row) * groups + group) * 16 + byte] =
-        __halves2half2(
-            __float2half(signed_nibble(packed) * scale),
-            __float2half(signed_nibble(packed >> 4) * scale));
+    reinterpret_cast<Half2Pair*>(output)[
+        (static_cast<size_t>(row) * groups + group) * 8 + pair] = {
+            __halves2half2(
+                __float2half(signed_nibble(first) * scale),
+                __float2half(signed_nibble(first >> 4) * scale)),
+            __halves2half2(
+                __float2half(signed_nibble(second) * scale),
+                __float2half(signed_nibble(second >> 4) * scale))};
 }
 
 __global__ void dequantize_q4_g128_dense_weight_cuda(
@@ -263,8 +277,9 @@ void launch_dequantize_q4_g32_dense_weight(
     const Q4B8G32Block* weight, __half2* output, size_t packed_count,
     int rows, int groups) {
     constexpr int threads = 256;
+    const size_t pair_count = packed_count / 2;
     dequantize_q4_g32_dense_weight_cuda<<<
-        static_cast<unsigned>((packed_count + threads - 1) / threads),
+        static_cast<unsigned>((pair_count + threads - 1) / threads),
         threads>>>(weight, output, packed_count, rows, groups);
 }
 
