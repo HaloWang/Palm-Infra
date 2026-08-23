@@ -24,12 +24,14 @@ constexpr int q4_g32_rows_per_storage_block = 8;
 constexpr int q4_g32_quad_rows_target_blocks_per_sm = 6;
 constexpr int q4_g32_quad_rows_fallback_min_columns = 16384;
 constexpr int q4_g32_quad_rows_min_groups = 64;
-// Caching avoids repeated L1 activation reads for the two profitable middle
-// shapes. Shorter pair-row dots do not amortize the preload, while the very
-// wide vocabulary grid is already bandwidth-bound and only adds cache traffic.
-constexpr int q4_g32_activation_cache_max_inner = 4096;
+// Caching avoids repeated L1 activation reads for profitable middle-width
+// output grids. Shorter pair-row dots do not amortize the preload, while the
+// very wide vocabulary grid is already bandwidth-bound and only adds traffic.
+// Keep pair and quad limits independent: their row reuse and occupancy differ.
 constexpr int q4_g32_pair_activation_cache_min_inner = 4096;
+constexpr int q4_g32_pair_activation_cache_max_inner = 9216;
 constexpr int q4_g32_pair_activation_cache_max_columns = 4096;
+constexpr int q4_g32_quad_activation_cache_max_inner = 4096;
 constexpr int q4_g32_quad_activation_cache_max_columns = 65536;
 // Four canonical storage blocks exactly fill one 256-thread CUDA block.
 constexpr int q4_g32_storage_blocks_per_cuda_block = 4;
@@ -553,10 +555,10 @@ void launch_q4_g32_dense_gemv(
             inner / 32 >= q4_g32_quad_rows_min_groups && enough_grid;
         const bool cache_pair_activation =
             inner >= q4_g32_pair_activation_cache_min_inner &&
-            inner <= q4_g32_activation_cache_max_inner &&
+            inner <= q4_g32_pair_activation_cache_max_inner &&
             columns <= q4_g32_pair_activation_cache_max_columns;
         const bool cache_quad_activation =
-            inner <= q4_g32_activation_cache_max_inner &&
+            inner <= q4_g32_quad_activation_cache_max_inner &&
             columns < q4_g32_quad_activation_cache_max_columns;
         if (use_quad_rows) {
             if (cache_quad_activation)

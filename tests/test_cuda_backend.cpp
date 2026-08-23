@@ -2272,59 +2272,65 @@ int main() {
         !close_enough(decode_actual, decode_expected, 8e-3f))
         return 1;
 
-    // The pair-row activation-cache specialization is selected for the
-    // 4096-wide GDN output projection shape. Keep its shared-memory preload
-    // and the following quantized dot under both reference and sanitizer
-    // coverage without allocating a model-sized matrix.
-    constexpr int cached_k = 4096;
-    constexpr int cached_groups = cached_k / 32;
-    std::vector<float> cached_activation(cached_k);
-    for (int inner = 0; inner < cached_k; ++inner)
-        cached_activation[inner] =
-            static_cast<float>(inner % 37 - 18) / 41.0f;
-    std::vector<Q4B8G32Block> cached_blocks(cached_groups);
-    std::vector<float> cached_weight(static_cast<size_t>(n) * cached_k);
-    for (int group = 0; group < cached_groups; ++group) {
-        auto& packed_block = cached_blocks[group];
-        for (int row = 0; row < n; ++row) {
-            const float scale = 0.015625f +
-                ((group + row) % 11) * 0.00075f;
-            packed_block.scales[row] = scale;
-            for (int pair = 0; pair < 16; ++pair) {
-                const int low = (group * 7 + row + pair * 2) % 16 - 8;
-                const int high =
-                    (group * 7 + row + pair * 2 + 1) % 16 - 8;
-                packed_block.q[row][pair] = static_cast<uint8_t>(
-                    (low & 0xf) | ((high & 0xf) << 4));
-                const int inner = group * 32 + pair * 2;
-                cached_weight[static_cast<size_t>(row) * cached_k + inner] =
-                    low * scale;
-                cached_weight[static_cast<size_t>(row) * cached_k +
-                              inner + 1] = high * scale;
+    // The pair-row activation-cache specialization covers both the 4096-wide
+    // GDN projection and the 9216-wide down projection. Keep each dynamic
+    // shared-memory size and its following quantized dot under reference and
+    // sanitizer coverage without allocating a model-sized matrix.
+    const auto check_cached_pair = [&](int cached_k) {
+        const int cached_groups = cached_k / 32;
+        std::vector<float> cached_activation(cached_k);
+        for (int inner = 0; inner < cached_k; ++inner)
+            cached_activation[inner] =
+                static_cast<float>(inner % 37 - 18) / 41.0f;
+        std::vector<Q4B8G32Block> cached_blocks(cached_groups);
+        std::vector<float> cached_weight(
+            static_cast<size_t>(n) * cached_k);
+        for (int group = 0; group < cached_groups; ++group) {
+            auto& packed_block = cached_blocks[group];
+            for (int row = 0; row < n; ++row) {
+                const float scale = 0.015625f +
+                    ((group + row) % 11) * 0.00075f;
+                packed_block.scales[row] = scale;
+                for (int pair = 0; pair < 16; ++pair) {
+                    const int low =
+                        (group * 7 + row + pair * 2) % 16 - 8;
+                    const int high =
+                        (group * 7 + row + pair * 2 + 1) % 16 - 8;
+                    packed_block.q[row][pair] = static_cast<uint8_t>(
+                        (low & 0xf) | ((high & 0xf) << 4));
+                    const int inner = group * 32 + pair * 2;
+                    cached_weight[
+                        static_cast<size_t>(row) * cached_k + inner] =
+                        low * scale;
+                    cached_weight[
+                        static_cast<size_t>(row) * cached_k + inner + 1] =
+                        high * scale;
+                }
             }
         }
-    }
-    Tensor cached_q4 = Tensor::create(
-        Precision::INT4, MemoryType::EXTERNAL,
-        n, cached_k, 1, 1, cached_blocks.data());
-    cached_q4.rowmajor_data = cached_blocks.data();
-    cached_q4.q4_g32_data = cached_blocks.data();
-    cached_q4.is_q4_g32_packed = true;
-    cached_q4.group_size = 32;
-    cached_q4.groups_per_row = cached_groups;
-    backend.wrap_weight_int4(cached_q4);
-    std::memset(
-        cached_blocks.data(), 0,
-        cached_blocks.size() * sizeof(Q4B8G32Block));
-    std::vector<float> cached_expected(n);
-    std::vector<float> cached_actual(n);
-    reference(
-        cached_activation, cached_weight, cached_expected,
-        1, n, cached_k);
-    if (!dispatch_matmul(
-            backend, cached_q4, cached_activation, cached_actual,
-            1, n, cached_k) ||
-        !close_enough(cached_actual, cached_expected, 8e-3f))
+        Tensor cached_q4 = Tensor::create(
+            Precision::INT4, MemoryType::EXTERNAL,
+            n, cached_k, 1, 1, cached_blocks.data());
+        cached_q4.rowmajor_data = cached_blocks.data();
+        cached_q4.q4_g32_data = cached_blocks.data();
+        cached_q4.is_q4_g32_packed = true;
+        cached_q4.group_size = 32;
+        cached_q4.groups_per_row = cached_groups;
+        backend.wrap_weight_int4(cached_q4);
+        std::memset(
+            cached_blocks.data(), 0,
+            cached_blocks.size() * sizeof(Q4B8G32Block));
+        std::vector<float> cached_expected(n);
+        std::vector<float> cached_actual(n);
+        reference(
+            cached_activation, cached_weight, cached_expected,
+            1, n, cached_k);
+        return dispatch_matmul(
+                   backend, cached_q4, cached_activation, cached_actual,
+                   1, n, cached_k) &&
+            close_enough(cached_actual, cached_expected, 8e-3f);
+    };
+    if (!check_cached_pair(4096) || !check_cached_pair(9216))
         return 1;
 
     // Exercise the wide-output CUDA kernel selector with a ragged final
