@@ -2019,6 +2019,8 @@ int main() {
         !test_wide_cached_sdpa(backend, Precision::FP16, 257, 8) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 3, 5, true) ||
         !test_wide_cached_sdpa(
+            backend, Precision::FP16, 255, 1, false, 2, 256) ||
+        !test_wide_cached_sdpa(
             backend, Precision::FP16, 0, 17, false, 2, 256) ||
         !test_wide_cached_sdpa(
             backend, Precision::FP16, 1023, 2, true, 1, 256) ||

@@ -401,17 +401,21 @@ __global__ void sdpa_decode_cuda(
     __shared__ float2 pair_reduction[Threads];
 
     float local_maximum = -FLT_MAX;
-    const bool cooperative_qk = Threads == 1024 && cached && fp16_cache &&
-        query_feature_stride == 1 && key_dim == 128 &&
+    constexpr int cooperative_lanes_per_key = Threads == 512 ? 2 : 4;
+    const bool cooperative_shape =
+        (Threads == 512 && key_dim == 256) ||
+        (Threads == 1024 && key_dim == 128);
+    const bool cooperative_qk = cooperative_shape && cached && fp16_cache &&
+        query_feature_stride == 1 &&
         (reinterpret_cast<uintptr_t>(query_row) &
          (alignof(float2) - 1)) == 0 &&
         (reinterpret_cast<uintptr_t>(key) &
          (alignof(__half2) - 1)) == 0;
     if (cooperative_qk) {
-        // Four adjacent lanes cooperate on one key. Their half2 reads cover a
-        // contiguous 16-byte span instead of four cache rows 256 bytes apart,
-        // while still exposing 256 independent keys per 1024-thread block.
-        constexpr int lanes_per_key = 4;
+        // Two or four adjacent lanes cooperate on one key. Their half2 reads
+        // cover a contiguous span instead of unrelated cache rows while still
+        // exposing 256 independent keys per block.
+        constexpr int lanes_per_key = cooperative_lanes_per_key;
         const int lane = threadIdx.x % lanes_per_key;
         const int first_key = threadIdx.x / lanes_per_key;
         const auto* query2 = reinterpret_cast<const float2*>(query_row);
