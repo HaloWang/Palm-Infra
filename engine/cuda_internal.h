@@ -58,6 +58,17 @@ void launch_rope(
     int rope_dim, bool interleave, size_t x_s0, size_t x_s1, size_t x_s2,
     size_t x_s3, size_t c_s0, size_t c_s1, size_t s_s0, size_t s_s1,
     size_t o_s0, size_t o_s1, size_t o_s2, size_t o_s3);
+void launch_qk_rms_norm_rope(
+    const float* query, const float* key, const float* query_weight,
+    const float* key_weight, const float* cosine, const float* sine,
+    float* output, int feature_dim, int sequence_length, int query_heads,
+    int total_heads, int rope_dim, bool interleave,
+    size_t query_feature_stride, size_t query_row_stride,
+    size_t key_feature_stride, size_t key_row_stride,
+    size_t cosine_feature_stride, size_t cosine_position_stride,
+    size_t sine_feature_stride, size_t sine_position_stride,
+    size_t output_feature_stride, size_t output_position_stride,
+    size_t output_head_stride, float epsilon);
 void launch_append_kv(
     const float* key, const float* value, void* key_cache,
     void* value_cache, bool fp16_cache, int num_kv_heads,

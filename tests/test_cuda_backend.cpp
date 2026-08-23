@@ -361,6 +361,105 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
         return false;
 
+    constexpr int qk_query_heads = 2;
+    constexpr int qk_key_heads = 1;
+    constexpr int qk_rope_dim = 6;
+    constexpr int qk_query_rows = rope_sequence * qk_query_heads;
+    constexpr int qk_key_rows = rope_sequence * qk_key_heads;
+    Tensor query_storage =
+        device_tensor(backend, norm_width + 3, qk_query_rows);
+    Tensor key_storage =
+        device_tensor(backend, norm_width + 5, qk_key_rows);
+    Tensor qk_query = query_storage.view_2d(norm_width, qk_query_rows);
+    Tensor qk_key = key_storage.view_2d(norm_width, qk_key_rows);
+    std::vector<float> query_storage_data(
+        static_cast<size_t>(query_storage.nelements()), 91.0f);
+    std::vector<float> key_storage_data(
+        static_cast<size_t>(key_storage.nelements()), -83.0f);
+    std::vector<float> qk_query_data(norm_width * qk_query_rows);
+    std::vector<float> qk_key_data(norm_width * qk_key_rows);
+    for (size_t i = 0; i < qk_query_data.size(); ++i)
+        qk_query_data[i] =
+            (static_cast<int>((i * 7) % 23) - 11) / 13.0f;
+    for (size_t i = 0; i < qk_key_data.size(); ++i)
+        qk_key_data[i] =
+            (static_cast<int>((i * 5) % 19) - 9) / 11.0f;
+    for (int row = 0; row < qk_query_rows; ++row)
+        std::copy_n(
+            qk_query_data.data() + row * norm_width, norm_width,
+            query_storage_data.data() + row * (norm_width + 3));
+    for (int row = 0; row < qk_key_rows; ++row)
+        std::copy_n(
+            qk_key_data.data() + row * norm_width, norm_width,
+            key_storage_data.data() + row * (norm_width + 5));
+    if (!upload(backend, query_storage, query_storage_data) ||
+        !upload(backend, key_storage, key_storage_data))
+        return false;
+    std::vector<float> key_norm_weight(norm_width);
+    for (int dimension = 0; dimension < norm_width; ++dimension)
+        key_norm_weight[dimension] = 1.1f - dimension * 0.03f;
+    Tensor key_norm_scale = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, norm_width, 1, 1, 1,
+        key_norm_weight.data());
+    backend.wrap_weight(key_norm_scale);
+    Tensor qk_output = device_tensor(
+        backend, norm_width, rope_sequence,
+        qk_query_heads + qk_key_heads);
+    GraphNode qk_fused;
+    qk_fused.op_type = OpType::QK_RMS_NORM_ROPE;
+    qk_fused.params.i32 = {qk_rope_dim, 0, qk_query_heads};
+    qk_fused.params.f32 = {1e-6f};
+    backend.dispatch(
+        qk_fused,
+        {&qk_query, &qk_key, &norm_scale, &key_norm_scale, &cosine, &sine},
+        &qk_output, nullptr);
+    backend.end_graph();
+    expected.assign(
+        static_cast<size_t>(norm_width) * rope_sequence *
+            (qk_query_heads + qk_key_heads),
+        0.0f);
+    auto qk_reference = [&](const std::vector<float>& source,
+                            const std::vector<float>& weight, int rows,
+                            int output_row_offset) {
+        for (int row = 0; row < rows; ++row) {
+            float square_sum = 0.0f;
+            for (int dimension = 0; dimension < norm_width; ++dimension) {
+                const float value = source[row * norm_width + dimension];
+                square_sum += value * value;
+            }
+            const float inverse = 1.0f /
+                std::sqrt(square_sum / norm_width + 1e-6f);
+            const int position = row % rope_sequence;
+            for (int pair = 0; pair < qk_rope_dim / 2; ++pair) {
+                const int first = pair;
+                const int second = pair + qk_rope_dim / 2;
+                const float x0 = source[row * norm_width + first] * inverse *
+                    weight[first];
+                const float x1 = source[row * norm_width + second] * inverse *
+                    weight[second];
+                const float c = cosine_data[position * 4 + pair];
+                const float s = sine_data[position * 4 + pair];
+                expected[(output_row_offset + row) * norm_width + first] =
+                    x0 * c - x1 * s;
+                expected[(output_row_offset + row) * norm_width + second] =
+                    x1 * c + x0 * s;
+            }
+            for (int dimension = qk_rope_dim; dimension < norm_width;
+                 ++dimension) {
+                expected[(output_row_offset + row) * norm_width + dimension] =
+                    source[row * norm_width + dimension] * inverse *
+                    weight[dimension];
+            }
+        }
+    };
+    qk_reference(qk_query_data, norm_weight, qk_query_rows, 0);
+    qk_reference(
+        qk_key_data, key_norm_weight, qk_key_rows, qk_query_rows);
+    if (!download(backend, qk_output, actual))
+        return false;
+    if (backend.dispatch_failed() || !close_enough(actual, expected, 3e-5f))
+        return false;
+
     constexpr int heads = 4;
     constexpr int kv_heads = 2;
     constexpr int key_dim = 4;

@@ -234,44 +234,63 @@ def build_graph(weights_dir: str, cfg: dict, seq_len: int = 1,
                      prec=Precision.FP16)
         caches.append((ck, cv))
 
+    input_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_layers_{i}_input_layernorm_weight.weights"),
+            (hidden_size,), Precision.FP32)
+        for i in range(num_layers)
+    ]
+    post_norm_weights = [
+        g.weight(
+            os.path.join(
+                weights_dir,
+                f"model_layers_{i}_post_attention_layernorm_weight.weights"),
+            (hidden_size,), Precision.FP32)
+        for i in range(num_layers)
+    ]
+    final_norm_weight = g.weight(
+        os.path.join(weights_dir, "final_norm.weights"),
+        (hidden_size,), Precision.FP32)
+
     x = hidden
+    x_normed = g.rms_norm(x, input_norm_weights[0], eps=eps)
     for i in range(num_layers):
         ck, cv = caches[i]
-        x = _build_layer(
-            g, x, i, weights_dir, cos, sin, mask, ck, cv,
+        next_norm_weight = (
+            input_norm_weights[i + 1]
+            if i + 1 < num_layers else final_norm_weight
+        )
+        x, x_normed = _build_layer(
+            g, x, x_normed, post_norm_weights[i], next_norm_weight,
+            i, weights_dir, cos, sin, mask, ck, cv,
             eps, seq_len, num_heads, num_kv_heads, head_dim,
             intermediate, hidden_size, is_prefill=is_prefill,
         )
 
-    w_norm = g.weight(os.path.join(weights_dir, "final_norm.weights"),
-                      (hidden_size,), Precision.FP32)
-    x = g.rms_norm(x, w_norm, eps=eps)
+    x = x_normed
 
     print(f"  Total: {len(g._nodes)} nodes")
     return g
 
 
-def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
+def _build_layer(g: GraphBuilder, x: int, x_normed: int,
+                 post_norm_weight: int, next_norm_weight: int,
+                 layer_idx: int, weights_dir: str,
                  cos: int, sin: int, mask: int, ck_in: int, cv_in: int,
                  eps: float, seq_len: int, num_heads: int, num_kv_heads: int,
                  head_dim: int, intermediate: int, hidden_size: int,
-                 is_prefill: bool = False) -> int:
+                 is_prefill: bool = False) -> tuple[int, int]:
     pfx = f"model_layers_{layer_idx}"
-
-    w_ln = g.weight(os.path.join(weights_dir, f"{pfx}_input_layernorm_weight.weights"),
-                    (hidden_size,), Precision.FP32)
-    x_normed = g.rms_norm(x, w_ln, eps=eps)
 
     attn_out = _build_attention(
         g, x_normed, layer_idx, weights_dir, cos, sin, mask, ck_in, cv_in,
         eps, seq_len, num_heads, num_kv_heads, head_dim, hidden_size,
         is_prefill=is_prefill,
     )
-    x = g.add(x, attn_out)
-
-    w_ln2 = g.weight(os.path.join(weights_dir, f"{pfx}_post_attention_layernorm_weight.weights"),
-                     (hidden_size,), Precision.FP32)
-    x_normed2 = g.rms_norm(x, w_ln2, eps=eps)
+    x_normed2 = g.add_rms_norm(
+        x, attn_out, post_norm_weight, eps=eps)
 
     mlp_pfx = f"{pfx}_mlp"
     # Fused gate/up: one [2*intermediate, hidden] matmul (activation=NONE so the
@@ -284,7 +303,9 @@ def _build_layer(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     merged = g.matmul(x_normed2, w_gate_up)
     mlp_hidden = g.swiglu(merged)
     mlp_out = g.matmul(mlp_hidden, w_down)
-    return g.add(x, mlp_out)
+    next_x_normed = g.add_rms_norm(
+        x, mlp_out, next_norm_weight, eps=eps)
+    return x, next_x_normed
 
 
 def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
@@ -315,23 +336,17 @@ def _build_attention(g: GraphBuilder, x: int, layer_idx: int, weights_dir: str,
     query = g.reshape(query, (head_dim, num_heads, _S))
     query = g.permute(query, (0, 2, 1, 3))
     query = g.reshape(query, (head_dim, num_heads * _S))
-    query = g.rms_norm(query, w_qn, eps=eps)
-    query = g.reshape(query, (head_dim, _S, num_heads))
-    query = g.contiguous(query)
 
     k = g.reshape(k, (head_dim, num_kv_heads, _S))
     k = g.permute(k, (0, 2, 1, 3))
     k = g.reshape(k, (head_dim, num_kv_heads * _S))
-    k = g.rms_norm(k, w_kn, eps=eps)
-    k = g.reshape(k, (head_dim, _S, num_kv_heads))
-    k = g.contiguous(k)
+    qk = g.qk_rms_norm_rope(
+        query, k, w_qn, w_kn, cos, sin, _S, num_heads, num_kv_heads,
+        rope_dim=head_dim, interleave=False, eps=eps)
+    query, k = g.slice(qk, [num_heads, num_kv_heads], dim=2)
 
     v = g.reshape(v, (head_dim, num_kv_heads, _S))
     v = g.permute(v, (0, 2, 1, 3))
-    v = g.contiguous(v)
-
-    query = g.rope(query, cos, sin, rope_dim=head_dim, interleave=False)
-    k = g.rope(k, cos, sin, rope_dim=head_dim, interleave=False)
 
     attn, _, _ = g.sdpa(
         query, k, v, mask, ck_in, cv_in,

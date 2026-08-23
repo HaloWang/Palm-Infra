@@ -1095,6 +1095,87 @@ void CudaBackend::dispatch(const GraphNode& node,
         return;
     }
 
+    if (node.op_type == OpType::QK_RMS_NORM_ROPE && inputs.size() >= 6 &&
+        inputs[0] && inputs[1] && inputs[2] && inputs[3] && inputs[4] &&
+        inputs[5] && output && inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        fp32_contiguous(*inputs[2]) && fp32_contiguous(*inputs[3]) &&
+        inputs[4]->prec == Precision::FP32 &&
+        inputs[5]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& query = *inputs[0];
+        const Tensor& key = *inputs[1];
+        const Tensor& query_weight = *inputs[2];
+        const Tensor& key_weight = *inputs[3];
+        const Tensor& cosine = *inputs[4];
+        const Tensor& sine = *inputs[5];
+        const int width = static_cast<int>(output->shape[0]);
+        const int sequence_length = static_cast<int>(output->shape[1]);
+        const int total_heads = static_cast<int>(output->shape[2]);
+        const int query_heads = graph_params::get_i32(
+            node.params, 2, total_heads);
+        const int key_heads = total_heads - query_heads;
+        const int rope_dim = graph_params::get_i32(node.params, 0, width);
+        const bool interleave =
+            graph_params::get_i32(node.params, 1, 1) != 0;
+        const auto element_aligned = [](const Tensor& tensor) {
+            for (int dimension = 0; dimension < 4; ++dimension)
+                if (tensor.stride[dimension] % sizeof(float) != 0)
+                    return false;
+            return true;
+        };
+        const float* query_data = device_pointer_const<float>(query);
+        const float* key_data = device_pointer_const<float>(key);
+        const float* query_weight_data =
+            device_pointer_const<float>(query_weight);
+        const float* key_weight_data =
+            device_pointer_const<float>(key_weight);
+        const float* cosine_data = device_pointer_const<float>(cosine);
+        const float* sine_data = device_pointer_const<float>(sine);
+        float* destination = device_pointer<float>(*output);
+        if (query_data && key_data && query_weight_data && key_weight_data &&
+            cosine_data && sine_data && destination && width > 0 &&
+            sequence_length > 0 && query_heads > 0 && key_heads > 0 &&
+            rope_dim > 0 && rope_dim <= width && rope_dim % 2 == 0 &&
+            query.shape[0] == width && key.shape[0] == width &&
+            query.shape[1] >= sequence_length * query_heads &&
+            key.shape[1] >= sequence_length * key_heads &&
+            query.shape[2] == 1 && query.shape[3] == 1 &&
+            key.shape[2] == 1 && key.shape[3] == 1 &&
+            query_weight.shape[0] >= width && key_weight.shape[0] >= width &&
+            cosine.shape[0] >= rope_dim / 2 &&
+            sine.shape[0] >= rope_dim / 2 &&
+            cosine.shape[1] >= sequence_length &&
+            sine.shape[1] >= sequence_length && output->shape[3] == 1 &&
+            element_aligned(query) && element_aligned(key) &&
+            element_aligned(cosine) && element_aligned(sine) &&
+            element_aligned(*output)) {
+            mollm_cuda::launch_qk_rms_norm_rope(
+                query_data, key_data, query_weight_data, key_weight_data,
+                cosine_data, sine_data, destination, width, sequence_length,
+                query_heads, total_heads, rope_dim, interleave,
+                query.stride[0] / sizeof(float),
+                query.stride[1] / sizeof(float),
+                key.stride[0] / sizeof(float),
+                key.stride[1] / sizeof(float),
+                cosine.stride[0] / sizeof(float),
+                cosine.stride[1] / sizeof(float),
+                sine.stride[0] / sizeof(float),
+                sine.stride[1] / sizeof(float),
+                output->stride[0] / sizeof(float),
+                output->stride[1] / sizeof(float),
+                output->stride[2] / sizeof(float),
+                graph_params::get_f32(node.params, 0, 1e-6f));
+            if (!mollm_cuda::report_cuda(
+                    cudaGetLastError(), "qk_rms_norm_rope_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
     if (node.op_type == OpType::RMS_NORM_ROPE && inputs.size() >= 4 &&
         inputs[0] && inputs[1] && inputs[2] && inputs[3] && output &&
         fp32_contiguous(*inputs[0]) && fp32_contiguous(*inputs[1]) &&

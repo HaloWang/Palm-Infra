@@ -1,4 +1,5 @@
 #include "engine/cuda_internal.h"
+#include "engine/cuda_reduction.cuh"
 
 #include <cfloat>
 #include <cmath>
@@ -52,6 +53,78 @@ __global__ void rope_cuda(
         ? (dimension & 1) == 0 : dimension < half;
     output[output_index] = first_component
         ? x0 * c - x1 * s : x0 * s + x1 * c;
+}
+
+__global__ void qk_rms_norm_rope_cuda(
+    const float* query, const float* key, const float* query_weight,
+    const float* key_weight, const float* cosine, const float* sine,
+    float* output, int feature_dim, int sequence_length, int query_heads,
+    int total_heads, int rope_dim, bool interleave,
+    size_t query_feature_stride, size_t query_row_stride,
+    size_t key_feature_stride, size_t key_row_stride,
+    size_t cosine_feature_stride, size_t cosine_position_stride,
+    size_t sine_feature_stride, size_t sine_position_stride,
+    size_t output_feature_stride, size_t output_position_stride,
+    size_t output_head_stride, float epsilon) {
+    const int row = static_cast<int>(blockIdx.x);
+    const int rows = sequence_length * total_heads;
+    if (row >= rows)
+        return;
+
+    const int query_rows = sequence_length * query_heads;
+    const bool is_query = row < query_rows;
+    const int source_row = is_query ? row : row - query_rows;
+    const float* source = (is_query ? query : key) +
+        static_cast<size_t>(source_row) *
+            (is_query ? query_row_stride : key_row_stride);
+    const size_t source_feature_stride = is_query
+        ? query_feature_stride : key_feature_stride;
+    const float* weight = is_query ? query_weight : key_weight;
+
+    float sum = 0.0f;
+    for (int dimension = threadIdx.x; dimension < feature_dim;
+         dimension += blockDim.x) {
+        const float value = source[
+            static_cast<size_t>(dimension) * source_feature_stride];
+        sum += value * value;
+    }
+    __shared__ float reduction[256];
+    const float block_sum =
+        mollm_cuda::detail::block_reduce_sum_256(sum, reduction);
+    const float inverse = rsqrtf(block_sum / feature_dim + epsilon);
+
+    const int position = source_row % sequence_length;
+    const int head = row / sequence_length;
+    float* destination = output +
+        static_cast<size_t>(position) * output_position_stride +
+        static_cast<size_t>(head) * output_head_stride;
+    const int half = rope_dim / 2;
+    for (int pair = threadIdx.x; pair < half; pair += blockDim.x) {
+        const int first = interleave ? pair * 2 : pair;
+        const int second = interleave ? first + 1 : pair + half;
+        const float x0 = source[
+            static_cast<size_t>(first) * source_feature_stride] * inverse *
+            weight[first];
+        const float x1 = source[
+            static_cast<size_t>(second) * source_feature_stride] * inverse *
+            weight[second];
+        const float c = cosine[
+            static_cast<size_t>(pair) * cosine_feature_stride +
+            static_cast<size_t>(position) * cosine_position_stride];
+        const float s = sine[
+            static_cast<size_t>(pair) * sine_feature_stride +
+            static_cast<size_t>(position) * sine_position_stride];
+        destination[static_cast<size_t>(first) * output_feature_stride] =
+            x0 * c - x1 * s;
+        destination[static_cast<size_t>(second) * output_feature_stride] =
+            x1 * c + x0 * s;
+    }
+    for (int dimension = rope_dim + threadIdx.x; dimension < feature_dim;
+         dimension += blockDim.x) {
+        destination[static_cast<size_t>(dimension) * output_feature_stride] =
+            source[static_cast<size_t>(dimension) * source_feature_stride] *
+            inverse * weight[dimension];
+    }
 }
 
 __device__ float load_kv_cache_value(
@@ -356,6 +429,28 @@ void launch_rope(
         input, cosine, sine, output, feature_dim, sequence_length, channels,
         shape2, rope_dim, interleave, x_s0, x_s1, x_s2, x_s3, c_s0, c_s1,
         s_s0, s_s1, o_s0, o_s1, o_s2, o_s3);
+}
+
+void launch_qk_rms_norm_rope(
+    const float* query, const float* key, const float* query_weight,
+    const float* key_weight, const float* cosine, const float* sine,
+    float* output, int feature_dim, int sequence_length, int query_heads,
+    int total_heads, int rope_dim, bool interleave,
+    size_t query_feature_stride, size_t query_row_stride,
+    size_t key_feature_stride, size_t key_row_stride,
+    size_t cosine_feature_stride, size_t cosine_position_stride,
+    size_t sine_feature_stride, size_t sine_position_stride,
+    size_t output_feature_stride, size_t output_position_stride,
+    size_t output_head_stride, float epsilon) {
+    constexpr int threads = 256;
+    qk_rms_norm_rope_cuda<<<sequence_length * total_heads, threads>>>(
+        query, key, query_weight, key_weight, cosine, sine, output,
+        feature_dim, sequence_length, query_heads, total_heads, rope_dim,
+        interleave, query_feature_stride, query_row_stride,
+        key_feature_stride, key_row_stride, cosine_feature_stride,
+        cosine_position_stride, sine_feature_stride, sine_position_stride,
+        output_feature_stride, output_position_stride, output_head_stride,
+        epsilon);
 }
 
 void launch_append_kv(

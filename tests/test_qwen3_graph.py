@@ -33,6 +33,9 @@ def tiny_cfg():
 def main():
     g = build_graph(".", tiny_cfg(), seq_len=8, n_ctx=64, is_prefill=True)
 
+    def count(op_type):
+        return sum(node.op_type == op_type for node in g._nodes)
+
     sdpa_nodes = [n for n in g._nodes if n.op_type == OpType.SDPA]
     check(len(sdpa_nodes) == 2, "one SDPA node per layer")
     for node in sdpa_nodes:
@@ -61,6 +64,12 @@ def main():
 
     check(not any(n.op_type == OpType.SIGMOID for n in g._nodes),
           "Qwen3 attention has no Qwen3.5 output gate")
+    check(count(OpType.ADD_RMS_NORM) == 4,
+          "attention and MLP residual pairs use ADD_RMS_NORM")
+    check(count(OpType.QK_RMS_NORM_ROPE) == 2,
+          "Q and K normalization/RoPE share one op per layer")
+    check(count(OpType.ROTARY_EMBED) == 0,
+          "Qwen3 has no standalone RoPE after Q/K fusion")
 
     print("Qwen3 graph tests passed")
 
