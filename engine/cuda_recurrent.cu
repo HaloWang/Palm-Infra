@@ -12,6 +12,10 @@ constexpr int gdn_head_dim = 128;
 // the partials in lane order. Sixteen workers preserve stable FP32 behavior
 // while avoiding both the serial single-lane dot and a tree reduction.
 constexpr int gdn_dot_workers = 16;
+constexpr int gdn_warp_size = 32;
+// Two independent value rows per block balance grid-level parallelism against
+// launch and scheduling overhead across both small and large hybrid models.
+constexpr int gdn_value_warps_per_block = 2;
 static_assert(gdn_head_dim % gdn_dot_workers == 0);
 
 __global__ void shortconv_serial_cuda(
@@ -216,7 +220,8 @@ __global__ void gdn_recurrence_rows_128_cuda(
     int real_tokens, float scale) {
     const int warp = static_cast<int>(threadIdx.x) / warpSize;
     const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
-    const int value_dimension = static_cast<int>(blockIdx.x) * 4 + warp;
+    const int value_dimension =
+        static_cast<int>(blockIdx.x) * gdn_value_warps_per_block + warp;
     const int value_head = static_cast<int>(blockIdx.y);
     if (value_dimension >= gdn_head_dim || value_head >= num_value_heads)
         return;
@@ -226,7 +231,8 @@ __global__ void gdn_recurrence_rows_128_cuda(
     const int qkv_key_width = num_heads * gdn_head_dim;
     float* head_state = state +
         static_cast<size_t>(value_head) * gdn_head_dim * gdn_head_dim;
-    __shared__ float decayed_state[4][gdn_head_dim];
+    __shared__ float
+        decayed_state[gdn_value_warps_per_block][gdn_head_dim];
     float local_state[4];
 #pragma unroll
     for (int chunk = 0; chunk < 4; ++chunk) {
@@ -557,8 +563,13 @@ bool launch_gdn(
             a, b, a_log, dt_bias, decay, beta, num_value_heads,
             sequence_length, a_row_stride, b_row_stride);
         const dim3 recurrence_grid(
-            (value_dimension + 3) / 4, num_value_heads);
-        gdn_recurrence_rows_128_cuda<<<recurrence_grid, 128>>>(
+            (value_dimension + gdn_value_warps_per_block - 1) /
+                gdn_value_warps_per_block,
+            num_value_heads);
+        constexpr int recurrence_threads =
+            gdn_value_warps_per_block * gdn_warp_size;
+        gdn_recurrence_rows_128_cuda<<<
+            recurrence_grid, recurrence_threads>>>(
             qkv, normalized_query, normalized_key, query_key_dot, decay,
             beta, state, raw_output, num_heads, num_value_heads,
             sequence_length, process_length, scale);
