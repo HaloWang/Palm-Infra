@@ -771,6 +771,39 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     }
     if (!close_enough(decode_actual, decode_expected, 3e-5f))
         return false;
+
+    // FP16 cached attention vectorizes aligned, contiguous query rows. A
+    // borrowed view may still begin at a scalar-float offset, which must use
+    // the numerically equivalent scalar path instead of a misaligned float2
+    // load.
+    if (fp16_cache) {
+        Tensor misaligned_storage = device_tensor(
+            backend, static_cast<int64_t>(decode_query_data.size()) + 1);
+        std::vector<float> padded_query(
+            decode_query_data.size() + 1, 0.0f);
+        std::copy(
+            decode_query_data.begin(), decode_query_data.end(),
+            padded_query.begin() + 1);
+        if (!upload(backend, misaligned_storage, padded_query))
+            return false;
+        Tensor misaligned_query = misaligned_storage;
+        misaligned_query.shape[0] = key_dim;
+        misaligned_query.shape[1] = 1;
+        misaligned_query.shape[2] = heads;
+        misaligned_query.shape[3] = 1;
+        misaligned_query.compute_strides();
+        misaligned_query.device_offset += sizeof(float);
+        backend.dispatch(
+            sdpa,
+            {&misaligned_query, &decode_key, &decode_value, nullptr,
+             &key_cache, &value_cache},
+            &decode_output, nullptr);
+        backend.end_graph();
+        if (backend.dispatch_failed() ||
+            !download(backend, decode_output, decode_actual) ||
+            !close_enough(decode_actual, decode_expected, 3e-5f))
+            return false;
+    }
     if (!backend.copy_to_host(
             key_cache, cached_key_bytes.data(), cached_key_bytes.size(),
             CacheMetadata::SIZE))
@@ -859,7 +892,8 @@ bool test_layout_rope_and_sdpa(CudaBackend& backend,
     return true;
 }
 
-bool test_long_sdpa_decode(CudaBackend& backend) {
+bool test_long_sdpa_decode(CudaBackend& backend,
+                           Precision cache_precision) {
     backend.clear_dispatch_error();
     constexpr int heads = 2;
     constexpr int kv_heads = 1;
@@ -906,16 +940,19 @@ bool test_long_sdpa_decode(CudaBackend& backend) {
         }
     }
 
+    const bool fp16_cache = cache_precision == Precision::FP16;
+    const size_t cache_element_size = fp16_cache
+        ? sizeof(mollm::cpu::fp16_t) : sizeof(float);
     const size_t key_cache_bytes = CacheMetadata::SIZE +
-        cached_key.size() * sizeof(float);
+        cached_key.size() * cache_element_size;
     const size_t value_cache_bytes = CacheMetadata::SIZE +
-        cached_value.size() * sizeof(float);
+        cached_value.size() * cache_element_size;
     Tensor key_cache = Tensor::create(
-        Precision::FP32, MemoryType::EXTERNAL,
-        key_cache_bytes / sizeof(float));
+        cache_precision, MemoryType::EXTERNAL,
+        key_cache_bytes / cache_element_size);
     Tensor value_cache = Tensor::create(
-        Precision::FP32, MemoryType::EXTERNAL,
-        value_cache_bytes / sizeof(float));
+        cache_precision, MemoryType::EXTERNAL,
+        value_cache_bytes / cache_element_size);
     backend.alloc_persistent(
         key_cache, key_cache_bytes,
         PersistentHostAccess::MIRRORED_PREFIX, CacheMetadata::SIZE);
@@ -936,14 +973,43 @@ bool test_long_sdpa_decode(CudaBackend& backend) {
     if (!backend.copy_from_host(
             &key_metadata, key_cache, sizeof(key_metadata)) ||
         !backend.copy_from_host(
-            &value_metadata, value_cache, sizeof(value_metadata)) ||
-        !backend.copy_from_host(
-            cached_key.data(), key_cache,
-            cached_key.size() * sizeof(float), CacheMetadata::SIZE) ||
-        !backend.copy_from_host(
-            cached_value.data(), value_cache,
-            cached_value.size() * sizeof(float), CacheMetadata::SIZE))
+            &value_metadata, value_cache, sizeof(value_metadata)))
         return false;
+    if (fp16_cache) {
+        std::vector<mollm::cpu::fp16_t> key_fp16(cached_key.size());
+        std::vector<mollm::cpu::fp16_t> value_fp16(cached_value.size());
+        for (size_t index = 0; index < cached_key.size(); ++index) {
+            key_fp16[index] =
+                static_cast<mollm::cpu::fp16_t>(cached_key[index]);
+            cached_key[index] = static_cast<float>(key_fp16[index]);
+        }
+        for (size_t index = 0; index < cached_value.size(); ++index) {
+            value_fp16[index] =
+                static_cast<mollm::cpu::fp16_t>(cached_value[index]);
+            cached_value[index] = static_cast<float>(value_fp16[index]);
+        }
+        if (!backend.copy_from_host(
+                key_fp16.data(), key_cache,
+                key_fp16.size() * sizeof(key_fp16[0]),
+                CacheMetadata::SIZE) ||
+            !backend.copy_from_host(
+                value_fp16.data(), value_cache,
+                value_fp16.size() * sizeof(value_fp16[0]),
+                CacheMetadata::SIZE))
+            return false;
+    } else if (!backend.copy_from_host(
+                   cached_key.data(), key_cache,
+                   cached_key.size() * sizeof(float), CacheMetadata::SIZE) ||
+               !backend.copy_from_host(
+                   cached_value.data(), value_cache,
+                   cached_value.size() * sizeof(float),
+                   CacheMetadata::SIZE)) {
+        return false;
+    }
+    const auto round_for_cache = [fp16_cache](float value) {
+        return fp16_cache
+            ? static_cast<float>(mollm::cpu::fp16_t(value)) : value;
+    };
 
     GraphNode sdpa;
     sdpa.op_type = OpType::SDPA;
@@ -970,7 +1036,7 @@ bool test_long_sdpa_decode(CudaBackend& backend) {
                     ? cached_key[
                           static_cast<size_t>(position) * key_dim +
                           dimension]
-                    : key_data[dimension];
+                    : round_for_cache(key_data[dimension]);
                 dot += query_data[head * key_dim + dimension] * key_element;
             }
             scores[position] = dot * scale;
@@ -987,7 +1053,7 @@ bool test_long_sdpa_decode(CudaBackend& backend) {
                     ? cached_value[
                           static_cast<size_t>(position) * value_dim +
                           dimension]
-                    : value_data[dimension];
+                    : round_for_cache(value_data[dimension]);
                 expected[head * value_dim + dimension] +=
                     scores[position] / sum * value_element;
             }
@@ -1351,7 +1417,8 @@ int main() {
         backend.kv_cache_precision(Precision::FP32) != Precision::FP32 ||
         !test_layout_rope_and_sdpa(backend, Precision::FP32) ||
         !test_layout_rope_and_sdpa(backend, Precision::FP16) ||
-        !test_long_sdpa_decode(backend) ||
+        !test_long_sdpa_decode(backend, Precision::FP32) ||
+        !test_long_sdpa_decode(backend, Precision::FP16) ||
         !test_decode_add_rms_norm(backend) ||
         !test_lm_head_argmax(backend))
         return 1;

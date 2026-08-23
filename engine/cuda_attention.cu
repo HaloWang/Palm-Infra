@@ -2,6 +2,7 @@
 #include "engine/cuda_reduction.cuh"
 
 #include <cfloat>
+#include <cstdint>
 #include <cmath>
 
 namespace {
@@ -142,6 +143,40 @@ __device__ void store_kv_cache_value(
         static_cast<float*>(cache)[index] = value;
 }
 
+__device__ __forceinline__ float query_key_dot(
+    const float* query, const void* key, bool cached, bool fp16_cache,
+    int key_dim, size_t cached_key_base, size_t current_key_base,
+    size_t query_feature_stride, size_t key_feature_stride) {
+    float dot = 0.0f;
+    const bool half2_aligned =
+        (reinterpret_cast<uintptr_t>(query) & (alignof(float2) - 1)) == 0 &&
+        (reinterpret_cast<uintptr_t>(key) & (alignof(__half2) - 1)) == 0;
+    if (cached && fp16_cache && query_feature_stride == 1 &&
+        key_dim % 2 == 0 && half2_aligned) {
+        const auto* query2 = reinterpret_cast<const float2*>(query);
+        const auto* key2 = reinterpret_cast<const __half2*>(key) +
+            cached_key_base / 2;
+        for (int pair = 0; pair < key_dim / 2; ++pair) {
+            const float2 q = query2[pair];
+            const float2 k = __half22float2(key2[pair]);
+            dot = fmaf(q.x, k.x, dot);
+            dot = fmaf(q.y, k.y, dot);
+        }
+        return dot;
+    }
+    for (int dimension = 0; dimension < key_dim; ++dimension) {
+        const float key_element = cached
+            ? load_kv_cache_value(
+                  key, cached_key_base + dimension, fp16_cache)
+            : static_cast<const float*>(key)[
+                  current_key_base + static_cast<size_t>(dimension) *
+                      key_feature_stride];
+        dot += query[static_cast<size_t>(dimension) *
+                     query_feature_stride] * key_element;
+    }
+    return dot;
+}
+
 __global__ void append_kv_cuda(
     const float* key, const float* value, void* key_cache,
     void* value_cache, bool fp16_cache, int num_kv_heads,
@@ -212,21 +247,12 @@ __global__ void sdpa_scores_cuda(
     const size_t cached_key_base =
         (static_cast<size_t>(key_head) * key_capacity + key_position) *
         key_dim;
-    const auto* current_key = static_cast<const float*>(key);
     const size_t current_key_base =
         static_cast<size_t>(key_head) * key_head_stride +
         static_cast<size_t>(key_position) * key_position_stride;
-    float dot = 0.0f;
-    for (int dimension = 0; dimension < key_dim; ++dimension) {
-        const float key_value = cached
-            ? load_kv_cache_value(
-                  key, cached_key_base + dimension, fp16_cache)
-            : current_key[current_key_base +
-                          static_cast<size_t>(dimension) *
-                              key_feature_stride];
-        dot += query_row[static_cast<size_t>(dimension) *
-                         query_feature_stride] * key_value;
-    }
+    const float dot = query_key_dot(
+        query_row, key, cached, fp16_cache, key_dim, cached_key_base,
+        current_key_base, query_feature_stride, key_feature_stride);
     float score = dot * scale;
     if (mask) {
         score += mask[static_cast<size_t>(query_position) * mask_row_stride +
@@ -330,17 +356,9 @@ __global__ void sdpa_decode_cuda(
         const size_t current_key_base =
             static_cast<size_t>(key_head) * key_head_stride +
             static_cast<size_t>(key_position) * key_position_stride;
-        float dot = 0.0f;
-        for (int dimension = 0; dimension < key_dim; ++dimension) {
-            const float key_element = cached
-                ? load_kv_cache_value(
-                      key, cached_key_base + dimension, fp16_cache)
-                : static_cast<const float*>(key)[
-                      current_key_base + static_cast<size_t>(dimension) *
-                          key_feature_stride];
-            dot += query_row[static_cast<size_t>(dimension) *
-                             query_feature_stride] * key_element;
-        }
+        const float dot = query_key_dot(
+            query_row, key, cached, fp16_cache, key_dim, cached_key_base,
+            current_key_base, query_feature_stride, key_feature_stride);
         float score = dot * scale;
         if (mask)
             score += mask[static_cast<size_t>(key_position) *
