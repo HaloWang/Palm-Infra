@@ -288,12 +288,10 @@ struct CudaBackend::Impl {
                         weight_elements, k);
                     label = "dequantize_q8_dense_weight_cuda";
                 } else if (valid_q4_g32) {
-                    const size_t packed_count =
-                        static_cast<size_t>((n + 7) / 8) * (k / 32) * 8 * 16;
                     mollm_cuda::launch_dequantize_q4_g32_dense_weight(
                         static_cast<const Q4B8G32Block*>(prepared->data),
                         reinterpret_cast<__half2*>(quantized_weight_scratch),
-                        packed_count, n, k / 32);
+                        n, k / 32);
                     label = "dequantize_q4_g32_dense_weight_cuda";
                 } else {
                     const size_t packed_count =

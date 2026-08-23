@@ -12,6 +12,13 @@ struct alignas(8) Half2Pair {
     __half2 second;
 };
 
+constexpr int q4_g32_pairs_per_storage_block = 8 * 8;
+// Four canonical storage blocks exactly fill one 256-thread CUDA block.
+constexpr int q4_g32_storage_blocks_per_cuda_block = 4;
+constexpr int q4_g32_dequant_threads =
+    q4_g32_pairs_per_storage_block *
+    q4_g32_storage_blocks_per_cuda_block;
+
 __global__ void fp32_to_fp16(const float* source, __half* destination,
                              size_t count) {
     const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
@@ -110,25 +117,28 @@ __global__ void q8_per_channel_dense_gemv_cuda(
 }
 
 __global__ void dequantize_q4_g32_dense_weight_cuda(
-    const Q4B8G32Block* weight, __half2* output, size_t packed_count,
-    int rows, int groups) {
-    const size_t index = static_cast<size_t>(blockIdx.x) * blockDim.x +
-        threadIdx.x;
+    const Q4B8G32Block* weight, __half2* output, int rows, int groups) {
     // A canonical block has sixteen packed bytes per row. Convert two bytes
     // per thread so the expanded FP16 weight uses one naturally aligned
     // 64-bit store while sharing the scale and index arithmetic.
-    const size_t pair_count = packed_count / 2;
-    if (index >= pair_count)
+    const int local_block =
+        static_cast<int>(threadIdx.x) /
+            q4_g32_pairs_per_storage_block;
+    const int packed_index =
+        static_cast<int>(threadIdx.x) %
+            q4_g32_pairs_per_storage_block;
+    const int group = static_cast<int>(blockIdx.x) *
+        q4_g32_storage_blocks_per_cuda_block + local_block;
+    if (group >= groups)
         return;
-    constexpr int pairs_per_block = 8 * 8;
-    const size_t block_index = index / pairs_per_block;
-    const int packed_index = static_cast<int>(index % pairs_per_block);
     const int lane = packed_index / 8;
     const int pair = packed_index % 8;
-    const int group = static_cast<int>(block_index % groups);
-    const int row = static_cast<int>(block_index / groups) * 8 + lane;
+    const int row_block = static_cast<int>(blockIdx.y);
+    const int row = row_block * 8 + lane;
     if (row >= rows)
         return;
+    const size_t block_index =
+        static_cast<size_t>(row_block) * groups + group;
     const auto& block = weight[block_index];
     const uint8_t first = block.q[lane][pair * 2];
     const uint8_t second = block.q[lane][pair * 2 + 1];
@@ -297,13 +307,14 @@ void launch_q8_dense_gemv(
 }
 
 void launch_dequantize_q4_g32_dense_weight(
-    const Q4B8G32Block* weight, __half2* output, size_t packed_count,
-    int rows, int groups) {
-    constexpr int threads = 256;
-    const size_t pair_count = packed_count / 2;
+    const Q4B8G32Block* weight, __half2* output, int rows, int groups) {
+    const dim3 grid(
+        (groups + q4_g32_storage_blocks_per_cuda_block - 1) /
+            q4_g32_storage_blocks_per_cuda_block,
+        (rows + 7) / 8);
     dequantize_q4_g32_dense_weight_cuda<<<
-        static_cast<unsigned>((pair_count + threads - 1) / threads),
-        threads>>>(weight, output, packed_count, rows, groups);
+        grid, q4_g32_dequant_threads>>>(
+        weight, output, rows, groups);
 }
 
 void launch_dequantize_q4_g128_dense_weight(

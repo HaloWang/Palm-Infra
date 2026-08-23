@@ -41,8 +41,7 @@ void launch_q8_dense_gemv(
     int group_size, int groups_per_row, float* output, int columns,
     int inner);
 void launch_dequantize_q4_g32_dense_weight(
-    const Q4B8G32Block* weight, __half2* output, size_t packed_count,
-    int rows, int groups);
+    const Q4B8G32Block* weight, __half2* output, int rows, int groups);
 void launch_dequantize_q4_g128_dense_weight(
     const Q4B8G128Block* weight, __half2* output, size_t packed_count,
     int rows, int groups);
