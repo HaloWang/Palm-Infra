@@ -2269,6 +2269,71 @@ int main() {
         !close_enough(decode_actual, decode_expected, 8e-3f))
         return 1;
 
+    // Exercise the wide-output CUDA kernel selector with a ragged final
+    // storage block. Compute the reference directly from the packed weights
+    // so the test does not need a large expanded FP32 matrix.
+    constexpr int wide_n = 18439;
+    constexpr int wide_k = 2048;
+    constexpr int wide_groups = wide_k / 32;
+    constexpr int wide_rows_per_block = 8;
+    constexpr int wide_row_blocks =
+        (wide_n + wide_rows_per_block - 1) / wide_rows_per_block;
+    std::vector<float> wide_activation(wide_k);
+    for (int inner = 0; inner < wide_k; ++inner)
+        wide_activation[inner] =
+            static_cast<float>(inner % 31 - 15) / 37.0f;
+    std::vector<Q4B8G32Block> wide_blocks(
+        static_cast<size_t>(wide_row_blocks) * wide_groups);
+    std::vector<float> wide_expected(wide_n, 0.0f);
+    for (int row_block = 0; row_block < wide_row_blocks; ++row_block) {
+        for (int group = 0; group < wide_groups; ++group) {
+            auto& packed_block = wide_blocks[
+                static_cast<size_t>(row_block) * wide_groups + group];
+            for (int row_lane = 0; row_lane < wide_rows_per_block;
+                 ++row_lane) {
+                const int row =
+                    row_block * wide_rows_per_block + row_lane;
+                const float group_scale = 0.0078125f +
+                    ((row_block + group + row_lane) % 13) * 0.0005f;
+                packed_block.scales[row_lane] = group_scale;
+                for (int pair = 0; pair < 16; ++pair) {
+                    const int low =
+                        (row + group * 3 + pair * 2) % 16 - 8;
+                    const int high =
+                        (row + group * 3 + pair * 2 + 1) % 16 - 8;
+                    packed_block.q[row_lane][pair] =
+                        static_cast<uint8_t>(
+                            (low & 0xf) | ((high & 0xf) << 4));
+                    if (row < wide_n) {
+                        const int inner = group * 32 + pair * 2;
+                        wide_expected[row] +=
+                            wide_activation[inner] * low * group_scale;
+                        wide_expected[row] +=
+                            wide_activation[inner + 1] * high * group_scale;
+                    }
+                }
+            }
+        }
+    }
+    Tensor wide_q4 = Tensor::create(
+        Precision::INT4, MemoryType::EXTERNAL,
+        wide_n, wide_k, 1, 1, wide_blocks.data());
+    wide_q4.rowmajor_data = wide_blocks.data();
+    wide_q4.q4_g32_data = wide_blocks.data();
+    wide_q4.is_q4_g32_packed = true;
+    wide_q4.group_size = 32;
+    wide_q4.groups_per_row = wide_groups;
+    backend.wrap_weight_int4(wide_q4);
+    std::memset(
+        wide_blocks.data(), 0,
+        wide_blocks.size() * sizeof(Q4B8G32Block));
+    std::vector<float> wide_actual(wide_n);
+    if (!dispatch_matmul(
+            backend, wide_q4, wide_activation, wide_actual,
+            1, wide_n, wide_k) ||
+        !close_enough(wide_actual, wide_expected, 5e-3f))
+        return 1;
+
     constexpr int k128 = 128;
     std::vector<float> activation128(static_cast<size_t>(m) * k128);
     for (size_t i = 0; i < activation128.size(); ++i)

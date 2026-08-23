@@ -18,11 +18,32 @@ struct alignas(8) Half2Pair {
 
 constexpr int q4_g32_pairs_per_storage_block = 8 * 8;
 constexpr int q4_g32_rows_per_storage_block = 8;
+// Four rows per warp need enough inner work to amortize their longer lane
+// loop and a wide output grid to retain enough resident blocks. Below either
+// point the two-row kernel's extra row parallelism wins instead.
+constexpr int q4_g32_quad_rows_target_blocks_per_sm = 6;
+constexpr int q4_g32_quad_rows_fallback_min_columns = 16384;
+constexpr int q4_g32_quad_rows_min_groups = 64;
 // Four canonical storage blocks exactly fill one 256-thread CUDA block.
 constexpr int q4_g32_storage_blocks_per_cuda_block = 4;
 constexpr int q4_g32_dequant_threads =
     q4_g32_pairs_per_storage_block *
     q4_g32_storage_blocks_per_cuda_block;
+
+int cuda_multiprocessor_count() {
+    static const int count = [] {
+        int device = 0;
+        int multiprocessors = 0;
+        if (cudaGetDevice(&device) == cudaSuccess &&
+            cudaDeviceGetAttribute(
+                &multiprocessors, cudaDevAttrMultiProcessorCount,
+                device) == cudaSuccess)
+            return multiprocessors;
+        cudaGetLastError();
+        return 0;
+    }();
+    return count;
+}
 
 __global__ void fp32_to_fp16(const float* source, __half* destination,
                              size_t count) {
@@ -292,6 +313,59 @@ __global__ void q4_g32_pair_rows_gemv_cuda(
         output[column] = sum;
 }
 
+__global__ void q4_g32_quad_rows_gemv_cuda(
+    const float* __restrict__ activation,
+    const Q4B8G32Block* __restrict__ weight,
+    float* __restrict__ output, int columns, int inner) {
+    constexpr int lanes_per_row = 8;
+    constexpr int rows_per_warp = 4;
+    constexpr int storage_blocks_per_cuda_block = 2;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int row = warp * rows_per_warp + lane / lanes_per_row;
+    const int pair = lane % lanes_per_row;
+    const int storage_block = static_cast<int>(blockIdx.x) *
+        storage_blocks_per_cuda_block +
+        row / q4_g32_rows_per_storage_block;
+    const int block_row = row % q4_g32_rows_per_storage_block;
+    const int column = static_cast<int>(blockIdx.x) *
+        storage_blocks_per_cuda_block * q4_g32_rows_per_storage_block + row;
+    if (storage_block * q4_g32_rows_per_storage_block >= columns)
+        return;
+    const int groups = inner / 32;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const auto& block =
+            weight[static_cast<size_t>(storage_block) * groups + group];
+        const uint8_t first = block.q[block_row][pair];
+        const uint8_t second = block.q[block_row][pair + lanes_per_row];
+        const auto* group_activation = reinterpret_cast<const float2*>(
+            activation + static_cast<size_t>(group) * 32);
+        const float2 first_value = group_activation[pair];
+        const float2 second_value = group_activation[pair + lanes_per_row];
+        const float scale = block.scales[block_row];
+        float quantized_dot = fmaf(
+            first_value.x,
+            static_cast<float>(biased_q4_g32_nibble(first)),
+            first_value.y * static_cast<float>(
+                biased_q4_g32_nibble(first >> 4)));
+        quantized_dot = fmaf(
+            second_value.x,
+            static_cast<float>(biased_q4_g32_nibble(second)),
+            quantized_dot);
+        quantized_dot = fmaf(
+            second_value.y,
+            static_cast<float>(biased_q4_g32_nibble(second >> 4)),
+            quantized_dot);
+        sum = fmaf(quantized_dot, scale, sum);
+    }
+    for (int offset = lanes_per_row / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(
+            0xffffffffu, sum, offset, lanes_per_row);
+    if (lane % lanes_per_row == 0 && column < columns)
+        output[column] = sum;
+}
+
 __global__ void q4_g128_dense_gemv_cuda(
     const float* __restrict__ activation,
     const Q4B8G128Block* __restrict__ weight,
@@ -438,11 +512,30 @@ void launch_q4_g32_dense_gemv(
     constexpr int warps_per_block = 4;
     constexpr int threads = warps_per_block * 32;
     if (reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0) {
-        const unsigned blocks = static_cast<unsigned>(
-            (columns + q4_g32_rows_per_storage_block - 1) /
-            q4_g32_rows_per_storage_block);
-        q4_g32_pair_rows_gemv_cuda<<<blocks, threads>>>(
-            activation, weight, output, columns, inner);
+        constexpr int quad_storage_blocks_per_cuda_block = 2;
+        const unsigned quad_blocks = static_cast<unsigned>(
+            (columns + quad_storage_blocks_per_cuda_block *
+                           q4_g32_rows_per_storage_block - 1) /
+            (quad_storage_blocks_per_cuda_block *
+             q4_g32_rows_per_storage_block));
+        const int multiprocessors = cuda_multiprocessor_count();
+        const bool enough_grid = multiprocessors > 0
+            ? quad_blocks >= static_cast<unsigned>(
+                  multiprocessors *
+                  q4_g32_quad_rows_target_blocks_per_sm)
+            : columns >= q4_g32_quad_rows_fallback_min_columns;
+        const bool use_quad_rows =
+            inner / 32 >= q4_g32_quad_rows_min_groups && enough_grid;
+        if (use_quad_rows) {
+            q4_g32_quad_rows_gemv_cuda<<<quad_blocks, threads>>>(
+                activation, weight, output, columns, inner);
+        } else {
+            const unsigned blocks = static_cast<unsigned>(
+                (columns + q4_g32_rows_per_storage_block - 1) /
+                q4_g32_rows_per_storage_block);
+            q4_g32_pair_rows_gemv_cuda<<<blocks, threads>>>(
+                activation, weight, output, columns, inner);
+        }
     } else {
         const unsigned blocks = static_cast<unsigned>(
             (columns + warps_per_block - 1) / warps_per_block);
