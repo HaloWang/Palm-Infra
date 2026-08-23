@@ -13,6 +13,7 @@ struct alignas(8) Half2Pair {
 };
 
 constexpr int q4_g32_pairs_per_storage_block = 8 * 8;
+constexpr int q4_g32_rows_per_storage_block = 8;
 // Four canonical storage blocks exactly fill one 256-thread CUDA block.
 constexpr int q4_g32_storage_blocks_per_cuda_block = 4;
 constexpr int q4_g32_dequant_threads =
@@ -135,7 +136,7 @@ __global__ void prepare_q4_g32_dense_gemm_cuda(
     const int lane = packed_index / 8;
     const int pair = packed_index % 8;
     const int row_block = static_cast<int>(blockIdx.y);
-    const int row = row_block * 8 + lane;
+    const int row = row_block * q4_g32_rows_per_storage_block + lane;
     if (group < groups && row < rows) {
         const size_t block_index =
             static_cast<size_t>(row_block) * groups + group;
@@ -229,6 +230,44 @@ __global__ void q4_g32_dense_gemv_cuda(
     for (int offset = warpSize / 2; offset != 0; offset /= 2)
         sum += __shfl_down_sync(0xffffffffu, sum, offset);
     if (lane == 0)
+        output[column] = sum;
+}
+
+__global__ void q4_g32_pair_rows_gemv_cuda(
+    const float* __restrict__ activation,
+    const Q4B8G32Block* __restrict__ weight,
+    float* __restrict__ output, int columns, int inner) {
+    // Four warps cover one canonical eight-row storage tile. Each half-warp
+    // owns one row and consumes both nibbles of a packed byte, halving the
+    // number of warps and reductions without serializing a row below sixteen
+    // lanes.
+    constexpr int lanes_per_row = 16;
+    const int warp = static_cast<int>(threadIdx.x) / warpSize;
+    const int lane = static_cast<int>(threadIdx.x) & (warpSize - 1);
+    const int row = warp * 2 + lane / lanes_per_row;
+    const int pair = lane % lanes_per_row;
+    const int column = static_cast<int>(blockIdx.x) *
+        q4_g32_rows_per_storage_block + row;
+    const int groups = inner / 32;
+    float sum = 0.0f;
+    for (int group = 0; group < groups; ++group) {
+        const auto& block =
+            weight[static_cast<size_t>(blockIdx.x) * groups + group];
+        const uint8_t packed = block.q[row][pair];
+        const float2 value = reinterpret_cast<const float2*>(
+            activation + static_cast<size_t>(group) * 32)[pair];
+        const float scale = block.scales[row];
+        sum = fmaf(
+            value.x, static_cast<float>(signed_nibble(packed)) * scale,
+            sum);
+        sum = fmaf(
+            value.y,
+            static_cast<float>(signed_nibble(packed >> 4)) * scale, sum);
+    }
+    for (int offset = lanes_per_row / 2; offset != 0; offset /= 2)
+        sum += __shfl_down_sync(
+            0xffffffffu, sum, offset, lanes_per_row);
+    if (lane % lanes_per_row == 0 && column < columns)
         output[column] = sum;
 }
 
@@ -334,7 +373,8 @@ void launch_prepare_q4_g32_dense_gemm(
     const dim3 grid(
         (groups + q4_g32_storage_blocks_per_cuda_block - 1) /
             q4_g32_storage_blocks_per_cuda_block,
-        (rows + 7) / 8);
+        (rows + q4_g32_rows_per_storage_block - 1) /
+            q4_g32_rows_per_storage_block);
     const bool vector_aligned = activation_count % 2 == 0 &&
         reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0 &&
         reinterpret_cast<uintptr_t>(activation_output) %
@@ -366,10 +406,18 @@ void launch_q4_g32_dense_gemv(
     int columns, int inner) {
     constexpr int warps_per_block = 4;
     constexpr int threads = warps_per_block * 32;
-    const unsigned blocks = static_cast<unsigned>(
-        (columns + warps_per_block - 1) / warps_per_block);
-    q4_g32_dense_gemv_cuda<<<blocks, threads>>>(
-        activation, weight, output, columns, inner);
+    if (reinterpret_cast<uintptr_t>(activation) % alignof(float2) == 0) {
+        const unsigned blocks = static_cast<unsigned>(
+            (columns + q4_g32_rows_per_storage_block - 1) /
+            q4_g32_rows_per_storage_block);
+        q4_g32_pair_rows_gemv_cuda<<<blocks, threads>>>(
+            activation, weight, output, columns, inner);
+    } else {
+        const unsigned blocks = static_cast<unsigned>(
+            (columns + warps_per_block - 1) / warps_per_block);
+        q4_g32_dense_gemv_cuda<<<blocks, threads>>>(
+            activation, weight, output, columns, inner);
+    }
 }
 
 void launch_q4_g128_dense_gemv(
