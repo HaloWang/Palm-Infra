@@ -92,6 +92,8 @@ struct CudaBackend::Impl {
     size_t attention_scores_bytes = 0;
     void* norm_scratch = nullptr;
     size_t norm_scratch_bytes = 0;
+    void* recurrent_scratch = nullptr;
+    size_t recurrent_scratch_bytes = 0;
 
     ~Impl() {
         if (cublas)
@@ -120,6 +122,8 @@ struct CudaBackend::Impl {
             cudaFree(attention_scores);
         if (norm_scratch)
             cudaFree(norm_scratch);
+        if (recurrent_scratch)
+            cudaFree(recurrent_scratch);
         if (std::getenv("MOLLM_CUDA_PROFILE")) {
             std::fprintf(stderr, "\nCudaBackend operator coverage:\n");
             for (const auto& entry : native_ops)
@@ -1357,6 +1361,182 @@ void CudaBackend::dispatch(const GraphNode& node,
                 output->stride[3] / sizeof(float));
             if (!mollm_cuda::report_cuda(
                     cudaGetLastError(), "rms_norm_rope_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    if (node.op_type == OpType::SHORTCONV && inputs.size() >= 3 &&
+        inputs[0] && inputs[1] && inputs[2] && output &&
+        inputs[0]->prec == Precision::FP32 &&
+        inputs[1]->prec == Precision::FP32 &&
+        inputs[2]->prec == Precision::FP32 &&
+        output->prec == Precision::FP32) {
+        const Tensor& input = *inputs[0];
+        const Tensor& weight = *inputs[1];
+        const Tensor& state = *inputs[2];
+        const int groups = static_cast<int>(input.shape[0]);
+        const int sequence_length = static_cast<int>(input.shape[1]);
+        const int kernel_size = graph_params::get_i32(node.params, 0, 4);
+        const int real_tokens = graph_params::get_i32(
+            node.params, 1, sequence_length);
+        const float* input_data = device_pointer_const<float>(input);
+        const float* weight_data = device_pointer_const<float>(weight);
+        float* state_data = device_pointer<float>(state);
+        float* destination = device_pointer<float>(*output);
+        if (input_data && weight_data && state_data && destination &&
+            groups > 0 && sequence_length > 0 && kernel_size > 0 &&
+            input.shape[2] == 1 && input.shape[3] == 1 &&
+            output->shape[0] == input.shape[0] &&
+            output->shape[1] == input.shape[1] &&
+            output->shape[2] == 1 && output->shape[3] == 1 &&
+            weight.nelements() >=
+                static_cast<int64_t>(groups) * kernel_size &&
+            state.nelements() >=
+                static_cast<int64_t>(groups) * (kernel_size - 1) &&
+            output->nelements() >=
+                static_cast<int64_t>(groups) * sequence_length &&
+            input.stride[0] % sizeof(float) == 0 &&
+            input.stride[1] % sizeof(float) == 0 &&
+            mollm_cuda::launch_shortconv(
+                input_data, weight_data, state_data, destination, groups,
+                sequence_length, kernel_size, real_tokens,
+                input.stride[0] / sizeof(float),
+                input.stride[1] / sizeof(float))) {
+            if (!mollm_cuda::report_cuda(
+                    cudaGetLastError(), "shortconv_cuda")) {
+                impl_->failed = true;
+                return;
+            }
+            record_native();
+            return;
+        }
+    }
+
+    const bool gdn_core =
+        node.op_type == OpType::GATED_DELTANET_PREFILL ||
+        node.op_type == OpType::GATED_DELTANET_DECODE;
+    const bool gdn_conv_decode =
+        node.op_type == OpType::GATED_DELTANET_CONV_DECODE;
+    if ((gdn_core || gdn_conv_decode) &&
+        inputs.size() >= (gdn_conv_decode ? 10u : 8u) && output &&
+        std::all_of(
+            inputs.begin(), inputs.begin() + 8,
+            [](const Tensor* tensor) {
+                return tensor && tensor->prec == Precision::FP32;
+            }) &&
+        (!gdn_conv_decode ||
+         (inputs[8] && inputs[8]->prec == Precision::FP32 &&
+          inputs[9] && inputs[9]->prec == Precision::FP32)) &&
+        output->prec == Precision::FP32) {
+        const int num_heads = graph_params::get_i32(node.params, 0, 16);
+        const int key_dimension = graph_params::get_i32(node.params, 1, 128);
+        const int value_dimension =
+            graph_params::get_i32(node.params, 2, 128);
+        const int sequence_length = graph_params::get_i32(node.params, 3, 1);
+        const int real_tokens =
+            graph_params::get_i32(node.params, 6, sequence_length);
+        const int num_value_heads =
+            graph_params::get_i32(node.params, 7, num_heads);
+        const int qkv_key_width = num_heads * key_dimension;
+        const int qkv_width =
+            2 * qkv_key_width + num_value_heads * value_dimension;
+        const int output_width = num_value_heads * value_dimension;
+        const float* qkv = device_pointer_const<float>(*inputs[0]);
+        const float* a = device_pointer_const<float>(*inputs[1]);
+        const float* b = device_pointer_const<float>(*inputs[2]);
+        const float* z = device_pointer_const<float>(*inputs[3]);
+        const float* a_log = device_pointer_const<float>(*inputs[4]);
+        const float* dt_bias = device_pointer_const<float>(*inputs[5]);
+        const float* norm_weight = device_pointer_const<float>(*inputs[6]);
+        float* state = device_pointer<float>(*inputs[7]);
+        float* destination = device_pointer<float>(*output);
+        float scale = graph_params::get_f32(node.params, 2, 0.0f);
+        if (scale == 0.0f && key_dimension > 0)
+            scale = 1.0f / std::sqrt(static_cast<float>(key_dimension));
+        const bool valid = qkv && a && b && z && a_log && dt_bias &&
+            norm_weight && state && destination && num_heads > 0 &&
+            num_value_heads > 0 && num_value_heads % num_heads == 0 &&
+            key_dimension == 128 && value_dimension == 128 &&
+            sequence_length > 0 && inputs[0]->nelements() >=
+                static_cast<int64_t>(qkv_width) * sequence_length &&
+            inputs[1]->shape[0] >= num_value_heads &&
+            inputs[2]->shape[0] >= num_value_heads &&
+            inputs[3]->shape[0] >= output_width &&
+            inputs[4]->nelements() >= num_value_heads &&
+            inputs[5]->nelements() >= num_value_heads &&
+            inputs[6]->nelements() >= value_dimension &&
+            inputs[7]->nelements() >=
+                static_cast<int64_t>(num_value_heads) * key_dimension *
+                    value_dimension &&
+            output->nelements() >=
+                static_cast<int64_t>(output_width) * sequence_length &&
+            inputs[1]->stride[0] == sizeof(float) &&
+            inputs[2]->stride[0] == sizeof(float) &&
+            inputs[3]->stride[0] == sizeof(float) &&
+            output->is_contiguous();
+        bool launched = false;
+        if (valid && gdn_conv_decode) {
+            const int convolution_kernel =
+                graph_params::get_i32(node.params, 5, 4);
+            const float* convolution_weight =
+                device_pointer_const<float>(*inputs[8]);
+            float* convolution_state = device_pointer<float>(*inputs[9]);
+            const size_t scratch_bytes =
+                static_cast<size_t>(qkv_width) * sizeof(float);
+            const bool valid_convolution = sequence_length == 1 &&
+                convolution_weight && convolution_state &&
+                convolution_kernel > 0 && inputs[8]->nelements() >=
+                    static_cast<int64_t>(qkv_width) * convolution_kernel &&
+                inputs[9]->nelements() >=
+                    static_cast<int64_t>(qkv_width) *
+                        (convolution_kernel - 1) &&
+                inputs[0]->stride[0] % sizeof(float) == 0 &&
+                inputs[0]->stride[1] % sizeof(float) == 0;
+            if (valid_convolution &&
+                impl_->reserve(
+                    impl_->recurrent_scratch,
+                    impl_->recurrent_scratch_bytes, scratch_bytes)) {
+                auto* convolved =
+                    static_cast<float*>(impl_->recurrent_scratch);
+                const bool convolution_launched =
+                    mollm_cuda::launch_shortconv(
+                        qkv, convolution_weight, convolution_state,
+                        convolved, qkv_width, 1, convolution_kernel, 1,
+                        inputs[0]->stride[0] / sizeof(float),
+                        inputs[0]->stride[1] / sizeof(float));
+                launched = convolution_launched && mollm_cuda::launch_gdn(
+                    convolved, a, b, z, a_log, dt_bias, norm_weight, state,
+                    destination, num_heads, num_value_heads, key_dimension,
+                    value_dimension, 1, 1,
+                    graph_params::get_i32(node.params, 4, 1) != 0,
+                    graph_params::get_f32(node.params, 0, 1e-6f),
+                    graph_params::get_f32(node.params, 1, 1e-6f), scale,
+                    inputs[1]->stride[1] / sizeof(float),
+                    inputs[2]->stride[1] / sizeof(float),
+                    inputs[3]->stride[1] / sizeof(float));
+                if (convolution_launched && !launched) {
+                    impl_->failed = true;
+                    return;
+                }
+            }
+        } else if (valid) {
+            launched = mollm_cuda::launch_gdn(
+                qkv, a, b, z, a_log, dt_bias, norm_weight, state,
+                destination, num_heads, num_value_heads, key_dimension,
+                value_dimension, sequence_length, real_tokens,
+                graph_params::get_i32(node.params, 4, 1) != 0,
+                graph_params::get_f32(node.params, 0, 1e-6f),
+                graph_params::get_f32(node.params, 1, 1e-6f), scale,
+                inputs[1]->stride[1] / sizeof(float),
+                inputs[2]->stride[1] / sizeof(float),
+                inputs[3]->stride[1] / sizeof(float));
+        }
+        if (launched) {
+            if (!mollm_cuda::report_cuda(cudaGetLastError(), "gdn_128_cuda")) {
                 impl_->failed = true;
                 return;
             }

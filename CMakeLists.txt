@@ -366,7 +366,8 @@ if(MOLLM_CUDA)
         engine/cuda_backend.cu
         engine/cuda_matmul.cu
         engine/cuda_memory.cu
-        engine/cuda_ops.cu)
+        engine/cuda_ops.cu
+        engine/cuda_recurrent.cu)
     target_compile_definitions(mollm_lib PUBLIC MOLLM_CUDA=1)
     target_link_libraries(mollm_lib PUBLIC CUDA::cudart CUDA::cublas)
     set_target_properties(mollm_lib PROPERTIES

@@ -1,6 +1,7 @@
 #include "engine/cuda_backend.h"
 #include "engine/engine.h"
 #include "graph/execute.h"
+#include "kernels/gdn.h"
 #include "kernels/quant_layouts.h"
 
 #include <algorithm>
@@ -1184,6 +1185,362 @@ bool test_wide_cached_sdpa(CudaBackend& backend,
     return true;
 }
 
+bool test_shortconv(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    constexpr int groups = 7;
+    constexpr int sequence_length = 5;
+    constexpr int kernel_size = 4;
+    constexpr int real_tokens = 3;
+    constexpr int row_padding = 3;
+    constexpr int row_stride = groups + row_padding;
+
+    Tensor input_storage =
+        device_tensor(backend, row_stride, sequence_length);
+    Tensor input = input_storage;
+    input.shape[0] = groups;
+    Tensor weight = device_tensor(backend, kernel_size, groups);
+    Tensor state = device_tensor(backend, kernel_size - 1, groups);
+    Tensor output = device_tensor(backend, groups, sequence_length);
+    std::vector<float> input_storage_data(input_storage.nelements(), 99.0f);
+    std::vector<float> input_data(
+        static_cast<size_t>(groups) * sequence_length);
+    std::vector<float> weight_data(weight.nelements());
+    std::vector<float> state_data(state.nelements());
+    for (int token = 0; token < sequence_length; ++token) {
+        for (int group = 0; group < groups; ++group) {
+            const float value =
+                ((token * 7 + group * 3) % 17 - 8) / 19.0f;
+            input_data[static_cast<size_t>(token) * groups + group] = value;
+            input_storage_data[
+                static_cast<size_t>(token) * row_stride + group] = value;
+        }
+    }
+    for (size_t index = 0; index < weight_data.size(); ++index)
+        weight_data[index] =
+            (static_cast<int>(index % 13) - 6) / 23.0f;
+    for (size_t index = 0; index < state_data.size(); ++index)
+        state_data[index] =
+            (static_cast<int>(index % 11) - 5) / 29.0f;
+    if (!upload(backend, input_storage, input_storage_data) ||
+        !upload(backend, weight, weight_data) ||
+        !upload(backend, state, state_data))
+        return false;
+
+    const auto reference = [&](
+        const std::vector<float>& source, int tokens, int process_tokens,
+        std::vector<float>& state_reference,
+        std::vector<float>& output_reference) {
+        for (int group = 0; group < groups; ++group) {
+            float window[kernel_size - 1];
+            for (int index = 0; index < kernel_size - 1; ++index)
+                window[index] = state_reference[
+                    static_cast<size_t>(group) * (kernel_size - 1) + index];
+            for (int token = 0; token < process_tokens; ++token) {
+                const float value =
+                    source[static_cast<size_t>(token) * groups + group];
+                float sum = value * weight_data[
+                    static_cast<size_t>(group) * kernel_size +
+                    kernel_size - 1];
+                for (int index = 0; index < kernel_size - 1; ++index)
+                    sum += window[index] * weight_data[
+                        static_cast<size_t>(group) * kernel_size + index];
+                output_reference[
+                    static_cast<size_t>(group) * tokens + token] =
+                    sum / (1.0f + std::exp(-sum));
+                for (int index = 0; index < kernel_size - 2; ++index)
+                    window[index] = window[index + 1];
+                window[kernel_size - 2] = value;
+            }
+            for (int index = 0; index < kernel_size - 1; ++index)
+                state_reference[
+                    static_cast<size_t>(group) * (kernel_size - 1) + index] =
+                    window[index];
+        }
+    };
+
+    std::vector<float> expected_state = state_data;
+    std::vector<float> expected_output(
+        static_cast<size_t>(groups) * sequence_length, 0.0f);
+    reference(input_data, sequence_length, real_tokens, expected_state,
+              expected_output);
+    GraphNode shortconv;
+    shortconv.op_type = OpType::SHORTCONV;
+    shortconv.params.i32 = {kernel_size, real_tokens};
+    backend.dispatch(
+        shortconv, {&input, &weight, &state}, &output, nullptr);
+    backend.end_graph();
+    std::vector<float> actual_output;
+    std::vector<float> actual_state;
+    if (backend.dispatch_failed() ||
+        !download(backend, output, actual_output) ||
+        !download(backend, state, actual_state) ||
+        !close_enough(actual_output, expected_output, 1e-6f) ||
+        !close_enough(actual_state, expected_state, 1e-6f))
+        return false;
+
+    Tensor decode_input = device_tensor(backend, groups);
+    Tensor decode_output = device_tensor(backend, groups);
+    std::vector<float> decode_data(groups);
+    for (int group = 0; group < groups; ++group)
+        decode_data[group] = (group - 3) / 17.0f;
+    if (!upload(backend, decode_input, decode_data))
+        return false;
+    std::vector<float> expected_decode(groups, 0.0f);
+    reference(decode_data, 1, 1, expected_state, expected_decode);
+    shortconv.params.i32 = {kernel_size, 1};
+    backend.dispatch(
+        shortconv, {&decode_input, &weight, &state}, &decode_output, nullptr);
+    backend.end_graph();
+    return !backend.dispatch_failed() &&
+        download(backend, decode_output, actual_output) &&
+        download(backend, state, actual_state) &&
+        close_enough(actual_output, expected_decode, 1e-6f) &&
+        close_enough(actual_state, expected_state, 1e-6f);
+}
+
+bool test_gdn(CudaBackend& backend) {
+    backend.clear_dispatch_error();
+    constexpr int key_heads = 1;
+    constexpr int value_heads = 2;
+    constexpr int dimension = 128;
+    constexpr int sequence_length = 3;
+    constexpr int real_tokens = 2;
+    constexpr int qkv_width =
+        2 * key_heads * dimension + value_heads * dimension;
+    constexpr int output_width = value_heads * dimension;
+
+    std::vector<float> qkv_data(
+        static_cast<size_t>(qkv_width) * sequence_length);
+    std::vector<float> a_data(
+        static_cast<size_t>(value_heads) * sequence_length);
+    std::vector<float> b_data(a_data.size());
+    std::vector<float> z_data(
+        static_cast<size_t>(output_width) * sequence_length);
+    std::vector<float> a_log(value_heads);
+    std::vector<float> dt_bias(value_heads);
+    std::vector<float> norm_weight(dimension);
+    std::vector<float> initial_state(
+        static_cast<size_t>(value_heads) * dimension * dimension);
+    for (size_t index = 0; index < qkv_data.size(); ++index)
+        qkv_data[index] =
+            (static_cast<int>(index % 29) - 14) / 41.0f;
+    for (size_t index = 0; index < a_data.size(); ++index) {
+        a_data[index] = (static_cast<int>(index % 7) - 3) / 13.0f;
+        b_data[index] = (static_cast<int>(index % 5) - 2) / 11.0f;
+    }
+    for (size_t index = 0; index < z_data.size(); ++index)
+        z_data[index] =
+            (static_cast<int>(index % 17) - 8) / 23.0f;
+    for (int head = 0; head < value_heads; ++head) {
+        a_log[head] = -1.1f + head * 0.15f;
+        dt_bias[head] = -0.2f + head * 0.1f;
+    }
+    for (int index = 0; index < dimension; ++index)
+        norm_weight[index] = 0.75f + (index % 11) / 32.0f;
+    for (size_t index = 0; index < initial_state.size(); ++index)
+        initial_state[index] =
+            (static_cast<int>(index % 19) - 9) / 97.0f;
+
+    OpParams params;
+    params.i32 = {key_heads, dimension, dimension, sequence_length,
+                  1, 4, real_tokens, value_heads};
+    params.f32 = {1e-6f, 1e-6f, 1.0f / std::sqrt(128.0f)};
+    std::vector<float> expected_state = initial_state;
+    std::vector<float> expected_output(
+        static_cast<size_t>(output_width) * sequence_length);
+    Tensor h_qkv = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        qkv_width, sequence_length, 1, 1, qkv_data.data());
+    Tensor h_a = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, sequence_length, 1, 1, a_data.data());
+    Tensor h_b = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, sequence_length, 1, 1, b_data.data());
+    Tensor h_z = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_width, sequence_length, 1, 1, z_data.data());
+    Tensor h_a_log = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, 1, 1, 1, a_log.data());
+    Tensor h_dt_bias = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, 1, 1, 1, dt_bias.data());
+    Tensor h_norm = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        dimension, 1, 1, 1, norm_weight.data());
+    Tensor h_state = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        dimension, dimension, value_heads, 1, expected_state.data());
+    Tensor h_output = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_width, sequence_length, 1, 1, expected_output.data());
+    std::vector<const Tensor*> host_inputs = {
+        &h_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm, &h_state};
+    std::vector<Tensor*> host_outputs = {&h_output};
+    kernel_gdn_prefill(params, host_inputs, host_outputs);
+
+    Tensor qkv = device_tensor(backend, qkv_width, sequence_length);
+    Tensor a = device_tensor(backend, value_heads, sequence_length);
+    Tensor b = device_tensor(backend, value_heads, sequence_length);
+    Tensor z = device_tensor(backend, output_width, sequence_length);
+    Tensor device_a_log = device_tensor(backend, value_heads);
+    Tensor device_dt_bias = device_tensor(backend, value_heads);
+    Tensor norm = device_tensor(backend, dimension);
+    Tensor state = device_tensor(
+        backend, dimension, dimension, value_heads);
+    Tensor output = device_tensor(backend, output_width, sequence_length);
+    if (!upload(backend, qkv, qkv_data) ||
+        !upload(backend, a, a_data) || !upload(backend, b, b_data) ||
+        !upload(backend, z, z_data) ||
+        !upload(backend, device_a_log, a_log) ||
+        !upload(backend, device_dt_bias, dt_bias) ||
+        !upload(backend, norm, norm_weight) ||
+        !upload(backend, state, initial_state))
+        return false;
+    GraphNode gdn;
+    gdn.op_type = OpType::GATED_DELTANET_PREFILL;
+    gdn.params = params;
+    backend.dispatch(
+        gdn, {&qkv, &a, &b, &z, &device_a_log, &device_dt_bias,
+              &norm, &state},
+        &output, nullptr);
+    backend.end_graph();
+    std::vector<float> actual_output;
+    std::vector<float> actual_state;
+    if (backend.dispatch_failed() ||
+        !download(backend, output, actual_output) ||
+        !download(backend, state, actual_state) ||
+        !close_enough(actual_output, expected_output, 2e-4f) ||
+        !close_enough(actual_state, expected_state, 2e-4f))
+        return false;
+
+    std::vector<float> decode_qkv(qkv_width);
+    std::vector<float> decode_a(value_heads);
+    std::vector<float> decode_b(value_heads);
+    std::vector<float> decode_z(output_width);
+    for (size_t index = 0; index < decode_qkv.size(); ++index)
+        decode_qkv[index] =
+            (static_cast<int>(index % 23) - 11) / 37.0f;
+    for (int head = 0; head < value_heads; ++head) {
+        decode_a[head] = (head - 1) / 9.0f;
+        decode_b[head] = (1 - head) / 7.0f;
+    }
+    for (size_t index = 0; index < decode_z.size(); ++index)
+        decode_z[index] =
+            (static_cast<int>(index % 13) - 6) / 19.0f;
+    std::vector<float> expected_decode(output_width);
+    h_qkv = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        qkv_width, 1, 1, 1, decode_qkv.data());
+    h_a = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, 1, 1, 1, decode_a.data());
+    h_b = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        value_heads, 1, 1, 1, decode_b.data());
+    h_z = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_width, 1, 1, 1, decode_z.data());
+    h_state.data = expected_state.data();
+    h_output = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_width, 1, 1, 1, expected_decode.data());
+    params.i32[3] = 1;
+    params.i32[6] = 1;
+    host_inputs = {
+        &h_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm, &h_state};
+    host_outputs = {&h_output};
+    kernel_gdn_decode(params, host_inputs, host_outputs);
+
+    qkv = device_tensor(backend, qkv_width);
+    a = device_tensor(backend, value_heads);
+    b = device_tensor(backend, value_heads);
+    z = device_tensor(backend, output_width);
+    output = device_tensor(backend, output_width);
+    if (!upload(backend, qkv, decode_qkv) ||
+        !upload(backend, a, decode_a) || !upload(backend, b, decode_b) ||
+        !upload(backend, z, decode_z))
+        return false;
+    gdn.op_type = OpType::GATED_DELTANET_DECODE;
+    gdn.params = params;
+    backend.dispatch(
+        gdn, {&qkv, &a, &b, &z, &device_a_log, &device_dt_bias,
+              &norm, &state},
+        &output, nullptr);
+    backend.end_graph();
+    if (backend.dispatch_failed() ||
+        !download(backend, output, actual_output) ||
+        !download(backend, state, actual_state) ||
+        !close_enough(actual_output, expected_decode, 2e-4f) ||
+        !close_enough(actual_state, expected_state, 2e-4f))
+        return false;
+
+    constexpr int convolution_kernel = 4;
+    std::vector<float> raw_qkv(qkv_width);
+    std::vector<float> convolution_weight(
+        static_cast<size_t>(qkv_width) * convolution_kernel);
+    std::vector<float> convolution_state(
+        static_cast<size_t>(qkv_width) * (convolution_kernel - 1));
+    for (size_t index = 0; index < raw_qkv.size(); ++index)
+        raw_qkv[index] =
+            (static_cast<int>(index % 31) - 15) / 43.0f;
+    for (size_t index = 0; index < convolution_weight.size(); ++index)
+        convolution_weight[index] =
+            (static_cast<int>(index % 11) - 5) / 27.0f;
+    for (size_t index = 0; index < convolution_state.size(); ++index)
+        convolution_state[index] =
+            (static_cast<int>(index % 13) - 6) / 39.0f;
+    std::vector<float> expected_convolution_state = convolution_state;
+    std::vector<float> expected_conv_output(output_width);
+    Tensor h_raw_qkv = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        qkv_width, 1, 1, 1, raw_qkv.data());
+    Tensor h_conv_weight = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        convolution_kernel, qkv_width, 1, 1, convolution_weight.data());
+    Tensor h_conv_state = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        convolution_kernel - 1, qkv_width, 1, 1,
+        expected_convolution_state.data());
+    h_state.data = expected_state.data();
+    h_output = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL,
+        output_width, 1, 1, 1, expected_conv_output.data());
+    host_inputs = {
+        &h_raw_qkv, &h_a, &h_b, &h_z, &h_a_log, &h_dt_bias, &h_norm,
+        &h_state, &h_conv_weight, &h_conv_state};
+    host_outputs = {&h_output};
+    kernel_gdn_conv_decode(params, host_inputs, host_outputs);
+
+    Tensor raw_qkv_tensor = device_tensor(backend, qkv_width);
+    Tensor conv_weight =
+        device_tensor(backend, convolution_kernel, qkv_width);
+    Tensor conv_state =
+        device_tensor(backend, convolution_kernel - 1, qkv_width);
+    output = device_tensor(backend, output_width);
+    if (!upload(backend, raw_qkv_tensor, raw_qkv) ||
+        !upload(backend, conv_weight, convolution_weight) ||
+        !upload(backend, conv_state, convolution_state))
+        return false;
+    gdn.op_type = OpType::GATED_DELTANET_CONV_DECODE;
+    gdn.params = params;
+    backend.dispatch(
+        gdn, {&raw_qkv_tensor, &a, &b, &z, &device_a_log,
+              &device_dt_bias, &norm, &state, &conv_weight, &conv_state},
+        &output, nullptr);
+    backend.end_graph();
+    std::vector<float> actual_convolution_state;
+    return !backend.dispatch_failed() &&
+        download(backend, output, actual_output) &&
+        download(backend, state, actual_state) &&
+        download(backend, conv_state, actual_convolution_state) &&
+        close_enough(actual_output, expected_conv_output, 3e-4f) &&
+        close_enough(actual_state, expected_state, 3e-4f) &&
+        close_enough(
+            actual_convolution_state, expected_convolution_state, 1e-6f);
+}
+
 bool test_decode_add_rms_norm(CudaBackend& backend) {
     backend.clear_dispatch_error();
     constexpr int width = 1024;
@@ -1569,6 +1926,8 @@ int main() {
         !test_wide_cached_sdpa(backend, Precision::FP16, 0, 4) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 257, 8) ||
         !test_wide_cached_sdpa(backend, Precision::FP16, 3, 5, true) ||
+        !test_shortconv(backend) ||
+        !test_gdn(backend) ||
         !test_decode_add_rms_norm(backend) ||
         !test_lm_head_argmax(backend))
         return 1;
