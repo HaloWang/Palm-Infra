@@ -7171,7 +7171,7 @@ kernel void gdn_decode_f32(
     }
     float attn = (attn_decay + delta * qk) * p.scale;
 
-    // RMSNormGated: rms over v_dim (reduction), then *norm_w * silu(z).
+    // RMSNormGated: rms over v_dim, then model-selected output gate.
     float attn_sq = simd_sum(attn * attn);
     if (lane == 0) red[sg] = attn_sq;
     threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -7179,8 +7179,9 @@ kernel void gdn_decode_f32(
     float rms = 1.0f / sqrt(attn_total / (float)V + p.rms_eps);
     float normed = attn * rms * NORMW[p.norm_offset + dv];
     float z = Z[p.z_offset + (uint)((int)vh * V) + dv];
-    float silu_z = z / (1.0f + exp(-z));
-    O[p.out_offset + (uint)((int)vh * V) + dv] = normed * silu_z;
+    float sigmoid_z = 1.0f / (1.0f + exp(-z));
+    float gate = p.output_gate_type == 1 ? sigmoid_z : z * sigmoid_z;
+    O[p.out_offset + (uint)((int)vh * V) + dv] = normed * gate;
 }
 
 // ---------------------------------------------------------------------------
@@ -7296,8 +7297,9 @@ kernel void gdn_prefill_f32(
         float z =
             Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
               (uint)((int)vh*V) + dv];
-        float silu_z = z/(1.0f+exp(-z));
-        O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = normed * silu_z;
+        float sigmoid_z = 1.0f/(1.0f+exp(-z));
+        float gate = p.output_gate_type == 1 ? sigmoid_z : z * sigmoid_z;
+        O[p.out_offset + (uint)(t*zdim) + (uint)((int)vh*V) + dv] = normed * gate;
         threadgroup_barrier(mem_flags::mem_threadgroup);  // state consistent before next t
     }
 }
@@ -7455,10 +7457,12 @@ kernel void gdn_prefill_kparallel_f32(
             const float z =
                 Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
                   (uint)((int)vh*V + dv)];
-            const float silu_z = z / (1.0f + exp(-z));
+            const float sigmoid_z = 1.0f / (1.0f + exp(-z));
+            const float gate = p.output_gate_type == 1
+                ? sigmoid_z : z * sigmoid_z;
             O[p.out_offset + (uint)(t*zdim) +
               (uint)((int)vh*V + dv)] =
-                attn_s[dv] * rms * NORMW[p.norm_offset + dv] * silu_z;
+                attn_s[dv] * rms * NORMW[p.norm_offset + dv] * gate;
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
@@ -7645,10 +7649,12 @@ kernel void gdn_post_f32(
         const float z =
             Z[p.z_offset + (uint)t*(uint)p.z_row_stride +
               (uint)(vh*V) + tid];
-        const float silu_z = z/(1.0f + exp(-z));
+        const float sigmoid_z = 1.0f/(1.0f + exp(-z));
+        const float gate = p.output_gate_type == 1
+            ? sigmoid_z : z * sigmoid_z;
         O[p.out_offset + (uint)base + tid] =
             RAW[base + tid] * rms *
-            NORMW[p.norm_offset + tid] * silu_z;
+            NORMW[p.norm_offset + tid] * gate;
     }
 }
 

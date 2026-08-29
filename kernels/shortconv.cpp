@@ -30,18 +30,29 @@ void kernel_shortconv(const OpParams& params,
     // staging buffer. Qwen3.5 uses a fixed four-element convolution.
     if (seq_len == 1 && kernel_size == 4) {
         constexpr int prefix_len = 3;
-        for (int group = 0; group < groups; ++group) {
-            float* state = state_data + group * prefix_len;
-            const float value = x_data[group];
-            const float* weights = weight_data + group * kernel_size;
-            const float sum = state[0] * weights[0] + state[1] * weights[1] +
-                              state[2] * weights[2] + value * weights[3];
-            const float sigmoid = 1.f / (1.f + std::exp(-sum));
-            output_data[group] = sum * sigmoid;
+        auto process_decode = [&](int, int begin, int end) {
+            for (int group = begin; group < end; ++group) {
+                float* state = state_data + group * prefix_len;
+                const float value = x_data[group];
+                const float* weights = weight_data + group * kernel_size;
+                const float sum =
+                    state[0] * weights[0] + state[1] * weights[1] +
+                    state[2] * weights[2] + value * weights[3];
+                const float sigmoid = 1.f / (1.f + std::exp(-sum));
+                output_data[group] = sum * sigmoid;
 
-            state[0] = state[1];
-            state[1] = state[2];
-            state[2] = value;
+                state[0] = state[1];
+                state[1] = state[2];
+                state[2] = value;
+            }
+        };
+        if (thread_pool && thread_pool->num_threads() > 1 && groups >= 1024) {
+            const int chunk =
+                (groups + thread_pool->num_threads() - 1) /
+                thread_pool->num_threads();
+            thread_pool->parallel_for(0, groups, chunk, process_decode);
+        } else {
+            process_decode(0, 0, groups);
         }
         return;
     }

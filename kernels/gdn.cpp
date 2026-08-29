@@ -31,7 +31,7 @@
 //   i32[1] = k_head_dim
 //   i32[2] = v_head_dim
 //   i32[3] = seq_len           (prefill: N, decode: 1)
-//   i32[4] = use_qk_l2norm     (1 for Qwen3.5)
+//   i32[4] = flags             (bit 0: q/k L2 norm; bit 1: sigmoid output gate)
 //   i32[5] = conv_kernel       (informational, unused)
 //
 //   f32[0] = rms_eps           (1e-6)
@@ -69,7 +69,7 @@ static void fused_gdn_head(
     int num_heads, int k_dim, int v_dim, int num_v_heads, int seq_len,
     int data_seq_len, int a_row_stride, int b_row_stride, int z_row_stride,
     bool use_l2norm, float rms_eps, float l2norm_eps, float scale,
-    int vh_begin, int vh_end)
+    bool sigmoid_output_gate, int vh_begin, int vh_end)
 {
     int qkv_dim   = num_heads * k_dim;       // key_dim (q/k are key_heads * k_dim)
     int z_dim     = num_v_heads * v_dim;
@@ -147,7 +147,7 @@ static void fused_gdn_head(
                 attn_out[dv] = s * scale;
             }
 
-            // 6. RMSNormGated: out = rms_norm(attn_out, norm_w) * silu(z)
+            // 6. RMSNormGated with model-selected output gate.
             // Output layout: [z_dim, seq] row-major. Matmul reads lda = stride[1]/es = z_dim.
             // out[global_dim + t * z_dim] matches matmul's A[m*z_dim + k] for out_proj.
             const float* z_row = z + t * z_row_stride + vh * v_dim;
@@ -156,9 +156,11 @@ static void fused_gdn_head(
             float rms = 1.f / std::sqrt(sum_sq / (float)v_dim + rms_eps);
             for (int d = 0; d < v_dim; d++) {
                 float normed = attn_out[d] * rms * norm_w[d];
-                float silu_z = z_row[d] * sigmoidf(z_row[d]);
+                float sigmoid_z = sigmoidf(z_row[d]);
+                float gate = sigmoid_output_gate ? sigmoid_z
+                                                 : z_row[d] * sigmoid_z;
                 int global_dim = vh * v_dim + d;
-                out[global_dim + t * z_dim] = normed * silu_z;
+                out[global_dim + t * z_dim] = normed * gate;
             }
         }
     }
@@ -193,10 +195,12 @@ void kernel_gdn_prefill(const OpParams& params,
     int k_head_dim  = graph_params::get_i32(params, 1, 128);
     int v_head_dim  = graph_params::get_i32(params, 2, 128);
     int seq_len     = graph_params::get_i32(params, 3, 4);
-    bool use_l2norm = graph_params::get_i32(params, 4, 1) != 0;
+    int flags       = graph_params::get_i32(params, 4, 1);
+    bool use_l2norm = (flags & 1) != 0;
     // params.i32[5] = conv_kernel (unused)
     int n_real      = graph_params::get_i32(params, 6, seq_len);
     int num_v_heads = graph_params::get_i32(params, 7, num_heads);
+    bool sigmoid_output_gate = (flags & 2) != 0;
     float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
     float l2norm_eps= graph_params::get_f32(params, 1, 1e-6f);
     float scale     = graph_params::get_f32(params, 2, 0.f);
@@ -239,7 +243,7 @@ void kernel_gdn_prefill(const OpParams& params,
                        process_len, seq_len,
                        a_row_stride, b_row_stride, z_row_stride,
                        use_l2norm, rms_eps, l2norm_eps, scale,
-                       vh_begin, vh_end);
+                       sigmoid_output_gate, vh_begin, vh_end);
     };
     if (thread_pool && num_v_heads >= 2) {
         thread_pool->parallel_for(0, num_v_heads, 1, process_heads);

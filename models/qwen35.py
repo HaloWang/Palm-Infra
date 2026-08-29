@@ -574,7 +574,8 @@ def _build_layer(g, x, x_normed, post_norm_weight, next_norm_weight,
 def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
                               gs_in, gc_in, eps, seq_len,
                               num_heads, k_dim, v_dim, num_v_heads,
-                              conv_kernel, hidden_size, is_prefill=False):
+                              conv_kernel, hidden_size, is_prefill=False,
+                              output_gate_type="silu"):
     """Build a linear attention (Gated Delta Rule) layer.
 
     Uses the fused `gated_deltanet` op for the GDN core + RMSNormGated.
@@ -624,14 +625,16 @@ def _build_linear_attn_layer(g, x, layer_idx, weights_dir,
             A_log, dt_bias, w_norm, gs_in,
             num_heads=num_heads, k_dim=k_dim, v_dim=v_dim, seq_len=seq_len,
             use_qk_l2norm=True, rms_eps=eps,
-            num_v_heads=num_v_heads)
+            num_v_heads=num_v_heads,
+            output_gate_type=output_gate_type)
     else:
         gated = g.gated_deltanet_conv_decode(
             qkv, a_out, b_out, z_out,
             A_log, dt_bias, w_norm, gs_in, w_conv, gc_in,
             num_heads=num_heads, k_dim=k_dim, v_dim=v_dim,
             num_v_heads=num_v_heads, conv_kernel=conv_kernel,
-            use_qk_l2norm=True, rms_eps=eps)
+            use_qk_l2norm=True, rms_eps=eps,
+            output_gate_type=output_gate_type)
 
     # ---- out_proj ----
     w_out = g.weight(os.path.join(weights_dir, f"{pfx}_out_proj_weight.weights"),

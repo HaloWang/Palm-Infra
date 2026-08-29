@@ -3,11 +3,13 @@
 #include "kernels/deepseek_v4_attention.h"
 #include "kernels/elementwise.h"
 #include "kernels/gdn.h"
+#include "kernels/gated_residual.h"
 #include "kernels/hyper_connection.h"
 #include "kernels/layout.h"
 #include "kernels/matmul.h"
 #include "kernels/moe.h"
 #include "kernels/norm.h"
+#include "kernels/ple.h"
 #include "kernels/rope.h"
 #include "kernels/rwkv.h"
 #include "kernels/shortconv.h"
@@ -138,6 +140,17 @@ void CPUBackend::dispatch(const GraphNode& node,
             run(*inputs[1], *inputs[3], key_heads, key_out);
         }
         break;
+    case OpType::GROUP_RMS_NORM:
+        if (has_inputs(2) && output) {
+            if (!kernel_group_rms_norm(
+                    *inputs[0], *inputs[1], *output,
+                    graph_params::get_i32(params, 0, 0),
+                    graph_params::get_f32(params, 0, 1e-6f), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
 
     case OpType::SDPA:
     case OpType::SDPA_MLA: {
@@ -237,6 +250,77 @@ void CPUBackend::dispatch(const GraphNode& node,
                 graph_params::get_i32(params, 1, 4),
                 graph_params::get_f32(params, 0, 1e-6f),
                 graph_params::get_f32(params, 1, 1e-6f), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::GR_REDUCE:
+        if (has_inputs(2) && output) {
+            if (!kernel_gr_reduce(
+                    *inputs[0], *inputs[1], *output,
+                    graph_params::get_i32(params, 0, 0),
+                    graph_params::get_i32(params, 1, 4), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::GR_INJECT:
+        if (has_inputs(3) && output) {
+            if (!kernel_gr_inject(
+                    *inputs[0], *inputs[1], *inputs[2], *output,
+                    graph_params::get_i32(params, 0, 0),
+                    graph_params::get_i32(params, 1, 4), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::PLE_LOOKUP:
+        if (has_inputs(6) && output) {
+            const uint64_t seed =
+                static_cast<uint32_t>(graph_params::get_i32(params, 5, 1234)) |
+                (static_cast<uint64_t>(static_cast<uint32_t>(
+                    graph_params::get_i32(params, 6, 0))) << 32);
+            if (!kernel_ple_lookup(
+                    *inputs[0], const_cast<Tensor&>(*inputs[1]),
+                    *inputs[2], *inputs[3], *inputs[4], *inputs[5], *output,
+                    graph_params::get_i32(params, 0, 3),
+                    graph_params::get_i32(params, 1, 8),
+                    graph_params::get_i32(params, 2, 0),
+                    graph_params::get_i32(params, 3, 0),
+                    graph_params::get_i32(params, 4, 0), seed,
+                    graph_params::get_i32(
+                        params, 7,
+                        static_cast<int>(inputs[0]->nelements())),
+                    thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::PLE_GATE:
+        if (has_inputs(3) && output) {
+            if (!kernel_ple_gate(
+                    *inputs[0], *inputs[1], *inputs[2], *output,
+                    graph_params::get_i32(params, 0, 0),
+                    graph_params::get_i32(params, 1, 4), thread_pool))
+                reject();
+        } else {
+            reject();
+        }
+        break;
+    case OpType::PLE_DILATED_CONV:
+        if (has_inputs(3) && output) {
+            if (!kernel_ple_dilated_conv(
+                    *inputs[0], *inputs[1],
+                    const_cast<Tensor&>(*inputs[2]), *output,
+                    graph_params::get_i32(params, 0, 4),
+                    graph_params::get_i32(params, 1, 3),
+                    graph_params::get_i32(
+                        params, 2, static_cast<int>(inputs[0]->shape[1])),
+                    thread_pool))
                 reject();
         } else {
             reject();

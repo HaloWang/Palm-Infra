@@ -640,6 +640,9 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
 
                 const bool lookup_table =
                     wref.find("embed_tokens") != std::string::npos ||
+                    wref.find(
+                        "ple_embedding_ngram_embedding_weight") !=
+                        std::string::npos ||
                     wref.find("vision_pos_embed.weights") !=
                         std::string::npos;
                 // Resident accelerators consume package-native weights or
@@ -667,6 +670,15 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                     (t.prec == Precision::FP16 && t.is_interleaved &&
                      t.data != data);
                 if (complete_cpu_sidecar) {
+                    mmap_weight_exclusion_ranges_.push_back(
+                        {pit->second.first, pit->second.second});
+                }
+                // PLE is a 47+ GiB random-access embedding table. Keep its
+                // package mapping available for lookup, but do not fault and
+                // mlock every page during dense-weight warmup.
+                if (wref.find(
+                        "ple_embedding_ngram_embedding_weight") !=
+                    std::string::npos) {
                     mmap_weight_exclusion_ranges_.push_back(
                         {pit->second.first, pit->second.second});
                 }

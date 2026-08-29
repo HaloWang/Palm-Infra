@@ -537,40 +537,51 @@ int main() {
         fill_rand(qkv.data(), qkv.size()); fill_rand(a.data(), H); fill_rand(b.data(), H);
         fill_rand(z.data(), zdim); fill_rand(alg.data(), VH); fill_rand(dtb.data(), VH);
         fill_rand(nrm.data(), Vd); fill_rand(st.data(), st.size());
-        memcpy(QKV.data,qkv.data(),qkv.size()*4); memcpy(A.data,a.data(),H*4); memcpy(B.data,b.data(),H*4);
-        memcpy(Z.data,z.data(),zdim*4); memcpy(ALG.data,alg.data(),VH*4); memcpy(DTB.data,dtb.data(),VH*4);
-        memcpy(NRM.data,nrm.data(),Vd*4); memcpy(ST.data,st.data(),st.size()*4);
-        std::vector<int> i32 = {H, K, Vd, 1, 1, 4, 0, VH};
-        std::vector<float> f32 = {rmseps, l2eps, scale};
-        std::vector<const Tensor*> ins = {&QKV,&A,&B,&Z,&ALG,&DTB,&NRM,&ST};
-        metal_op(mb, OpType::GATED_DELTANET_DECODE, ins, O, i32, f32);
+        for (bool sigmoid_gate : {false, true}) {
+            memcpy(QKV.data,qkv.data(),qkv.size()*4); memcpy(A.data,a.data(),H*4); memcpy(B.data,b.data(),H*4);
+            memcpy(Z.data,z.data(),zdim*4); memcpy(ALG.data,alg.data(),VH*4); memcpy(DTB.data,dtb.data(),VH*4);
+            memcpy(NRM.data,nrm.data(),Vd*4); memcpy(ST.data,st.data(),st.size()*4);
+            std::vector<int> i32 = {H, K, Vd, 1,
+                                    1 | (sigmoid_gate ? 2 : 0), 4, 0, VH};
+            std::vector<float> f32 = {rmseps, l2eps, scale};
+            std::vector<const Tensor*> ins = {&QKV,&A,&B,&Z,&ALG,&DTB,&NRM,&ST};
+            metal_op(mb, OpType::GATED_DELTANET_DECODE, ins, O, i32, f32);
 
-        // reference
-        std::vector<float> ref(zdim), rst = st;
-        auto silu=[](float x){return x/(1.f+std::exp(-x));};
-        for (int vh=0; vh<VH; vh++){
-            int kh = vh; // repeat=1
-            std::vector<float> q(K), kk(K), v(Vd);
-            for(int d=0;d<K;d++){ q[d]=qkv[kh*K+d]; kk[d]=qkv[qkv_dim+kh*K+d]; }
-            for(int d=0;d<Vd;d++) v[d]=qkv[2*qkv_dim+vh*Vd+d];
-            double qs=0,ks=0; for(int d=0;d<K;d++){qs+=(double)q[d]*q[d];ks+=(double)kk[d]*kk[d];}
-            float qi=1.f/std::sqrt((float)qs+l2eps), ki=1.f/std::sqrt((float)ks+l2eps);
-            for(int d=0;d<K;d++){q[d]*=qi;kk[d]*=ki;}
-            float sp = (a[vh]+dtb[vh]>20.f)?(a[vh]+dtb[vh]):((a[vh]+dtb[vh]<-20.f)?std::exp(a[vh]+dtb[vh]):std::log1p(std::exp(a[vh]+dtb[vh])));
-            float gexp=std::exp(-std::exp(alg[vh])*sp), beta=1.f/(1.f+std::exp(-b[vh]));
-            float* S = rst.data()+(size_t)vh*K*Vd;
-            std::vector<float> kv(Vd,0);
-            for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]*=gexp; kv[dvv]+=S[dk*Vd+dvv]*kk[dk]; }
-            std::vector<float> delta(Vd); for(int dvv=0;dvv<Vd;dvv++) delta[dvv]=(v[dvv]-kv[dvv])*beta;
-            std::vector<float> attn(Vd,0);
-            for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]+=kk[dk]*delta[dvv]; attn[dvv]+=S[dk*Vd+dvv]*q[dk]; }
-            double ss=0; for(int dvv=0;dvv<Vd;dvv++){attn[dvv]*=scale; ss+=(double)attn[dvv]*attn[dvv];}
-            float rms=1.f/std::sqrt((float)(ss/Vd)+rmseps);
-            for(int dvv=0;dvv<Vd;dvv++) ref[vh*Vd+dvv]=attn[dvv]*rms*nrm[dvv]*silu(z[vh*Vd+dvv]);
+            // reference
+            std::vector<float> ref(zdim), rst = st;
+            auto sigmoid=[](float x){return 1.f/(1.f+std::exp(-x));};
+            for (int vh=0; vh<VH; vh++){
+                int kh = vh; // repeat=1
+                std::vector<float> q(K), kk(K), v(Vd);
+                for(int d=0;d<K;d++){ q[d]=qkv[kh*K+d]; kk[d]=qkv[qkv_dim+kh*K+d]; }
+                for(int d=0;d<Vd;d++) v[d]=qkv[2*qkv_dim+vh*Vd+d];
+                double qs=0,ks=0; for(int d=0;d<K;d++){qs+=(double)q[d]*q[d];ks+=(double)kk[d]*kk[d];}
+                float qi=1.f/std::sqrt((float)qs+l2eps), ki=1.f/std::sqrt((float)ks+l2eps);
+                for(int d=0;d<K;d++){q[d]*=qi;kk[d]*=ki;}
+                float sp = (a[vh]+dtb[vh]>20.f)?(a[vh]+dtb[vh]):((a[vh]+dtb[vh]<-20.f)?std::exp(a[vh]+dtb[vh]):std::log1p(std::exp(a[vh]+dtb[vh])));
+                float gexp=std::exp(-std::exp(alg[vh])*sp), beta=1.f/(1.f+std::exp(-b[vh]));
+                float* S = rst.data()+(size_t)vh*K*Vd;
+                std::vector<float> kv(Vd,0);
+                for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]*=gexp; kv[dvv]+=S[dk*Vd+dvv]*kk[dk]; }
+                std::vector<float> delta(Vd); for(int dvv=0;dvv<Vd;dvv++) delta[dvv]=(v[dvv]-kv[dvv])*beta;
+                std::vector<float> attn(Vd,0);
+                for(int dk=0;dk<K;dk++)for(int dvv=0;dvv<Vd;dvv++){ S[dk*Vd+dvv]+=kk[dk]*delta[dvv]; attn[dvv]+=S[dk*Vd+dvv]*q[dk]; }
+                double ss=0; for(int dvv=0;dvv<Vd;dvv++){attn[dvv]*=scale; ss+=(double)attn[dvv]*attn[dvv];}
+                float rms=1.f/std::sqrt((float)(ss/Vd)+rmseps);
+                for(int dvv=0;dvv<Vd;dvv++) {
+                    const float gate = sigmoid(z[vh*Vd+dvv]);
+                    const float gated = sigmoid_gate
+                        ? gate : z[vh*Vd+dvv] * gate;
+                    ref[vh*Vd+dvv] =
+                        attn[dvv] * rms * nrm[dvv] * gated;
+                }
+            }
+            bool ok_out = close((const float*)O.data, ref.data(), zdim, 3e-3f, 3e-3f);
+            bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 3e-3f, 3e-3f);
+            CHECK(ok_out && ok_st,
+                  sigmoid_gate ? "GDN_DECODE sigmoid gate H=4 K=128 V=128"
+                               : "GDN_DECODE SiLU gate H=4 K=128 V=128");
         }
-        bool ok_out = close((const float*)O.data, ref.data(), zdim, 3e-3f, 3e-3f);
-        bool ok_st  = close((const float*)ST.data, rst.data(), (int)st.size(), 3e-3f, 3e-3f);
-        CHECK(ok_out && ok_st, "GDN_DECODE H=4 K=128 V=128");
     }
 
     // ---- Decode ShortConv + GDN fusion: compare against the two-op path ----

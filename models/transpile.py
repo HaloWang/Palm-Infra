@@ -51,6 +51,7 @@ class OpType(IntEnum):
     ADD_RMS_NORM   = 22
     RMS_NORM_ROPE  = 23
     QK_RMS_NORM_ROPE = 24
+    GROUP_RMS_NORM = 25
     SILU           = 30
     GELU           = 31
     TANH           = 32
@@ -82,6 +83,11 @@ class OpType(IntEnum):
     HC_PRE         = 130
     HC_POST        = 131
     HC_HEAD        = 132
+    GR_REDUCE      = 133
+    GR_INJECT      = 134
+    PLE_LOOKUP     = 135
+    PLE_GATE       = 136
+    PLE_DILATED_CONV = 137
     DSV4_COMPRESSOR = 160
     DSV4_INDEXER = 161
     DSV4_SPARSE_ATTN = 162
@@ -101,6 +107,10 @@ class Precision(IntEnum):
     FP8_E4M3 = 4
     MXFP4 = 5
     INT32 = 6
+    RAW_U8 = 7
+    # NVIDIA NVFP4: packed E2M1, one E4M3 block scale per 16 values, and a
+    # per-matrix FP32 global scale. Currently used by SSD-backed MoE experts.
+    NVFP4 = 8
 
 
 # ---------------------------------------------------------------------------
@@ -279,7 +289,8 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
     if op == OpType.CONSTANT:
         return _CONST4
 
-    if op in (OpType.RMS_NORM, OpType.LAYER_NORM, OpType.ADD_RMS_NORM,
+    if op in (OpType.RMS_NORM, OpType.GROUP_RMS_NORM,
+              OpType.LAYER_NORM, OpType.ADD_RMS_NORM,
               OpType.SILU, OpType.GELU, OpType.TANH, OpType.SIGMOID, OpType.SIGMOID_EXACT,
               OpType.EXP, OpType.EXP_EXACT, OpType.SOFTPLUS,
               OpType.SWIGLU,
@@ -290,8 +301,14 @@ def _propagate_op(node: _Node, nodes: list) -> tuple:
               OpType.RWKV7, OpType.RWKV_TOKEN_SHIFT, OpType.RWKV_MIX,
               OpType.RWKV_L2_NORM, OpType.RWKV_POST,
               OpType.MOE,
-              OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD):
+              OpType.HC_PRE, OpType.HC_POST, OpType.HC_HEAD,
+              OpType.GR_REDUCE, OpType.GR_INJECT,
+              OpType.PLE_GATE, OpType.PLE_DILATED_CONV):
         return inp(0).dim_expr if n_in >= 1 else _CONST4
+
+    if op == OpType.PLE_LOOKUP:
+        token_ids = inp(0).dim_expr if n_in >= 1 else _CONST4
+        return (_CONST, token_ids[0], _CONST, _CONST)
 
     if op in (OpType.RMS_NORM_ROPE, OpType.QK_RMS_NORM_ROPE):
         return node.dim_expr
@@ -523,6 +540,18 @@ class GraphBuilder:
         sx = self._nodes[x].out_shape
         return self._add(OpType.RMS_NORM, [x, weight], sx,
                          prec=self._nodes[x].out_prec, f32=[eps])
+
+    def group_rms_norm(self, x: int, weight: int, group_size: int,
+                       eps: float = 1e-6) -> int:
+        """RMSNorm consecutive groups while retaining per-element gamma."""
+        sx = self._nodes[x].out_shape
+        if group_size <= 0 or sx[0] % group_size != 0:
+            raise ValueError(
+                f"invalid grouped RMSNorm shape {sx} / group {group_size}")
+        return self._add(
+            OpType.GROUP_RMS_NORM, [x, weight], sx,
+            prec=self._nodes[x].out_prec,
+            i32=[group_size], f32=[eps])
 
     def add_rms_norm(self, residual: int, update: int, weight: int,
                      eps: float = 1e-6) -> int:
@@ -926,7 +955,8 @@ class GraphBuilder:
                        A_log: int, dt_bias: int, norm_weight: int, gdn_state: int,
                        num_heads: int, k_dim: int, v_dim: int, seq_len: int,
                        use_qk_l2norm: bool = True, rms_eps: float = 1e-6,
-                       num_v_heads: int = 0) -> int:
+                       num_v_heads: int = 0,
+                       output_gate_type: str = "silu") -> int:
         """Fused Gated Delta Rule linear-attention core for Qwen3.5.
 
         Replaces: split qkv, g/beta compute, GDN recurrence, RMSNormGated.
@@ -957,6 +987,8 @@ class GraphBuilder:
         """
         if num_v_heads <= 0:
             num_v_heads = num_heads
+        if output_gate_type not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported GDN output gate: {output_gate_type}")
         op = (OpType.GATED_DELTANET_DECODE if seq_len == 1
               else OpType.GATED_DELTANET_PREFILL)
         scale = float(k_dim ** -0.5)
@@ -966,7 +998,9 @@ class GraphBuilder:
                          (num_v_heads * v_dim, seq_len),
                          prec=Precision.FP32,
                          i32=[num_heads, k_dim, v_dim, seq_len,
-                              1 if use_qk_l2norm else 0, 4, 0, num_v_heads],
+                              (1 if use_qk_l2norm else 0) |
+                              (2 if output_gate_type == "sigmoid" else 0),
+                              4, 0, num_v_heads],
                          f32=[rms_eps, 1e-6, scale])
 
     def gated_deltanet_conv_decode(
@@ -975,10 +1009,13 @@ class GraphBuilder:
             conv_weight: int, conv_state: int,
             num_heads: int, k_dim: int, v_dim: int,
             num_v_heads: int = 0, conv_kernel: int = 4,
-            use_qk_l2norm: bool = True, rms_eps: float = 1e-6) -> int:
+            use_qk_l2norm: bool = True, rms_eps: float = 1e-6,
+            output_gate_type: str = "silu") -> int:
         """Decode-only ShortConv + Gated DeltaNet + RMSNormGated fusion."""
         if num_v_heads <= 0:
             num_v_heads = num_heads
+        if output_gate_type not in ("silu", "sigmoid"):
+            raise ValueError(f"unsupported GDN output gate: {output_gate_type}")
         scale = float(k_dim ** -0.5)
         return self._add(
             OpType.GATED_DELTANET_CONV_DECODE,
@@ -987,7 +1024,9 @@ class GraphBuilder:
             (num_v_heads * v_dim, 1),
             prec=Precision.FP32,
             i32=[num_heads, k_dim, v_dim, 1,
-                 1 if use_qk_l2norm else 0, conv_kernel, 0, num_v_heads],
+                 (1 if use_qk_l2norm else 0) |
+                 (2 if output_gate_type == "sigmoid" else 0),
+                 conv_kernel, 0, num_v_heads],
             f32=[rms_eps, 1e-6, scale])
 
     def moe(self, hidden: int, router: int,
@@ -1079,6 +1118,85 @@ class GraphBuilder:
             OpType.HC_HEAD, [x, fn, scale, base],
             (hidden_size, sx[1]), prec=Precision.FP32,
             i32=[hidden_size, hc_mult], f32=[norm_eps, hc_eps])
+
+    def gr_reduce(self, normalized: int, gates: int,
+                  hidden_size: int, hc_count: int = 4) -> int:
+        """Qwen Gated Residual read: mean(gate * stream) over streams."""
+        sx = self._nodes[normalized].out_shape
+        sg = self._nodes[gates].out_shape
+        if sx != sg or sx[0] != hidden_size * hc_count:
+            raise ValueError(
+                f"invalid GR reduce shapes {sx}, {sg} for "
+                f"hidden={hidden_size}, streams={hc_count}")
+        return self._add(
+            OpType.GR_REDUCE, [normalized, gates],
+            (hidden_size, sx[1]), prec=self._nodes[normalized].out_prec,
+            i32=[hidden_size, hc_count])
+
+    def gr_inject(self, branch: int, residual: int, gates: int,
+                  hidden_size: int, hc_count: int = 4) -> int:
+        """Qwen Gated Residual write: residual_h + gate_h * branch."""
+        sb = self._nodes[branch].out_shape
+        sr = self._nodes[residual].out_shape
+        sg = self._nodes[gates].out_shape
+        if (sb[0] != hidden_size or sr[0] != hidden_size * hc_count or
+                sg[0] != hc_count or sb[1] != sr[1] or sg[1] != sr[1]):
+            raise ValueError(
+                f"invalid GR inject shapes branch={sb}, residual={sr}, "
+                f"gates={sg}")
+        return self._add(
+            OpType.GR_INJECT, [branch, residual, gates], sr,
+            prec=self._nodes[residual].out_prec,
+            i32=[hidden_size, hc_count])
+
+    def ple_lookup(self, token_ids: int, history: int, table: int,
+                   table_scale: int, head_vocab_sizes: int,
+                   head_offsets: int, embedding_dim: int,
+                   ngram_size: int, heads_per_ngram: int,
+                   eos_token_id: int, unigram_vocab_size: int,
+                   ple_layer_index: int = 0, seed: int = 1234) -> int:
+        """Hash token n-grams and gather their raw FP8 embedding rows."""
+        num_heads = (ngram_size - 1) * heads_per_ngram
+        if num_heads <= 0 or embedding_dim % num_heads != 0:
+            raise ValueError("PLE embedding dim must divide n-gram heads")
+        seq_len = self._nodes[token_ids].out_shape[0]
+        nid = self._add(
+            OpType.PLE_LOOKUP,
+            [token_ids, history, table, table_scale,
+             head_vocab_sizes, head_offsets],
+            (embedding_dim, seq_len), prec=Precision.FP32,
+            i32=[ngram_size, heads_per_ngram, eos_token_id,
+                 unigram_vocab_size, ple_layer_index,
+                 int(seed & 0xffffffff), int((seed >> 32) & 0xffffffff),
+                 seq_len])
+        if self._nodes[token_ids].dim_expr[0].kind == DimKind.SEQ:
+            self._nodes[nid].dim_expr = (
+                DimExpr.const(), DimExpr.seq(),
+                DimExpr.const(), DimExpr.const())
+        return nid
+
+    def ple_gate(self, query: int, key: int, value: int,
+                 hidden_size: int, hc_count: int = 4) -> int:
+        """Gate one PLE value into each residual stream."""
+        sq, sk, sv = (self._nodes[node].out_shape
+                      for node in (query, key, value))
+        if (sq != sk or sq[0] != hidden_size * hc_count or
+                sv[0] != hidden_size or sv[1] != sq[1]):
+            raise ValueError(
+                f"invalid PLE gate shapes query={sq}, key={sk}, value={sv}")
+        return self._add(
+            OpType.PLE_GATE, [query, key, value], sq,
+            prec=self._nodes[query].out_prec,
+            i32=[hidden_size, hc_count])
+
+    def ple_dilated_conv(self, x: int, weight: int, state: int,
+                         kernel_size: int, dilation: int) -> int:
+        """Depthwise causal SiLU convolution used after PLE gating."""
+        sx = self._nodes[x].out_shape
+        return self._add(
+            OpType.PLE_DILATED_CONV, [x, weight, state], sx,
+            prec=self._nodes[x].out_prec,
+            i32=[kernel_size, dilation, sx[1]])
 
     def dsv4_compressor(
             self, hidden: int, wkv: int, wgate: int, ape: int,

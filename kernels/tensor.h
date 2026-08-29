@@ -24,6 +24,11 @@ enum class Precision : uint8_t {
     MXFP4 = 5,
     // Integer graph metadata such as token-to-expert routing tables.
     INT32 = 6,
+    // Unscaled byte data consumed by model-specific lookup kernels.
+    RAW_U8 = 7,
+    // NVIDIA NVFP4: packed E2M1 values, E4M3 block-16 scales and one FP32
+    // global scale per matrix. Routed experts currently use it from SSD.
+    NVFP4 = 8,
 };
 
 enum class MemoryType : uint8_t {
@@ -72,6 +77,8 @@ struct Tensor {
     // Raw E8M0 block scales for FP8_E4M3 and MXFP4. E8M0 is a power-of-two
     // scale encoding, so preserving it avoids expanding the 284B checkpoint.
     const uint8_t* e8m0_scales = nullptr;
+    const uint8_t* nvfp4_scales = nullptr;
+    const float* nvfp4_row_scales = nullptr;
     // Optional load-time Q8-dot sidecar for native FP8 weights. It keeps the
     // package bytes in FP8 while avoiding per-token FP8 decode on CPUs without
     // native FP8 arithmetic.
@@ -152,6 +159,8 @@ struct Tensor {
         case Precision::FP8_E4M3: return 1;
         case Precision::MXFP4: return 1; // packed storage byte; logical element is a nibble
         case Precision::INT32: return 4;
+        case Precision::RAW_U8: return 1;
+        case Precision::NVFP4: return 1; // packed storage byte
         }
         return 0;
     }
@@ -359,6 +368,8 @@ inline size_t precision_size(Precision p) {
     case Precision::FP8_E4M3: return 1;
     case Precision::MXFP4: return 1; // packed storage byte
     case Precision::INT32: return 4;
+    case Precision::RAW_U8: return 1;
+    case Precision::NVFP4: return 1; // packed storage byte
     }
     return 0;
 }

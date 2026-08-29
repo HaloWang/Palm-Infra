@@ -187,3 +187,7 @@ void matmul_dispatch_fp8_e4m3(const Tensor& A, const Tensor& B, Tensor& C,
                               ThreadPool* thread_pool, Activation act,
                               int act_n_begin, int act_n_len,
                               MatmulTimer& timer);
+void matmul_dispatch_nvfp4(const Tensor& A, const Tensor& B, Tensor& C,
+                           ThreadPool* thread_pool, Activation act,
+                           int act_n_begin, int act_n_len,
+                           MatmulTimer& timer);

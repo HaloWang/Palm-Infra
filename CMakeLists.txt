@@ -76,6 +76,7 @@ set(SOURCES
     kernels/matmul_w4.cpp
     kernels/matmul_w8.cpp
     kernels/matmul_mxfp4.cpp
+    kernels/matmul_nvfp4.cpp
     ${MOLLM_CPU_PLATFORM_SOURCE}
     kernels/elementwise.cpp
     kernels/layout.cpp
@@ -86,6 +87,8 @@ set(SOURCES
     kernels/gdn.cpp
     kernels/gdn_decode.cpp
     kernels/gdn_prefill.cpp
+    kernels/gated_residual.cpp
+    kernels/ple.cpp
     kernels/deepseek_v4_attention.cpp
     kernels/hyper_connection.cpp
     kernels/moe.cpp
@@ -454,10 +457,13 @@ if(MOLLM_BUILD_TESTS)
     add_mollm_test(test_elementwise   tests/test_elementwise.cpp)
     add_mollm_test(test_layout        tests/test_layout.cpp)
     add_mollm_test(test_matmul        tests/test_matmul.cpp)
+    add_mollm_test(test_nvfp4         tests/test_nvfp4.cpp)
     add_mollm_test(test_moe_routing  tests/test_moe_routing.cpp)
     add_mollm_test(test_moe           tests/test_moe.cpp)
     add_mollm_test(test_moe_ssd       tests/test_moe_ssd.cpp)
     add_mollm_test(test_hyper_connection tests/test_hyper_connection.cpp)
+    add_mollm_test(test_gated_residual tests/test_gated_residual.cpp)
+    add_mollm_test(test_ple            tests/test_ple.cpp)
     add_mollm_test(test_deepseek_v4_attention tests/test_deepseek_v4_attention.cpp)
     add_mollm_test(test_trace         tests/test_trace.cpp)
     add_mollm_test(bench_matmul       tests/bench_matmul.cpp)
@@ -495,6 +501,8 @@ if(MOLLM_BUILD_TESTS)
                               test_qwen3_moe_graph.py)
         add_mollm_python_test(test_qwen35_graph
                               test_qwen35_graph.py)
+        add_mollm_python_test(test_qwen4_exp_graph
+                              test_qwen4_exp_graph.py)
         add_mollm_python_test(test_qwen35_quant_policy
                               test_qwen35_quant_policy.py)
         add_mollm_python_test(test_qwen35_moe_quant_policy

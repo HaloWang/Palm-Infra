@@ -1,5 +1,6 @@
 #include "kernels/gdn.h"
 #include "kernels/rwkv.h"
+#include "kernels/shortconv.h"
 
 #include <algorithm>
 #include <chrono>
@@ -93,9 +94,37 @@ static double bench_gdn(int heads, int d, int seq, ThreadPool& pool) {
         [&]{ std::memcpy(state.data(),initial.data(),state_n*sizeof(float)); });
 }
 
+static double bench_shortconv_decode(int groups, ThreadPool& pool) {
+    constexpr int kernel_size = 4;
+    constexpr int prefix = kernel_size - 1;
+    std::vector<float> x(groups), weight((size_t)groups * kernel_size),
+                       state((size_t)groups * prefix), initial(state.size()),
+                       out(groups);
+    fill(x);
+    fill(weight);
+    fill(initial, 0.01f);
+    Tensor tx = external(Precision::FP32, groups, 1, x.data());
+    Tensor tw = external(
+        Precision::FP32, kernel_size, groups, weight.data());
+    Tensor ts = external(
+        Precision::FP32, prefix, groups, state.data());
+    Tensor to = external(Precision::FP32, groups, 1, out.data());
+    std::vector<const Tensor*> inputs = {&tx, &tw, &ts};
+    OpParams params;
+    params.i32 = {kernel_size, 1};
+    return median_ms(
+        5, 101,
+        [&] { kernel_shortconv(params, inputs, to, &pool); },
+        [&] {
+            std::memcpy(state.data(), initial.data(),
+                        state.size() * sizeof(float));
+        });
+}
+
 int main() {
     constexpr int heads=32, d=64, threads=4;
     ThreadPool pool(threads);
+    ThreadPool single_thread_pool(1);
     std::printf("same-scale recurrent kernels: heads=%d d=%d state=%.2f MiB threads=%d\n",
                 heads,d,(double)heads*d*d*4/(1024.*1024.),threads);
     std::printf("boundary: WKV=recurrence only; GDN=L2+gates+recurrence+RMSNormGated\n");
@@ -105,5 +134,14 @@ int main() {
         std::printf("seq=%-3d WKV %.3f ms (%7.3f us/token)  GDN %.3f ms (%7.3f us/token)  WKV/GDN %.3fx\n",
                     seq,w,w*1000/seq,g,g*1000/seq,w/g);
     }
+    constexpr int conv_groups = 16480;
+    const double conv_single =
+        bench_shortconv_decode(conv_groups, single_thread_pool);
+    const double conv_parallel = bench_shortconv_decode(conv_groups, pool);
+    std::printf(
+        "shortconv decode groups=%d: 1-thread %.3f ms 4-thread %.3f ms "
+        "speedup %.3fx\n",
+        conv_groups, conv_single, conv_parallel,
+        conv_single / conv_parallel);
     return 0;
 }

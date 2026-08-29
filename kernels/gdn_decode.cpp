@@ -15,6 +15,8 @@ void kernel_gdn_decode_neon(const OpParams& params,
     int k_head_dim  = graph_params::get_i32(params, 1, 128);
     int v_head_dim  = graph_params::get_i32(params, 2, 128);
     int num_v_heads = graph_params::get_i32(params, 7, num_heads);
+    int flags       = graph_params::get_i32(params, 4, 1);
+    bool sigmoid_output_gate = (flags & 2) != 0;
     float rms_eps   = graph_params::get_f32(params, 0, 1e-6f);
     float l2_eps    = graph_params::get_f32(params, 1, 1e-6f);
     float scale     = graph_params::get_f32(params, 2, 0.f);
@@ -77,7 +79,8 @@ void kernel_gdn_decode_neon(const OpParams& params,
             gdn_recurrence_neon(q, k_buf, v_buf,
                                 g_t_exp, beta_t, state_h,
                                 norm_data, z_row, out_head,
-                                k_head_dim, v_head_dim, scale, rms_eps);
+                                k_head_dim, v_head_dim, scale, rms_eps,
+                                sigmoid_output_gate);
         }
     };
 

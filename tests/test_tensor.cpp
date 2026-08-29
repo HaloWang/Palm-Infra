@@ -95,6 +95,8 @@ int main() {
     CHECK(precision_size(Precision::MXFP4) == 1,
           "MXFP4 packed storage byte");
     CHECK(precision_size(Precision::INT32) == 4, "INT32 size");
+    CHECK(precision_size(Precision::RAW_U8) == 1, "RAW_U8 size");
+    CHECK(precision_size(Precision::NVFP4) == 1, "NVFP4 packed byte size");
 
     // ---- is_contiguous after permute ----
     CHECK(!p.is_contiguous(), "permuted tensor not contiguous");

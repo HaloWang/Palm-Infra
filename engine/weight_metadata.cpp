@@ -25,6 +25,8 @@ bool configure_weight_metadata(Tensor& tensor,
                                const void* scales, const char* label) {
     tensor.scales = nullptr;
     tensor.e8m0_scales = nullptr;
+    tensor.nvfp4_scales = nullptr;
+    tensor.nvfp4_row_scales = nullptr;
     tensor.fp8_q8_scales = nullptr;
     tensor.group_size = 0;
     tensor.num_groups = 0;
@@ -41,7 +43,7 @@ bool configure_weight_metadata(Tensor& tensor,
     const bool is_quantized =
         tensor.prec == Precision::INT8 || tensor.prec == Precision::INT4 ||
         tensor.prec == Precision::FP8_E4M3 ||
-        tensor.prec == Precision::MXFP4;
+        tensor.prec == Precision::MXFP4 || tensor.prec == Precision::NVFP4;
     if (!is_quantized)
         return true;
 
@@ -82,6 +84,17 @@ bool configure_weight_metadata(Tensor& tensor,
         tensor.groups_per_row = static_cast<uint32_t>(cols / 32);
         tensor.num_groups = header.num_groups;
         return true;
+    }
+
+    // Native NVFP4 routed experts have a per-expert global scale, while a
+    // graph constant describes the aggregate of every expert in a layer.
+    // They must therefore be presented through MoeSsdCache, which constructs
+    // one Tensor per expert and can attach the correct scalar.
+    if (tensor.prec == Precision::NVFP4) {
+        std::fprintf(stderr,
+                     "Engine: NVFP4 weight %s requires SSD expert storage\n",
+                     label);
+        return false;
     }
 
     // DeepSeek-V4 dense FP8 tensors use one E8M0 scale per 128x128 output/K

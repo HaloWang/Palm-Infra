@@ -213,6 +213,8 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
 
     view.scales = nullptr;
     view.e8m0_scales = nullptr;
+    view.nvfp4_scales = nullptr;
+    view.nvfp4_row_scales = nullptr;
     view.num_groups = 0;
     view.is_interleaved = false;
     view.is_q4_repacked = false;
@@ -265,6 +267,23 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
         view.num_groups =
             static_cast<uint32_t>(
                 static_cast<size_t>(rows) * groups_per_row);
+        return true;
+    }
+
+    if (src.prec == Precision::NVFP4) {
+        if (!src.nvfp4_scales || src.group_size != 16 ||
+            groups_per_row <= 0 || (K % 16) != 0) {
+            return false;
+        }
+        view.data = static_cast<char*>(src.data) +
+                    static_cast<size_t>(row0) * (K / 2);
+        view.nvfp4_scales = src.nvfp4_scales +
+            static_cast<size_t>(row0) * groups_per_row;
+        view.nvfp4_row_scales = src.nvfp4_row_scales + row0;
+        view.group_size = 16;
+        view.groups_per_row = static_cast<uint32_t>(groups_per_row);
+        view.num_groups = static_cast<uint32_t>(
+            static_cast<size_t>(rows) * groups_per_row);
         return true;
     }
 
@@ -523,6 +542,8 @@ bool kernel_moe_shared_expert(const Tensor& hidden,
             kernel_matmul_int4_gemv_batch(
                 shared_inputs, shared_weights, shared_outputs, thread_pool) ||
             kernel_matmul_int8_gemv_batch(
+                shared_inputs, shared_weights, shared_outputs, thread_pool) ||
+            kernel_matmul_nvfp4_gemv_batch(
                 shared_inputs, shared_weights, shared_outputs, thread_pool);
     }
     if (!batched_gate_up) {
@@ -603,7 +624,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
     const Tensor& experts_gate_up = *inputs[2];
     const Tensor& experts_down = *inputs[3];
     const bool use_bf16_activations =
-        experts_gate_up.prec == Precision::MXFP4;
+        experts_gate_up.prec == Precision::MXFP4 ||
+        experts_gate_up.prec == Precision::NVFP4;
     const auto* gate_up_source = static_cast<const MoeSsdTensorSource*>(
         experts_gate_up.moe_ssd_source);
     const auto* down_source = static_cast<const MoeSsdTensorSource*>(
@@ -845,6 +867,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (!kernel_matmul_int4_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
                 !kernel_matmul_mxfp4_gemv_batch(
+                    gate_inputs, gate_up_weights, gate_outputs, thread_pool) &&
+                !kernel_matmul_nvfp4_gemv_batch(
                     gate_inputs, gate_up_weights, gate_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(
@@ -905,6 +929,8 @@ bool kernel_qwen3_moe(const std::vector<const Tensor*>& inputs,
             if (!kernel_matmul_int4_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool) &&
                 !kernel_matmul_mxfp4_gemv_batch(
+                    down_inputs, down_weights, down_outputs, thread_pool) &&
+                !kernel_matmul_nvfp4_gemv_batch(
                     down_inputs, down_weights, down_outputs, thread_pool)) {
                 for (size_t i = 0; i < batch; ++i) {
                     kernel_matmul_fp32(

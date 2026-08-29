@@ -20,7 +20,7 @@
 //   beta_t = sigmoid(b_t)
 //   q_t, k_t L2-normalized per (head, token) when use_qk_l2norm=1
 //
-// RMSNormGated: out = rms_norm(core_attn_out, norm_weight) * silu(z)
+// RMSNormGated: out = rms_norm(core_attn_out, norm_weight) * gate(z)
 //
 // ---------------------------------------------------------------------------
 // Input layout contract (CRITICAL):
@@ -50,7 +50,7 @@
 //   i32[1] = k_head_dim
 //   i32[2] = v_head_dim
 //   i32[3] = seq_len           (prefill: N, decode: 1)
-//   i32[4] = use_qk_l2norm     (1 for Qwen3.5)
+//   i32[4] = flags             (bit 0: q/k L2 norm; bit 1: sigmoid output gate)
 //   i32[5] = conv_kernel       (informational, unused — shortconv already done)
 //   i32[6] = n_real_tokens     (runtime-injected by engine, 0 = all)
 //   i32[7] = num_v_heads       (value heads, for z/out dim; defaults to num_heads)

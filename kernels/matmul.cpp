@@ -58,6 +58,11 @@ void kernel_matmul_batch(const std::vector<const Tensor*>& pairs,
         return;
     }
     if (thread_pool && output.shape[1] == 1 &&
+        kernel_matmul_nvfp4_gemv_batch(
+            inputs, weights, outputs, thread_pool)) {
+        return;
+    }
+    if (thread_pool && output.shape[1] == 1 &&
         kernel_matmul_fp32_gemv_batch(
             inputs, weights, outputs, thread_pool)) {
         return;
@@ -88,6 +93,10 @@ void kernel_matmul_fp32(const Tensor& A, const Tensor& B, Tensor& C,
     case Precision::FP8_E4M3:
         matmul_dispatch_fp8_e4m3(A, B, C, thread_pool, act, act_n_begin,
                                  act_n_len, timer);
+        return;
+    case Precision::NVFP4:
+        matmul_dispatch_nvfp4(A, B, C, thread_pool, act, act_n_begin,
+                              act_n_len, timer);
         return;
     default:
         matmul_dispatch_dense(A, B, C, thread_pool, act, act_n_begin, act_n_len,

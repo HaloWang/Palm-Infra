@@ -128,6 +128,10 @@ bool kernel_matmul_mxfp4_gemv_batch(const std::vector<Tensor>& inputs,
                                     const std::vector<Tensor>& weights,
                                     std::vector<Tensor>& outputs,
                                     ThreadPool* thread_pool);
+bool kernel_matmul_nvfp4_gemv_batch(const std::vector<Tensor>& inputs,
+                                    const std::vector<Tensor>& weights,
+                                    std::vector<Tensor>& outputs,
+                                    ThreadPool* thread_pool);
 // Execute several M=1 FP32 GEMVs in one thread-pool dispatch. This preserves
 // each projection's FP32 accumulation order while amortizing worker barriers.
 bool kernel_matmul_fp32_gemv_batch(const std::vector<Tensor>& inputs,

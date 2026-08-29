@@ -499,7 +499,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                         if (layer_index < 0 || num_experts <= 0 ||
                             spec.rows <= 0 || spec.cols <= 0 ||
                             static_cast<uint32_t>(spec.precision) >
-                                static_cast<uint32_t>(Precision::MXFP4) ||
+                                static_cast<uint32_t>(Precision::NVFP4) ||
                             !valid_spans ||
                             weight_offset > ph.w_len ||
                             data_offset > ph.w_len - weight_offset ||

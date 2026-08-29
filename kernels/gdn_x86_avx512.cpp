@@ -56,7 +56,8 @@ void process_heads(
     float* state, float* output, int num_heads, int k_dim, int v_dim,
     int num_v_heads, int seq_len, int data_seq_len, int a_stride,
     int b_stride, int z_stride, bool use_l2norm, float rms_epsilon,
-    float l2_epsilon, float output_scale, int vh_begin, int vh_end) {
+    float l2_epsilon, float output_scale, bool sigmoid_output_gate,
+    int vh_begin, int vh_end) {
     const int qkv_dim = num_heads * k_dim;
     const int z_dim = num_v_heads * v_dim;
     const int state_size = k_dim * v_dim;
@@ -197,7 +198,9 @@ void process_heads(
             for (; d < v_dim; ++d)
                 attention[d] *= rms * output_scale * norm_weight[d];
             for (d = 0; d < v_dim; ++d) {
-                const float gate = z_row[d] * sigmoid(z_row[d]);
+                const float sigmoid_z = sigmoid(z_row[d]);
+                const float gate = sigmoid_output_gate
+                    ? sigmoid_z : z_row[d] * sigmoid_z;
                 output[vh * v_dim + d + token * z_dim] =
                     attention[d] * gate;
             }
@@ -217,10 +220,12 @@ void kernel_gdn_x86_avx512(const OpParams& params,
     const int k_dim = graph_params::get_i32(params, 1, 128);
     const int v_dim = graph_params::get_i32(params, 2, 128);
     const int seq_len = graph_params::get_i32(params, 3, 4);
-    const bool use_l2norm = graph_params::get_i32(params, 4, 1) != 0;
+    const int flags = graph_params::get_i32(params, 4, 1);
+    const bool use_l2norm = (flags & 1) != 0;
     const int n_real = graph_params::get_i32(params, 6, seq_len);
     const int num_v_heads =
         graph_params::get_i32(params, 7, num_heads);
+    const bool sigmoid_output_gate = (flags & 2) != 0;
     const float rms_epsilon =
         graph_params::get_f32(params, 0, 1e-6f);
     const float l2_epsilon =
@@ -254,7 +259,8 @@ void kernel_gdn_x86_avx512(const OpParams& params,
             static_cast<int>(inputs[1]->stride[1] / sizeof(float)),
             static_cast<int>(inputs[2]->stride[1] / sizeof(float)),
             static_cast<int>(inputs[3]->stride[1] / sizeof(float)),
-            use_l2norm, rms_epsilon, l2_epsilon, scale, begin, end);
+            use_l2norm, rms_epsilon, l2_epsilon, scale,
+            sigmoid_output_gate, begin, end);
     };
     if (thread_pool && num_v_heads >= 2)
         thread_pool->parallel_for(0, num_v_heads, 1, run);

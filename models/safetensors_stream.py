@@ -29,6 +29,7 @@ _DTYPE_BYTES = {
     "F32": 4,
     "F8_E4M3": 1,
     "F8_E8M0": 1,
+    "U8": 1,
     "I8": 1,
     "I32": 4,
     "I64": 8,
@@ -142,6 +143,18 @@ def _fp16_to_fp32(chunk: bytes) -> bytes:
     return np.frombuffer(chunk, dtype="<f2").astype(np.float32).tobytes()
 
 
+def _bf16_to_fp32_plus_one(chunk: bytes) -> bytes:
+    values = np.frombuffer(_bf16_to_fp32(chunk), dtype="<f4").copy()
+    values += np.float32(1.0)
+    return values.tobytes()
+
+
+def _fp16_to_fp32_plus_one(chunk: bytes) -> bytes:
+    values = np.frombuffer(chunk, dtype="<f2").astype(np.float32)
+    values += np.float32(1.0)
+    return values.tobytes()
+
+
 def _int64_to_int32(chunk: bytes) -> bytes:
     if len(chunk) % 8:
         raise ValueError("INT64 stream chunk is not element-aligned")
@@ -246,6 +259,118 @@ def fp32_streamed_weight(
         data_ranges=[data_range])
 
 
+def fp32_plus_one_streamed_weight(
+        index: SafeTensorIndex, name: str,
+        logical_shape: tuple[int, ...] | None = None) -> StreamedWeight:
+    """Stream a parameter whose module uses ``1 + weight`` as FP32."""
+    tensor = index.tensor(name)
+    shape = logical_shape or tensor.shape
+    if np.prod(shape, dtype=np.int64) != np.prod(
+            tensor.shape, dtype=np.int64):
+        raise ValueError(
+            f"logical FP32 shape changes element count: "
+            f"{tensor.shape} -> {shape}")
+    if tensor.dtype == "BF16":
+        transform = _bf16_to_fp32_plus_one
+        output_size = tensor.source.size * 2
+    elif tensor.dtype == "F16":
+        transform = _fp16_to_fp32_plus_one
+        output_size = tensor.source.size * 2
+    elif tensor.dtype == "F32":
+        def transform(chunk: bytes) -> bytes:
+            values = np.frombuffer(chunk, dtype="<f4").copy()
+            values += np.float32(1.0)
+            return values.tobytes()
+        output_size = tensor.source.size
+    else:
+        raise ValueError(f"cannot convert {tensor.dtype} to FP32: {name}")
+    return StreamedWeight(
+        precision=Precision.FP32,
+        logical_shape=tuple(int(dim) for dim in shape),
+        data_ranges=[WeightByteRange(
+            tensor.source.path, tensor.source.offset, tensor.source.size,
+            transform, output_size)])
+
+
+def concatenate_fp16_streamed_weights(
+        index: SafeTensorIndex, names: Iterable[str],
+        logical_shape: tuple[int, ...]) -> StreamedWeight:
+    """Row-concatenate BF16/F16 tensors into one streamed FP16 tensor."""
+    ranges = []
+    elements = 0
+    for name in names:
+        tensor = index.tensor(name)
+        if tensor.dtype not in ("BF16", "F16"):
+            raise ValueError(f"cannot concatenate {tensor.dtype} as FP16: {name}")
+        elements += int(np.prod(tensor.shape, dtype=np.int64))
+        ranges.append(WeightByteRange(
+            tensor.source.path, tensor.source.offset, tensor.source.size,
+            _bf16_to_fp16 if tensor.dtype == "BF16" else None))
+    expected = int(np.prod(logical_shape, dtype=np.int64))
+    if elements != expected:
+        raise ValueError(
+            f"concatenated FP16 element count mismatch: {elements} != {expected}")
+    return StreamedWeight(
+        precision=Precision.FP16,
+        logical_shape=tuple(int(dim) for dim in logical_shape),
+        data_ranges=ranges)
+
+
+def concatenate_fp16_row_slices(
+        index: SafeTensorIndex,
+        slices: Iterable[tuple[str, int, int]],
+        logical_shape: tuple[int, ...]) -> StreamedWeight:
+    """Concatenate contiguous row ranges from rank-2 tensors as FP16."""
+    ranges = []
+    elements = 0
+    for name, row_begin, row_count in slices:
+        tensor = index.tensor(name)
+        if tensor.dtype not in ("BF16", "F16") or len(tensor.shape) != 2:
+            raise ValueError(f"row slice is not a BF16/F16 matrix: {name}")
+        rows, cols = tensor.shape
+        if row_begin < 0 or row_count <= 0 or row_begin + row_count > rows:
+            raise ValueError(
+                f"invalid row slice [{row_begin}, {row_begin + row_count}) "
+                f"for {name} with {rows} rows")
+        row_bytes = cols * 2
+        ranges.append(WeightByteRange(
+            tensor.source.path,
+            tensor.source.offset + row_begin * row_bytes,
+            row_count * row_bytes,
+            _bf16_to_fp16 if tensor.dtype == "BF16" else None))
+        elements += row_count * cols
+    expected = int(np.prod(logical_shape, dtype=np.int64))
+    if elements != expected:
+        raise ValueError(
+            f"concatenated FP16 slice count mismatch: {elements} != {expected}")
+    return StreamedWeight(
+        precision=Precision.FP16,
+        logical_shape=tuple(int(dim) for dim in logical_shape),
+        data_ranges=ranges)
+
+
+def raw_u8_streamed_weight(
+        index: SafeTensorIndex, names: Iterable[str],
+        logical_shape: tuple[int, ...], *,
+        accepted_dtypes: tuple[str, ...] = ("U8", "F8_E4M3"),
+        ) -> StreamedWeight:
+    """Concatenate byte-exact tensors used by lookup tables."""
+    tensors = [index.tensor(name) for name in names]
+    for tensor in tensors:
+        if tensor.dtype not in accepted_dtypes:
+            raise ValueError(
+                f"raw tensor has unsupported dtype {tensor.dtype}: "
+                f"{tensor.name}")
+    actual = sum(tensor.nbytes for tensor in tensors)
+    expected = int(np.prod(logical_shape, dtype=np.int64))
+    if actual != expected:
+        raise ValueError(f"raw byte count mismatch: {actual} != {expected}")
+    return StreamedWeight(
+        precision=Precision.RAW_U8,
+        logical_shape=tuple(int(dim) for dim in logical_shape),
+        data_ranges=[tensor.source for tensor in tensors])
+
+
 def integer_streamed_weight(index: SafeTensorIndex,
                             name: str,
                             logical_shape: tuple[int, ...] | None = None
@@ -298,4 +423,81 @@ def aggregate_mxfp4_experts(index: SafeTensorIndex,
         group_size=32,
         num_groups=sum(scale.nbytes for scale in scales),
         expert_interleave_count=interleave_expert_count,
+    )
+
+
+def _repeat_f32_scalar(count: int):
+    def transform(chunk: bytes) -> bytes:
+        if len(chunk) != 4:
+            raise ValueError("NVFP4 global scale must be one FP32 scalar")
+        return chunk * count
+    return transform
+
+
+def aggregate_nvfp4_experts(
+        index: SafeTensorIndex,
+        expert_projection_names: Iterable[Iterable[str]]) -> StreamedWeight:
+    """Fuse and aggregate native NVFP4 expert projections.
+
+    Each inner iterable contains projections that are row-concatenated for a
+    single expert (gate + up, or just down). Packed E2M1 bytes stay native.
+    The sidecar stores all E4M3 block scales followed by one FP32 global scale
+    per output row, allowing fused projections to retain distinct globals.
+    """
+    experts = [list(names) for names in expert_projection_names]
+    if not experts or not experts[0]:
+        raise ValueError("cannot aggregate empty NVFP4 experts")
+
+    data_ranges = []
+    scale_ranges = []
+    rows_per_expert = None
+    logical_k = None
+    total_groups = 0
+    for expert_names in experts:
+        expert_rows = 0
+        expert_scales = []
+        expert_globals = []
+        for name in expert_names:
+            tensor = index.tensor(name)
+            if tensor.dtype != "U8" or len(tensor.shape) != 2:
+                raise ValueError(f"expert is not packed NVFP4: {name}")
+            rows, packed_k = tensor.shape
+            current_k = packed_k * 2
+            if current_k % 16 != 0:
+                raise ValueError(f"NVFP4 K is not block-16 aligned: {name}")
+            if logical_k is None:
+                logical_k = current_k
+            elif logical_k != current_k:
+                raise ValueError(f"inconsistent NVFP4 K dimension: {name}")
+            scale = index.tensor(name + "_scale")
+            scale2 = index.tensor(name + "_scale_2")
+            expected_scale = (rows, current_k // 16)
+            if scale.dtype != "F8_E4M3" or scale.shape != expected_scale:
+                raise ValueError(f"invalid NVFP4 block scale: {scale.name}")
+            if scale2.dtype != "F32" or scale2.shape not in ((), (1,)):
+                raise ValueError(f"invalid NVFP4 global scale: {scale2.name}")
+            data_ranges.append(tensor.source)
+            expert_scales.append(scale.source)
+            expert_globals.append(WeightByteRange(
+                scale2.source.path, scale2.source.offset, scale2.source.size,
+                _repeat_f32_scalar(rows), rows * 4))
+            expert_rows += rows
+            total_groups += rows * (current_k // 16)
+        if rows_per_expert is None:
+            rows_per_expert = expert_rows
+        elif rows_per_expert != expert_rows:
+            raise ValueError("NVFP4 experts have inconsistent fused row counts")
+        # The runtime sidecar is [all block scales][one global per row].
+        scale_ranges.extend(expert_scales)
+        scale_ranges.extend(expert_globals)
+
+    assert rows_per_expert is not None and logical_k is not None
+    return StreamedWeight(
+        precision=Precision.NVFP4,
+        logical_shape=(len(experts) * rows_per_expert, logical_k),
+        data_ranges=data_ranges,
+        scale_ranges=scale_ranges,
+        group_size=16,
+        num_groups=total_groups,
+        expert_interleave_count=len(experts),
     )

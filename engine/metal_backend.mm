@@ -958,6 +958,8 @@ size_t esize(Precision p) {
     case Precision::FP8_E4M3: return 1;
     case Precision::MXFP4: return 1;
     case Precision::INT32: return 4;
+    case Precision::RAW_U8: return 1;
+    case Precision::NVFP4: return 1;
     }
     return 4;
 }
@@ -3352,7 +3354,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.k_dim       = params.i32.size()>1 ? params.i32[1] : 128;
         p.v_dim       = params.i32.size()>2 ? params.i32[2] : 128;
         p.seq_len     = 1;
-        p.use_qk_l2norm = params.i32.size()>4 ? params.i32[4] : 1;
+        const int gdn_flags = params.i32.size()>4 ? params.i32[4] : 1;
+        p.use_qk_l2norm = gdn_flags & 1;
+        p.output_gate_type = (gdn_flags & 2) != 0;
         p.conv_kernel = params.i32.size()>5 ? params.i32[5] : 4;
         p.n_real      = 1;
         p.num_v_heads = (params.i32.size()>7 && params.i32[7]>0)
@@ -3419,7 +3423,9 @@ void MetalBackend::dispatch(const GraphNode& node,
         p.k_dim       = params.i32.size()>1 ? params.i32[1] : 128;
         p.v_dim       = params.i32.size()>2 ? params.i32[2] : 128;
         p.seq_len     = params.i32.size()>3 ? params.i32[3] : 1;
-        p.use_qk_l2norm = params.i32.size()>4 ? params.i32[4] : 1;
+        const int gdn_flags = params.i32.size()>4 ? params.i32[4] : 1;
+        p.use_qk_l2norm = gdn_flags & 1;
+        p.output_gate_type = (gdn_flags & 2) != 0;
         p.n_real      = params.i32.size()>6 ? params.i32[6] : 0;
         p.num_v_heads = (params.i32.size()>7 && params.i32[7]>0) ? params.i32[7] : p.num_heads;
         p.rms_eps     = params.f32.size()>0 ? params.f32[0] : 1e-6f;

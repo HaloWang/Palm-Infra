@@ -235,12 +235,31 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     if (spec.precision != Precision::FP16 && spec.precision != Precision::FP32 &&
         spec.precision != Precision::INT8 &&
         spec.precision != Precision::INT4 &&
-        spec.precision != Precision::MXFP4) {
+        spec.precision != Precision::MXFP4 &&
+        spec.precision != Precision::NVFP4) {
         std::fprintf(stderr, "MoE SSD: unsupported precision for %s\n",
                      spec.weight_ref.c_str());
         return false;
     }
     bool has_embedded_scales = false;
+    if (spec.precision == Precision::NVFP4) {
+        const uint64_t rows = static_cast<uint64_t>(spec.rows);
+        const uint64_t cols = static_cast<uint64_t>(spec.cols);
+        const uint64_t groups = cols / 16;
+        const uint64_t expected_data = rows * cols / 2;
+        const uint64_t expected_scales = rows * groups + rows * sizeof(float);
+        if ((spec.flags & ~MappedFile::FLAG_EXPERT_INTERLEAVED) != 0 ||
+            spec.group_size != 16 || cols % 16 != 0 ||
+            spec.groups_per_row != groups ||
+            spec.data_bytes != expected_data ||
+            spec.scales_bytes != expected_scales) {
+            std::fprintf(stderr,
+                         "MoE SSD: NVFP4 expert %s has invalid packed "
+                         "data or scale metadata\n",
+                         spec.weight_ref.c_str());
+            return false;
+        }
+    }
     if (spec.precision == Precision::INT4) {
         constexpr uint32_t layout_flags =
             MappedFile::FLAG_INT4_BG32 | MappedFile::FLAG_INT4_BG128;
@@ -279,7 +298,8 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
     }
     if ((spec.precision == Precision::INT8 ||
          spec.precision == Precision::INT4 ||
-         spec.precision == Precision::MXFP4) &&
+         spec.precision == Precision::MXFP4 ||
+         spec.precision == Precision::NVFP4) &&
         (spec.group_size == 0 || spec.groups_per_row == 0 ||
          (spec.scales_bytes == 0 && !has_embedded_scales))) {
         std::fprintf(stderr, "MoE SSD: quantized expert %s lacks scale metadata\n",
@@ -783,6 +803,20 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         if (t.is_q4_g128_packed) t.q4_g128_data = t.data;
     } else if (s.precision == Precision::MXFP4) {
         t.e8m0_scales = scales;
+        t.group_size = s.group_size;
+        t.groups_per_row = s.groups_per_row;
+        t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
+    } else if (s.precision == Precision::NVFP4) {
+        const size_t block_scale_bytes =
+            static_cast<size_t>(s.rows) * s.groups_per_row;
+        const size_t row_scale_bytes =
+            static_cast<size_t>(s.rows) * sizeof(float);
+        if (!scales ||
+            s.scales_bytes != block_scale_bytes + row_scale_bytes)
+            return Tensor{};
+        t.nvfp4_scales = scales;
+        t.nvfp4_row_scales = reinterpret_cast<const float*>(
+            scales + block_scale_bytes);
         t.group_size = s.group_size;
         t.groups_per_row = s.groups_per_row;
         t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;

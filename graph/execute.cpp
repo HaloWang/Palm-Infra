@@ -93,7 +93,9 @@ void prepare_execution(ExecContext& ctx) {
             node.op_type == OpType::ADD_RMS_NORM ||
             node.op_type == OpType::DSV4_COMPRESSOR ||
             node.op_type == OpType::DSV4_INDEXER ||
-            node.op_type == OpType::DSV4_SPARSE_ATTN) {
+            node.op_type == OpType::DSV4_SPARSE_ATTN ||
+            node.op_type == OpType::PLE_LOOKUP ||
+            node.op_type == OpType::PLE_DILATED_CONV) {
             return;
         }
     }
@@ -162,8 +164,9 @@ void prepare_execution(ExecContext& ctx) {
 // inject_runtime_shapes
 //
 // Fills INPUT tensors' actual shapes (substituting runtime_seq_len for any
-// dim tagged DynamicKind::SEQ) and patches stateful op params (n_real_tokens
-// for GATED_DELTANET_PREFILL.params.i32[6] and SHORTCONV.params.i32[1]).
+// dim tagged DynamicKind::SEQ) and patches stateful op parameters with the
+// number of real tokens. This keeps recurrent state unchanged by static
+// padding in GDN, ShortConv, and PLE.
 //
 // Called once before execute_graph() by the engine. After this call:
 //   - INPUT tensors have their runtime shape filled in
@@ -227,6 +230,12 @@ void inject_runtime_shapes(ExecContext& ctx) {
             // SHORTCONV reads seq_len from input tensor shape (x.shape[1]),
             // which is set by the engine to graph_seq_len (padding mode) or
             // n_real (dynamic mode).
+        } else if (n.op_type == OpType::PLE_LOOKUP) {
+            if (n.params.i32.size() <= 7) n.params.i32.resize(8, 0);
+            n.params.i32[7] = n_real;
+        } else if (n.op_type == OpType::PLE_DILATED_CONV) {
+            if (n.params.i32.size() <= 2) n.params.i32.resize(3, 0);
+            n.params.i32[2] = n_real;
         }
     }
 }

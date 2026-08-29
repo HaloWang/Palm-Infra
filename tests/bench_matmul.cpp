@@ -29,6 +29,7 @@ struct BenchConfig {
     int num_threads = 1;
     int warmup = 3;
     int repeat = 10;
+    int batch_size = 1;
     int k_block = 0;       // 0 = use default (256)
     int chunk_size = 0;    // 0 = use adaptive
     bool disable_k_block = false;
@@ -36,6 +37,7 @@ struct BenchConfig {
     bool use_int8 = false; // INT8 weight storage
     bool use_int4 = false; // INT4 packed weight storage
     bool use_mxfp4 = false;
+    bool use_nvfp4 = false;
     bool use_fp32 = false; // explicitly FP32 (default)
     bool interleave_pack = true;   // B interleaved packing (FP16/INT8)
     bool no_interleave_pack = false;
@@ -96,6 +98,12 @@ static BenchConfig parse_args(int argc, char** argv) {
                 std::fprintf(stderr, "bench_matmul: invalid --repeat\n");
                 std::exit(1);
             }
+        } else if (arg == "--batch") {
+            if (!require_value(argc, argv, i, "--batch", value)) std::exit(1);
+            if (!parse_int(value, cfg.batch_size) || cfg.batch_size < 1) {
+                std::fprintf(stderr, "bench_matmul: invalid --batch\n");
+                std::exit(1);
+            }
         } else if (arg == "--list") {
             std::printf("M=1 K=2048 N=2048\n");
             std::printf("M=1 K=2048 N=6144\n");
@@ -128,6 +136,8 @@ static BenchConfig parse_args(int argc, char** argv) {
             cfg.use_int4 = true;
         } else if (arg == "--mxfp4") {
             cfg.use_mxfp4 = true;
+        } else if (arg == "--nvfp4") {
+            cfg.use_nvfp4 = true;
         } else if (arg == "--fp32") {
             cfg.use_fp32 = true;
         } else if (arg == "--group-size") {
@@ -250,6 +260,82 @@ static BenchResult run_dsv4_grouped_bench(const BenchConfig& cfg) {
     return result;
 }
 
+static BenchResult run_nvfp4_batch_bench(const BenchConfig& cfg) {
+    const int batch = cfg.batch_size;
+    const int K = cfg.K;
+    const int N = cfg.N;
+    if (!cfg.use_nvfp4 || cfg.M != 1 || batch < 2 || K % 16 != 0) {
+        std::fprintf(
+            stderr,
+            "bench_matmul: --batch requires M=1, --nvfp4, batch>=2, K%%16=0\n");
+        std::exit(1);
+    }
+    const size_t weight_bytes = static_cast<size_t>(N) * K / 2;
+    const size_t scale_bytes = static_cast<size_t>(N) * K / 16;
+    std::vector<float> activation(K), output(static_cast<size_t>(batch) * N);
+    std::vector<uint8_t> packed(static_cast<size_t>(batch) * weight_bytes);
+    std::vector<uint8_t> scales(static_cast<size_t>(batch) * scale_bytes);
+    std::vector<float> row_scales(static_cast<size_t>(batch) * N);
+    fill_rand(activation.data(), K);
+    for (uint8_t& byte : packed) {
+        const uint8_t low = static_cast<uint8_t>(std::rand() % 16);
+        const uint8_t high = static_cast<uint8_t>(std::rand() % 16);
+        byte = static_cast<uint8_t>(low | (high << 4));
+    }
+    for (size_t i = 0; i < scales.size(); ++i)
+        scales[i] = static_cast<uint8_t>(0x30 + (i & 7));
+    for (size_t i = 0; i < row_scales.size(); ++i)
+        row_scales[i] = 0.01f + 0.001f * static_cast<float>(i & 7);
+
+    const Tensor input = Tensor::create(
+        Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
+        activation.data());
+    std::vector<Tensor> inputs(batch, input);
+    std::vector<Tensor> weights;
+    std::vector<Tensor> outputs;
+    weights.reserve(batch);
+    outputs.reserve(batch);
+    for (int i = 0; i < batch; ++i) {
+        Tensor weight = Tensor::create(
+            Precision::NVFP4, MemoryType::EXTERNAL, N, K, 1, 1,
+            packed.data() + static_cast<size_t>(i) * weight_bytes);
+        weight.group_size = 16;
+        weight.groups_per_row = static_cast<uint32_t>(K / 16);
+        weight.num_groups = static_cast<uint32_t>(scale_bytes);
+        weight.nvfp4_scales =
+            scales.data() + static_cast<size_t>(i) * scale_bytes;
+        weight.nvfp4_row_scales =
+            row_scales.data() + static_cast<size_t>(i) * N;
+        weights.push_back(weight);
+        outputs.push_back(Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,
+            output.data() + static_cast<size_t>(i) * N));
+    }
+    ThreadPool pool(cfg.num_threads);
+    for (int i = 0; i < cfg.warmup; ++i)
+        kernel_matmul_nvfp4_gemv_batch(inputs, weights, outputs, &pool);
+    std::vector<double> times;
+    times.reserve(cfg.repeat);
+    for (int i = 0; i < cfg.repeat; ++i) {
+        const auto start = std::chrono::steady_clock::now();
+        kernel_matmul_nvfp4_gemv_batch(inputs, weights, outputs, &pool);
+        const auto end = std::chrono::steady_clock::now();
+        times.push_back(
+            std::chrono::duration<double, std::milli>(end - start).count());
+    }
+    std::sort(times.begin(), times.end());
+    BenchResult result;
+    result.min_ms = times.front();
+    result.max_ms = times.back();
+    result.p50_ms = times[times.size() / 2];
+    for (double time : times)
+        result.avg_ms += time;
+    result.avg_ms /= static_cast<double>(times.size());
+    const double flops = 2.0 * batch * N * K;
+    result.gflops = flops / (result.avg_ms * 1e6);
+    return result;
+}
+
 static BenchResult run_bench(const BenchConfig& cfg) {
     int M = cfg.M, K = cfg.K, N = cfg.N;
 
@@ -272,6 +358,7 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     bool is_int8 = cfg.use_int8;
     bool is_int4 = cfg.use_int4;
     bool is_mxfp4 = cfg.use_mxfp4;
+    bool is_nvfp4 = cfg.use_nvfp4;
     const bool use_interleaved_dense =
         g_matmul_config.use_interleave_pack &&
         mollm::cpu::capabilities().fp16_interleaved_weights;
@@ -299,6 +386,9 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     uint8_t* b_int4_data = nullptr;
     uint8_t* b_mxfp4_data = nullptr;
     uint8_t* b_mxfp4_scales = nullptr;
+    uint8_t* b_nvfp4_data = nullptr;
+    uint8_t* b_nvfp4_scales = nullptr;
+    float* b_nvfp4_row_scales = nullptr;
     uint8_t* b_int4_q4dot_data = nullptr;
     uint8_t* b_int4_q4g32_data = nullptr;
     uint8_t* b_int4_q4g128_data = nullptr;
@@ -307,7 +397,26 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     int group_size = cfg.group_size > 0 ? cfg.group_size : K;
     int groups_per_row = (K + group_size - 1) / group_size;
 
-    if (is_mxfp4) {
+    if (is_nvfp4) {
+        if ((K % 16) != 0) {
+            std::fprintf(
+                stderr, "bench_matmul: NVFP4 requires K divisible by 16\n");
+            std::exit(1);
+        }
+        b_nvfp4_data = new uint8_t[static_cast<size_t>(N) * K / 2];
+        b_nvfp4_scales = new uint8_t[static_cast<size_t>(N) * K / 16];
+        b_nvfp4_row_scales = new float[N];
+        for (size_t i = 0; i < static_cast<size_t>(N) * K / 2; ++i) {
+            const uint8_t low = static_cast<uint8_t>(std::rand() % 16);
+            const uint8_t high = static_cast<uint8_t>(std::rand() % 16);
+            b_nvfp4_data[i] = static_cast<uint8_t>(low | (high << 4));
+        }
+        for (size_t i = 0; i < static_cast<size_t>(N) * K / 16; ++i)
+            b_nvfp4_scales[i] = static_cast<uint8_t>(0x30 + (i & 7));
+        for (int n = 0; n < N; ++n)
+            b_nvfp4_row_scales[n] = 0.01f + 0.001f * (n & 7);
+        b_raw = b_nvfp4_data;
+    } else if (is_mxfp4) {
         if ((K % 32) != 0) {
             std::fprintf(
                 stderr, "bench_matmul: MXFP4 requires K divisible by 32\n");
@@ -402,14 +511,22 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     }
 
     Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M, 1, 1, a_data);
-    Tensor B = Tensor::create(is_mxfp4 ? Precision::MXFP4 :
+    Tensor B = Tensor::create(is_nvfp4 ? Precision::NVFP4 :
+                              is_mxfp4 ? Precision::MXFP4 :
                               is_int4 ? Precision::INT4 :
                               is_int8 ? Precision::INT8 :
                               is_fp16 ? Precision::FP16 : Precision::FP32,
                               MemoryType::EXTERNAL, N, K, 1, 1, b_raw);
     if (is_fp16)
         B.is_interleaved = use_interleaved_dense;
-    if (is_mxfp4) {
+    if (is_nvfp4) {
+        B.nvfp4_scales = b_nvfp4_scales;
+        B.nvfp4_row_scales = b_nvfp4_row_scales;
+        B.group_size = 16;
+        B.groups_per_row = static_cast<uint32_t>(K / 16);
+        B.num_groups = static_cast<uint32_t>(
+            static_cast<size_t>(N) * K / 16);
+    } else if (is_mxfp4) {
         B.e8m0_scales = b_mxfp4_scales;
         B.group_size = 32;
         B.groups_per_row = static_cast<uint32_t>(K / 32);
@@ -482,7 +599,11 @@ static BenchResult run_bench(const BenchConfig& cfg) {
     if (b_int4_q4g32_data) delete[] b_int4_q4g32_data;
     if (b_int4_q4g128_data) delete[] b_int4_q4g128_data;
     if (b_int4_sparse_data) delete[] b_int4_sparse_data;
-    if (is_mxfp4) {
+    if (is_nvfp4) {
+        delete[] b_nvfp4_data;
+        delete[] b_nvfp4_scales;
+        delete[] b_nvfp4_row_scales;
+    } else if (is_mxfp4) {
         delete[] b_mxfp4_data;
         delete[] b_mxfp4_scales;
     } else if (is_int8) {
@@ -501,16 +622,23 @@ int main(int argc, char** argv) {
     srand(42);
     BenchConfig cfg = parse_args(argc, argv);
     BenchResult result =
-        cfg.dsv4_grouped ? run_dsv4_grouped_bench(cfg) : run_bench(cfg);
+        cfg.dsv4_grouped
+            ? run_dsv4_grouped_bench(cfg)
+            : cfg.batch_size > 1
+                  ? run_nvfp4_batch_bench(cfg)
+                  : run_bench(cfg);
 
     if (!cfg.dsv4_grouped) {
         std::printf("M=%d K=%d N=%d threads=%d isa=%s prec=%s\n",
                     cfg.M, cfg.K, cfg.N, cfg.num_threads,
                     mollm::cpu::isa_name(),
+                    cfg.use_nvfp4 ? "NVFP4" :
                     cfg.use_mxfp4 ? "MXFP4" :
                     cfg.use_int4 ? "INT4" :
                     cfg.use_int8 ? "INT8" :
                     cfg.use_fp16 ? "FP16" : "FP32");
+        if (cfg.batch_size > 1)
+            std::printf("  batch=%d shared_activation=1\n", cfg.batch_size);
     }
     std::printf("  warmup=%d repeat=%d\n", cfg.warmup, cfg.repeat);
     if (cfg.sparse_a) std::printf("  sparse_a=1 density=%d%%\n", cfg.density_pct);

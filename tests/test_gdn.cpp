@@ -46,7 +46,7 @@ static void ref_fused_gdn(
     float* state, float* out,
     int num_heads, int k_dim, int v_dim, int seq_len,
     bool use_l2norm, float rms_eps, float l2norm_eps, float scale,
-    int num_v_heads = -1)
+    int num_v_heads = -1, bool sigmoid_output_gate = false)
 {
     if (num_v_heads < 0) num_v_heads = num_heads;
     int qkv_dim   = num_heads * k_dim;
@@ -126,9 +126,11 @@ static void ref_fused_gdn(
             float rms = 1.f / std::sqrt(sum_sq / (float)v_dim + rms_eps);
             for (int d = 0; d < v_dim; d++) {
                 float normed = attn_out[d] * rms * norm_w[d];
-                float silu_z = z_row[d] * ref_sigmoidf(z_row[d]);
+                float sigmoid_z = ref_sigmoidf(z_row[d]);
+                float gate = sigmoid_output_gate ? sigmoid_z
+                                                 : z_row[d] * sigmoid_z;
                 int global_dim = vh * v_dim + d;
-                out[global_dim + t * z_dim] = normed * silu_z;
+                out[global_dim + t * z_dim] = normed * gate;
             }
         }
     }
@@ -141,7 +143,8 @@ static bool run_kernel(bool prefill,
                        const float* qkv, const float* a, const float* b, const float* z,
                        const float* A_log, const float* dt_bias, const float* norm_w,
                        float* state, float* out_buf,
-                       int num_v_heads = -1) {
+                       int num_v_heads = -1,
+                       bool sigmoid_output_gate = false) {
     if (num_v_heads < 0) num_v_heads = num_heads;
     int qkv_total = num_heads * k_dim * 2 + num_v_heads * v_dim;
     int z_dim     = num_v_heads * v_dim;
@@ -165,7 +168,8 @@ static bool run_kernel(bool prefill,
     Tensor out_t   = make_2d(Precision::FP32, z_dim,      seq_len,  out_buf);
 
     OpParams params;
-    params.i32 = {num_heads, k_dim, v_dim, seq_len, 1 /*use_l2norm*/,
+    params.i32 = {num_heads, k_dim, v_dim, seq_len,
+                  1 | (sigmoid_output_gate ? 2 : 0),
                   4 /*conv_kernel*/, seq_len /*n_real*/, num_v_heads};
     params.f32 = {1e-6f /*rms_eps*/, 1e-6f /*l2norm_eps*/, 1.f / std::sqrt((float)k_dim)};
 
@@ -308,12 +312,14 @@ static bool test_decode_basic() {
                   A_log.data(), dt_bias.data(), norm_w.data(),
                   state_r.data(), out_r.data(),
                   num_heads, k_dim, v_dim, 1,
-                  true, 1e-6f, 1e-6f, scale);
+                  true, 1e-6f, 1e-6f, scale,
+                  num_heads, true /*sigmoid_output_gate*/);
 
     run_kernel(/*prefill=*/false, num_heads, k_dim, v_dim, 1,
                qkv.data(), a.data(), b.data(), z.data(),
                A_log.data(), dt_bias.data(), norm_w.data(),
-               state_k.data(), out_k.data());
+               state_k.data(), out_k.data(),
+               num_heads, true /*sigmoid_output_gate*/);
 
     bool ok = compare(out_r.data(), out_k.data(), z_dim, "decode out");
     ok &= compare(state_r.data(), state_k.data(), state_size, "decode state");

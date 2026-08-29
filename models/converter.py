@@ -27,6 +27,7 @@ SUPPORTED_MODELS = {
     "qwen3_5":     ("qwen35",     "convert_qwen35"),
     "qwen3_5_moe": ("qwen35_moe", "convert_qwen35_moe"),
     "hy_v3":       ("qwen3_moe",  "convert_hy_v3"),
+    "qwen4_exp":    ("qwen4_exp",   "convert_qwen4_exp"),
     "youtu":       ("mla",        "convert_mla"),
 }
 
@@ -64,7 +65,7 @@ def _looks_like_qwen3_moe(cfg: dict) -> bool:
 def main():
     if len(sys.argv) < 3:
         print(f"Usage: {sys.argv[0]} <model_dir> <output.mollm> [quant] [--text-only]")
-        print("Quant modes: fp16, w8pc, w4g128, w4g32, w4mixg128, w4mixg32")
+        print("Quant modes: fp16, w8pc, w4g128, w4g32, w4mixg128, w4mixg32, native")
         print()
         print("Supported model types:")
         for mt, (mod, func) in SUPPORTED_MODELS.items():
@@ -109,6 +110,8 @@ def main():
         print(f"Error: unsupported model_type '{model_type}' in {model_dir}/config.json")
         print(f"Supported types: {supported}")
         sys.exit(1)
+    if model_type == "qwen4_exp" and not extra:
+        quant = "native"
     if text_only and model_type != "qwen3_5":
         print("Error: --text-only currently applies only to qwen3_5 checkpoints")
         sys.exit(1)

@@ -15,6 +15,31 @@ static int failures = 0;
 int main() {
     CPUBackend cpu_backend;  // shared across all ExecContexts below
 
+    // Static padding must never advance recurrent PLE state past real tokens.
+    {
+        Graph padded;
+        GraphNode lookup;
+        lookup.id = 0;
+        lookup.op_type = OpType::PLE_LOOKUP;
+        lookup.params.i32 = {3, 2, 99, 100, 0, 1234, 0, 8};
+        padded.nodes.push_back(lookup);
+        GraphNode conv;
+        conv.id = 1;
+        conv.op_type = OpType::PLE_DILATED_CONV;
+        conv.params.i32 = {4, 3, 8};
+        padded.nodes.push_back(conv);
+        padded.runtime.tensors.resize(2);
+        ExecContext padded_ctx;
+        padded_ctx.graph = &padded;
+        padded_ctx.runtime_seq_len = 3;
+        padded_ctx.padded_seq_len = 8;
+        padded_ctx.static_padded = true;
+        inject_runtime_shapes(padded_ctx);
+        CHECK(padded.nodes[0].params.i32[7] == 3 &&
+                  padded.nodes[1].params.i32[2] == 3,
+              "static padding injects real token count into PLE state ops");
+    }
+
     {
         float scalar = 0.0f;
         Tensor value = Tensor::create(

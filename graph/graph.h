@@ -74,6 +74,7 @@ enum class OpType : uint32_t {
     ADD_RMS_NORM = 22,  // residual += update; out = rms_norm(residual)
     RMS_NORM_ROPE = 23, // Q/K RMSNorm + materialize + RoPE
     QK_RMS_NORM_ROPE = 24, // fused Q+K RMSNorm/materialize/RoPE
+    GROUP_RMS_NORM = 25, // RMSNorm independent consecutive feature groups
 
     // activations
     SILU = 30,
@@ -122,6 +123,11 @@ enum class OpType : uint32_t {
     HC_PRE               = 130,
     HC_POST              = 131,
     HC_HEAD              = 132,
+    GR_REDUCE            = 133,
+    GR_INJECT            = 134,
+    PLE_LOOKUP           = 135,
+    PLE_GATE             = 136,
+    PLE_DILATED_CONV     = 137,
     DSV4_COMPRESSOR      = 160,
     DSV4_INDEXER         = 161,
     DSV4_SPARSE_ATTN     = 162,
@@ -145,6 +151,7 @@ inline const char* op_type_name(OpType op) {
     case OpType::ADD_RMS_NORM: return "ADD_RMS_NORM";
     case OpType::RMS_NORM_ROPE: return "RMS_NORM_ROPE";
     case OpType::QK_RMS_NORM_ROPE: return "QK_RMS_NORM_ROPE";
+    case OpType::GROUP_RMS_NORM: return "GROUP_RMS_NORM";
     case OpType::SILU: return "SILU";
     case OpType::GELU: return "GELU";
     case OpType::TANH: return "TANH";
@@ -176,6 +183,11 @@ inline const char* op_type_name(OpType op) {
     case OpType::HC_PRE: return "HC_PRE";
     case OpType::HC_POST: return "HC_POST";
     case OpType::HC_HEAD: return "HC_HEAD";
+    case OpType::GR_REDUCE: return "GR_REDUCE";
+    case OpType::GR_INJECT: return "GR_INJECT";
+    case OpType::PLE_LOOKUP: return "PLE_LOOKUP";
+    case OpType::PLE_GATE: return "PLE_GATE";
+    case OpType::PLE_DILATED_CONV: return "PLE_DILATED_CONV";
     case OpType::DSV4_COMPRESSOR: return "DSV4_COMPRESSOR";
     case OpType::DSV4_INDEXER: return "DSV4_INDEXER";
     case OpType::DSV4_SPARSE_ATTN: return "DSV4_SPARSE_ATTN";

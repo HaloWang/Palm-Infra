@@ -67,7 +67,7 @@ static inline void gdn_recurrence_neon(
     float g_t_exp, float beta_t, float* state_h,
     const float* norm_w, const float* z_row,
     float* out_head, int k_dim, int v_dim,
-    float scale, float rms_eps)
+    float scale, float rms_eps, bool sigmoid_output_gate)
 {
     alignas(16) float kv_mem[128] = {0};
     alignas(16) float attn_out[128] = {0};
@@ -184,8 +184,9 @@ static inline void gdn_recurrence_neon(
             vst1q_f32(normed_lane, normed);
             for (int j = 0; j < 4; j++) {
                 float z = z_row[dv + j];
-                float silu_z = z / (1.f + std::exp(-z));
-                out_head[dv + j] = normed_lane[j] * silu_z;
+                float sigmoid_z = 1.f / (1.f + std::exp(-z));
+                float gate = sigmoid_output_gate ? sigmoid_z : z * sigmoid_z;
+                out_head[dv + j] = normed_lane[j] * gate;
             }
         }
     }

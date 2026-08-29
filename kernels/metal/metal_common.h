@@ -386,6 +386,7 @@ struct GdnParams {
     int   seq_len;
     int   n_real;         // real (non-padded) tokens; 0 = all
     int   use_qk_l2norm;
+    int   output_gate_type; // 0 = SiLU, 1 = sigmoid
     float rms_eps;
     float l2_eps;
     float scale;
