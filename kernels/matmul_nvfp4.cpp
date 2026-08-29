@@ -63,6 +63,30 @@ inline Nvfp4CoefficientsF16 decode_nvfp4_coefficients_f16(
     };
 }
 
+inline int8x16_t decode_nvfp4_coefficients_q8(const uint8_t* packed) {
+    // E2M1 coefficients multiplied by two are small exact integers. Keeping
+    // that factor in the coefficient lets SDOT consume all 16 values at once;
+    // the common 0.5 factor is restored together with the block scale.
+    const int8x16_t coefficient_table = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    const uint8x8_t bytes = vld1_u8(packed);
+    const uint8x16_t bytes16 = vcombine_u8(bytes, bytes);
+    const uint8x16_t low =
+        vandq_u8(bytes16, vdupq_n_u8(0x0f));
+    const uint8x16_t high = vshrq_n_u8(bytes16, 4);
+    return vqtbl1q_s8(coefficient_table, vzip1q_u8(low, high));
+}
+
+inline float nvfp4_dot16_q8(const int8_t* activation,
+                            const uint8_t* packed) {
+    const int32x4_t partial = vdotq_s32(
+        vdupq_n_s32(0), decode_nvfp4_coefficients_q8(packed),
+        vld1q_s8(activation));
+    return static_cast<float>(vaddvq_s32(partial));
+}
+
 inline Nvfp4Coefficients16 decode_nvfp4_coefficients16(
     const uint8_t* packed) {
     const Nvfp4CoefficientsF16 coefficients =
@@ -135,6 +159,14 @@ bool nvfp4_fp16_activation_enabled() {
     static const bool enabled = [] {
         const char* value = std::getenv("MOLLM_NVFP4_FP16_ACT");
         return !value || std::strcmp(value, "0") != 0;
+    }();
+    return enabled;
+}
+
+bool nvfp4_q8_activation_enabled() {
+    static const bool enabled = [] {
+        const char* value = std::getenv("MOLLM_NVFP4_Q8_ACT");
+        return value && std::strcmp(value, "0") != 0;
     }();
     return enabled;
 }
@@ -455,6 +487,62 @@ void matmul_nvfp4_gemv_four_f16_range(
     }
 }
 
+void matmul_nvfp4_gemv_four_q8_range(
+    const int8_t* activation, const float* activation_scales,
+    const Tensor& B, Tensor& C, int n_begin, int n_end) {
+    const int K = static_cast<int>(B.shape[1]);
+    const int groups = K / 16;
+    const int bytes_per_row = K / 2;
+    const auto* packed = static_cast<const uint8_t*>(B.data);
+    float* output = C.ptr<float>();
+    int n = n_begin;
+    for (; n + 3 < n_end; n += 4) {
+        const uint8_t* row0 = packed + static_cast<size_t>(n) * bytes_per_row;
+        const uint8_t* scale0 =
+            B.nvfp4_scales + static_cast<size_t>(n) * groups;
+        float32x4_t sums = vdupq_n_f32(0.0f);
+        for (int group = 0; group < groups; ++group) {
+            const int8_t* q8 = activation + group * 16;
+            const float32x4_t dots = {
+                nvfp4_dot16_q8(q8, row0 + group * 8),
+                nvfp4_dot16_q8(
+                    q8, row0 + bytes_per_row + group * 8),
+                nvfp4_dot16_q8(
+                    q8, row0 + 2 * bytes_per_row + group * 8),
+                nvfp4_dot16_q8(
+                    q8, row0 + 3 * bytes_per_row + group * 8),
+            };
+            const float32x4_t weight_scales = {
+                kFp8E4m3fnDecodeTable[scale0[group]],
+                kFp8E4m3fnDecodeTable[scale0[groups + group]],
+                kFp8E4m3fnDecodeTable[scale0[2 * groups + group]],
+                kFp8E4m3fnDecodeTable[scale0[3 * groups + group]],
+            };
+            const float scale =
+                0.5f * activation_scales[group / 2];
+            sums = vfmaq_n_f32(
+                sums, vmulq_f32(dots, weight_scales), scale);
+        }
+        sums = vmulq_f32(
+            sums, vld1q_f32(B.nvfp4_row_scales + n));
+        vst1q_f32(output + n, sums);
+    }
+    for (; n < n_end; ++n) {
+        const uint8_t* row =
+            packed + static_cast<size_t>(n) * bytes_per_row;
+        const uint8_t* scales =
+            B.nvfp4_scales + static_cast<size_t>(n) * groups;
+        float sum = 0.0f;
+        for (int group = 0; group < groups; ++group) {
+            sum += nvfp4_dot16_q8(
+                       activation + group * 16, row + group * 8) *
+                   (0.5f * activation_scales[group / 2]) *
+                   kFp8E4m3fnDecodeTable[scales[group]];
+        }
+        output[n] = sum * B.nvfp4_row_scales[n];
+    }
+}
+
 #endif
 
 }  // namespace
@@ -490,14 +578,22 @@ bool kernel_matmul_nvfp4_gemv_batch(
     }
 
     MatmulTimer timer;
-    const bool use_fp16_activation = nvfp4_fp16_activation_enabled();
+    const bool use_q8_activation = nvfp4_q8_activation_enabled();
+    const bool use_fp16_activation =
+        !use_q8_activation && nvfp4_fp16_activation_enabled();
     timer.set_shape(
-        use_fp16_activation ? "nvfp4_gemv_batch_fp16act"
-                            : "nvfp4_gemv_batch",
+        use_q8_activation ? "nvfp4_gemv_batch_q8act"
+                          : use_fp16_activation
+                                ? "nvfp4_gemv_batch_fp16act"
+                                : "nvfp4_gemv_batch",
         static_cast<int>(batch), N, K,
         16, K / 16, false, false, thread_pool->num_threads());
     static thread_local std::vector<__fp16> fp16_activation_storage;
     static thread_local std::vector<const __fp16*> fp16_activations;
+    static thread_local std::vector<std::vector<int8_t>> q8_activations;
+    static thread_local std::vector<std::vector<float>> q8_activation_scales;
+    static thread_local std::vector<const int8_t*> q8_activation_ptrs;
+    static thread_local std::vector<const float*> q8_scale_ptrs;
     if (use_fp16_activation) {
         fp16_activation_storage.resize(
             batch * static_cast<size_t>(K));
@@ -519,15 +615,45 @@ bool kernel_matmul_nvfp4_gemv_batch(
             fp16_activations[i] = destination;
         }
     }
+    if (use_q8_activation) {
+        q8_activations.resize(batch);
+        q8_activation_scales.resize(batch);
+        q8_activation_ptrs.resize(batch);
+        q8_scale_ptrs.resize(batch);
+        for (size_t i = 0; i < batch; ++i) {
+            size_t shared = 0;
+            for (; shared < i; ++shared) {
+                if (inputs[shared].data == inputs[i].data) {
+                    q8_activation_ptrs[i] = q8_activation_ptrs[shared];
+                    q8_scale_ptrs[i] = q8_scale_ptrs[shared];
+                    break;
+                }
+            }
+            if (shared != i) continue;
+            quantize_a_q8_blocks(
+                inputs[i].ptr<float>(), 1, K, K, K,
+                q8_activations[i], q8_activation_scales[i]);
+            q8_activation_ptrs[i] = q8_activations[i].data();
+            q8_scale_ptrs[i] = q8_activation_scales[i].data();
+        }
+    }
     const __fp16* const* fp16_activation_ptrs =
         use_fp16_activation ? fp16_activations.data() : nullptr;
+    const int8_t* const* q8_activation_data =
+        use_q8_activation ? q8_activation_ptrs.data() : nullptr;
+    const float* const* q8_scale_data =
+        use_q8_activation ? q8_scale_ptrs.data() : nullptr;
     int n_chunk = std::max(
         N / thread_pool->num_threads(), 4);
     n_chunk = ((n_chunk + 3) / 4) * 4;
     thread_pool->parallel_for(
         0, N, n_chunk, [&](int, int n_begin, int n_end) {
             for (size_t i = 0; i < batch; ++i) {
-                if (use_fp16_activation) {
+                if (use_q8_activation) {
+                    matmul_nvfp4_gemv_four_q8_range(
+                        q8_activation_data[i], q8_scale_data[i],
+                        weights[i], outputs[i], n_begin, n_end);
+                } else if (use_fp16_activation) {
                     matmul_nvfp4_gemv_four_f16_range(
                         fp16_activation_ptrs[i], weights[i], outputs[i],
                         Activation::NONE, 0, -1, n_begin, n_end);
