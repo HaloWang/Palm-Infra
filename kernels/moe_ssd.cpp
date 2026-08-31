@@ -248,8 +248,14 @@ bool MoeSsdCache::add_source(const MoeSsdTensorSpec& spec) {
         const uint64_t groups = cols / 16;
         const uint64_t expected_data = rows * cols / 2;
         const uint64_t expected_scales = rows * groups + rows * sizeof(float);
-        if ((spec.flags & ~MappedFile::FLAG_EXPERT_INTERLEAVED) != 0 ||
+        constexpr uint32_t nvfp4_flags =
+            MappedFile::FLAG_EXPERT_INTERLEAVED |
+            MappedFile::FLAG_NVFP4_Q8_PAIR;
+        const bool pair_packed =
+            (spec.flags & MappedFile::FLAG_NVFP4_Q8_PAIR) != 0;
+        if ((spec.flags & ~nvfp4_flags) != 0 ||
             spec.group_size != 16 || cols % 16 != 0 ||
+            (pair_packed && rows % 4 != 0) ||
             spec.groups_per_row != groups ||
             spec.data_bytes != expected_data ||
             spec.scales_bytes != expected_scales) {
@@ -699,8 +705,20 @@ bool MoeSsdCache::retain_for_next_forward(
         return false;
     const size_t layer_share =
         layers_.empty() ? capacity_bytes_ : capacity_bytes_ / layers_.size();
-    const size_t retain_limit =
+    size_t retain_limit =
         std::max<size_t>(1, layer_share / layout->second.pair_bytes);
+    // Do not let a large per-layer fair share pin a long tail of nearly cold
+    // history. Current-route experts remain first, followed by decayed
+    // frequency candidates up to this soft multiple. Smaller fair shares are
+    // unchanged.
+    constexpr size_t route_multiplier = 12;
+    if (route_multiplier != 0 && !experts.empty()) {
+        const size_t route_cap = experts.size() >
+                std::numeric_limits<size_t>::max() / route_multiplier
+            ? std::numeric_limits<size_t>::max()
+            : experts.size() * route_multiplier;
+        retain_limit = std::min(retain_limit, route_cap);
+    }
     std::vector<int>& retained = retained_experts_[layer];
     std::vector<float>& scores = retained_scores_[layer];
     scores.resize(static_cast<size_t>(gate_up->spec.num_experts), 0.0f);
@@ -785,8 +803,8 @@ bool MoeSsdCache::retain_for_next_forward(
 }
 
 Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
-                                 const uint8_t* data,
-                                 const uint8_t* scales) {
+                                const uint8_t* data,
+                                const uint8_t* scales) const {
     const MoeSsdTensorSpec& s = source.spec;
     Tensor t = Tensor::create(s.precision, MemoryType::EXTERNAL,
                               s.rows, s.cols, 1, 1,
@@ -817,6 +835,8 @@ Tensor MoeSsdCache::make_tensor(const MoeSsdTensorSource& source,
         t.nvfp4_scales = scales;
         t.nvfp4_row_scales = reinterpret_cast<const float*>(
             scales + block_scale_bytes);
+        if ((s.flags & MappedFile::FLAG_NVFP4_Q8_PAIR) != 0)
+            t.nvfp4_q8_pair_data = data;
         t.group_size = s.group_size;
         t.groups_per_row = s.groups_per_row;
         t.num_groups = static_cast<uint32_t>(s.rows) * s.groups_per_row;
@@ -1022,7 +1042,10 @@ size_t MoeSsdCache::recommended_prefetch_count(size_t predicted_count) const {
     std::lock_guard<std::mutex> lock(mutex_);
     constexpr uint64_t kMinimumSamples = 128;
     constexpr double kMinimumHitRate = 0.80;
-    const size_t minimum = std::max<size_t>(1, predicted_count / 2);
+    constexpr size_t configured_minimum = 3;
+    const size_t half_minimum =
+        std::max<size_t>(1, predicted_count / 2);
+    const size_t minimum = std::min(half_minimum, configured_minimum);
     size_t count = predicted_count;
     while (count > minimum) {
         const size_t rank = count - 1;

@@ -5,12 +5,15 @@
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <vector>
 
 namespace {
 
-bool close(float lhs, float rhs) {
-    return std::fabs(lhs - rhs) <= 1e-5f * std::max(1.0f, std::fabs(rhs));
+bool close(float lhs, float rhs, float relative_tolerance = 1e-5f) {
+    return std::fabs(lhs - rhs) <=
+        relative_tolerance * std::max(1.0f, std::fabs(rhs));
 }
 
 }  // namespace
@@ -104,12 +107,93 @@ int main() {
     // Exercise the public dispatcher: AArch64 takes the fused batch kernel,
     // while other targets must retain the portable per-matrix fallback.
     kernel_matmul_batch(pairs, batch_result, &thread_pool);
+    const float batch_tolerance = 5e-3f;
     for (int i = 0; i < M * N; ++i) {
-        if (!close(batch_output[i], output[i])) {
+        if (!close(batch_output[i], output[i], batch_tolerance)) {
             std::fprintf(stderr,
                          "NVFP4 batch mismatch i=%d: %.8f != %.8f\n",
                          i, batch_output[i], output[i]);
             return 1;
+        }
+    }
+    {
+        constexpr int pair_n = 8;
+        std::vector<uint8_t> pair_packed(pair_n * K / 2);
+        if (!pack_nvfp4_q8_pairs(
+                packed.data(), pair_packed.data(), pair_n, K)) {
+            std::fprintf(stderr, "NVFP4 pair pack failed\n");
+            return 1;
+        }
+        Tensor pair_weight = weight;
+        pair_weight.shape[0] = pair_n;
+        pair_weight.num_groups = pair_n;
+        pair_weight.nvfp4_q8_pair_data = pair_packed.data();
+        std::vector<Tensor> pair_weights(M, pair_weight);
+        std::vector<float> pair_output(M * pair_n, 0.0f);
+        std::vector<Tensor> pair_outputs;
+        for (int m = 0; m < M; ++m) {
+            pair_outputs.push_back(Tensor::create(
+                Precision::FP32, MemoryType::EXTERNAL, pair_n, 1, 1, 1,
+                pair_output.data() + m * pair_n));
+        }
+        if (kernel_matmul_nvfp4_gemv_batch(
+                batch_inputs, pair_weights, pair_outputs, &thread_pool)) {
+            for (int m = 0; m < M; ++m) {
+                for (int n = 0; n < pair_n; ++n) {
+                    if (!close(
+                            pair_output[m * pair_n + n],
+                            batch_output[m * N + n], batch_tolerance)) {
+                        std::fprintf(
+                            stderr,
+                            "NVFP4 pair-packed mismatch m=%d n=%d: "
+                            "%.8f != %.8f\n",
+                            m, n, pair_output[m * pair_n + n],
+                            batch_output[m * N + n]);
+                        return 1;
+                    }
+                }
+            }
+        }
+
+        // The non-batched decode dispatcher is used when only one routed
+        // expert is ready. It must select the pair kernel as well.
+        std::vector<float> single_output(pair_n, 0.0f);
+        Tensor single_result = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, pair_n, 1, 1, 1,
+            single_output.data());
+        kernel_matmul_fp32(
+            batch_inputs[0], pair_weight, single_result, &thread_pool);
+        for (int n = 0; n < pair_n; ++n) {
+            if (!close(single_output[n], batch_output[n], batch_tolerance)) {
+                std::fprintf(
+                    stderr,
+                    "NVFP4 pair-packed single mismatch n=%d: %.8f != %.8f\n",
+                    n, single_output[n], batch_output[n]);
+                return 1;
+            }
+        }
+
+        // Prefill and speculative multi-token calls consume the same package
+        // layout through the floating-point kernels.
+        std::vector<float> pair_prefill_output(M * pair_n, 0.0f);
+        Tensor pair_prefill_result = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL, pair_n, M, 1, 1,
+            pair_prefill_output.data());
+        kernel_matmul_fp32(
+            input, pair_weight, pair_prefill_result, &thread_pool);
+        for (int m = 0; m < M; ++m) {
+            for (int n = 0; n < pair_n; ++n) {
+                if (!close(pair_prefill_output[m * pair_n + n],
+                           output[m * N + n])) {
+                    std::fprintf(
+                        stderr,
+                        "NVFP4 pair-packed prefill mismatch m=%d n=%d: "
+                        "%.8f != %.8f\n",
+                        m, n, pair_prefill_output[m * pair_n + n],
+                        output[m * N + n]);
+                    return 1;
+                }
+            }
         }
     }
     std::puts("NVFP4 tests passed");

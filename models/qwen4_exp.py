@@ -27,6 +27,8 @@ from safetensors_stream import (
     fp32_plus_one_streamed_weight,
     fp32_streamed_weight,
     integer_streamed_weight,
+    quantize_w4g32_streamed_weight,
+    quantize_w8pc_streamed_weight,
     raw_u8_streamed_weight,
 )
 
@@ -370,11 +372,13 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
 
     put("embed_tokens", dense_streamed_weight(
         index, "model.language_model.embed_tokens.weight"))
-    put("lm_head", dense_streamed_weight(index, "lm_head.weight"))
+    put("lm_head", quantize_w8pc_streamed_weight(
+        dense_streamed_weight(index, "lm_head.weight")))
 
     def dense(checkpoint_name: str, output_name: str | None = None):
         put(output_name or checkpoint_name.replace(".", "_"),
-            dense_streamed_weight(index, checkpoint_name))
+            quantize_w4g32_streamed_weight(
+                dense_streamed_weight(index, checkpoint_name)))
 
     def fp32(checkpoint_name: str, output_name: str | None = None,
              shape: tuple[int, ...] | None = None):
@@ -414,8 +418,9 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
                           2 * linear_v_heads +
                           linear_v_heads * linear_v)
             put(f"{output}_in_proj_weight",
-                concatenate_fp16_streamed_weights(
-                    index, names, (fused_rows, hidden)))
+                quantize_w4g32_streamed_weight(
+                    concatenate_fp16_streamed_weights(
+                        index, names, (fused_rows, hidden))))
             fp32(f"{prefix}.conv1d.weight", f"{output}_conv1d_weight",
                  (2 * linear_heads * linear_k +
                   linear_v_heads * linear_v, int(tc["linear_conv_kernel_dim"])))
@@ -439,8 +444,9 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
             ])
             qkv_rows = 2 * heads * head_dim + 2 * kv_heads * head_dim
             put(f"{output}_qkv_proj_weight",
-                concatenate_fp16_row_slices(
-                    index, slices, (qkv_rows, hidden)))
+                quantize_w4g32_streamed_weight(
+                    concatenate_fp16_row_slices(
+                        index, slices, (qkv_rows, hidden))))
             norm(f"{prefix}.q_norm.weight", f"{output}_q_norm_weight")
             norm(f"{prefix}.k_norm.weight", f"{output}_k_norm_weight")
             dense(f"{prefix}.o_proj.weight", f"{output}_o_proj_weight")
@@ -504,10 +510,10 @@ def build_streamed_weights(model_dir: str | Path, cfg: dict,
 def convert_qwen4_exp(model_dir: str, output_path: str,
                       num_layers: int | None = None,
                       prefill_seq_len: int = 256, n_ctx: int = 2048,
-                      quant: str = "native"):
-    """Convert the released Qwen3.8-Flash-Next NVFP4 checkpoint."""
-    if quant.lower() not in ("native", "nvfp4"):
-        raise ValueError("Qwen4-Exp currently preserves native NVFP4 experts")
+                      quant: str = "w4g32"):
+    """Convert native NVFP4 experts with offline W4G32 dense weights."""
+    if quant.lower() != "w4g32":
+        raise ValueError("Qwen4-Exp uses W4G32 dense weights")
     model_path = Path(model_dir)
     cfg = json.loads((model_path / "config.json").read_text())
     if cfg.get("model_type") != "qwen4_exp":
@@ -561,7 +567,7 @@ def convert_qwen4_exp(model_dir: str, output_path: str,
         "vocab_size": int(tc["vocab_size"]),
         "num_experts": int(tc["num_experts"]),
         "num_experts_per_tok": int(tc["num_experts_per_tok"]),
-        "quantization": "native-nvfp4",
+        "quantization": "native-nvfp4+dense-w4g32+lm-head-w8pc",
         "moe_expert_storage": {
             "version": 1,
             "layout": "expert_interleaved_v1",

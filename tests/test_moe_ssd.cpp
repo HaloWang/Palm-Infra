@@ -197,6 +197,110 @@ int main() {
               "paged MXFP4 expert dispatches through matmul");
     }
 
+    // Offline-pair-packed NVFP4 experts must be accepted directly from the
+    // package and exposed to every CPU dispatch without an online transpose.
+    {
+        constexpr int rows = 4;
+        constexpr int cols = 32;
+        constexpr size_t data_bytes = rows * cols / 2;
+        constexpr size_t scale_bytes = rows * (cols / 16) +
+                                       rows * sizeof(float);
+        std::vector<uint8_t> rowmajor(data_bytes);
+        for (size_t i = 0; i < rowmajor.size(); ++i)
+            rowmajor[i] = static_cast<uint8_t>(i * 13 + 7);
+        std::vector<uint8_t> pair_packed(data_bytes);
+        check(pack_nvfp4_q8_pairs(
+                  rowmajor.data(), pair_packed.data(), rows, cols),
+              "pack NVFP4 SSD fixture");
+        std::vector<uint8_t> scales(scale_bytes, 0x38);
+        float* row_scales = reinterpret_cast<float*>(
+            scales.data() + rows * (cols / 16));
+        for (int row = 0; row < rows; ++row) row_scales[row] = 1.0f;
+        const std::string nvfp4_path =
+            "/tmp/mollm_test_moe_ssd_nvfp4_pair.bin";
+        {
+            std::ofstream out(nvfp4_path, std::ios::binary);
+            out.write(reinterpret_cast<const char*>(pair_packed.data()),
+                      static_cast<std::streamsize>(pair_packed.size()));
+            out.write(reinterpret_cast<const char*>(pair_packed.data()),
+                      static_cast<std::streamsize>(pair_packed.size()));
+            out.write(reinterpret_cast<const char*>(scales.data()),
+                      static_cast<std::streamsize>(scales.size()));
+            out.write(reinterpret_cast<const char*>(scales.data()),
+                      static_cast<std::streamsize>(scales.size()));
+        }
+        auto nv_spec = [&](const char* name, uint64_t data_offset,
+                           uint64_t scales_offset) {
+            MoeSsdTensorSpec out;
+            out.weight_ref = name;
+            out.layer = 0;
+            out.num_experts = 1;
+            out.rows = rows;
+            out.cols = cols;
+            out.precision = Precision::NVFP4;
+            out.flags = MappedFile::FLAG_NVFP4_Q8_PAIR;
+            out.group_size = 16;
+            out.groups_per_row = cols / 16;
+            out.data_offset = data_offset;
+            out.data_bytes = data_bytes;
+            out.scales_offset = scales_offset;
+            out.scales_bytes = scale_bytes;
+            return out;
+        };
+
+        MoeSsdCache cache;
+        check(cache.open(nvfp4_path, 2 * (data_bytes + scale_bytes)),
+              "open pair-packed NVFP4 cache");
+        check(cache.add_source(nv_spec(
+                  "nvfp4_gate", 0, 2 * data_bytes)) &&
+              cache.add_source(nv_spec(
+                  "nvfp4_down", data_bytes,
+                  2 * data_bytes + scale_bytes)),
+              "add pair-packed NVFP4 sources");
+        Tensor gate, down;
+        check(cache.acquire(cache.find_source("nvfp4_gate"),
+                            cache.find_source("nvfp4_down"),
+                            0, gate, down),
+              "load pair-packed NVFP4 expert");
+        check(gate.nvfp4_q8_pair_data == gate.data &&
+                  down.nvfp4_q8_pair_data == down.data,
+              "pair-packed NVFP4 aliases cached package bytes");
+
+        std::vector<float> activation(cols);
+        for (int k = 0; k < cols; ++k)
+            activation[k] = static_cast<float>(k - 15) / 16.0f;
+        std::vector<float> expected(rows), actual(rows);
+        Tensor input = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            cols, 1, 1, 1, activation.data());
+        Tensor reference = Tensor::create(
+            Precision::NVFP4, MemoryType::EXTERNAL,
+            rows, cols, 1, 1, rowmajor.data());
+        reference.nvfp4_scales = scales.data();
+        reference.nvfp4_row_scales = row_scales;
+        reference.group_size = 16;
+        reference.groups_per_row = cols / 16;
+        reference.num_groups = rows * (cols / 16);
+        Tensor expected_tensor = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            rows, 1, 1, 1, expected.data());
+        Tensor actual_tensor = Tensor::create(
+            Precision::FP32, MemoryType::EXTERNAL,
+            rows, 1, 1, 1, actual.data());
+        kernel_matmul_fp32(input, reference, expected_tensor);
+        kernel_matmul_fp32(input, gate, actual_tensor);
+        for (int row = 0; row < rows; ++row) {
+            if (std::abs(expected[row] - actual[row]) >= 1e-4f) {
+                std::fprintf(stderr,
+                             "NVFP4 SSD mismatch row=%d expected=%g actual=%g\n",
+                             row, expected[row], actual[row]);
+                check(false,
+                      "pair-packed NVFP4 SSD matmul matches row-major");
+            }
+        }
+        std::remove(nvfp4_path.c_str());
+    }
+
     // Storage tensors may place each expert's data and scale sidecar in one
     // chunk. Verify that the explicit stride reaches the next expert rather
     // than treating the intervening sidecar bytes as matrix data.

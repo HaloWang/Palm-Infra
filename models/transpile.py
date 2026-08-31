@@ -37,6 +37,7 @@ WEIGHT_FLAG_INT4_BG128 = 1 << 1
 WEIGHT_FLAG_INT4_BG32 = 1 << 2
 WEIGHT_FLAG_FP8_BLOCK128 = 1 << 3
 WEIGHT_FLAG_EXPERT_INTERLEAVED = 1 << 4
+WEIGHT_FLAG_NVFP4_Q8_PAIR = 1 << 5
 _CPP_QUANT_HELPER: str | None | bool = None
 _CPP_QUANT_HELPER_ANNOUNCED = False
 _CPP_QUANT_HELPER_MISSING_ANNOUNCED = False
@@ -1604,6 +1605,10 @@ class WeightByteRange:
     size: int
     transform: Optional[Callable[[bytes], bytes]] = None
     output_size: Optional[int] = None
+    # Transformed chunks start and end on this byte boundary. This lets
+    # layout transforms operate incrementally without materializing a large
+    # source tensor. One means no additional alignment requirement.
+    transform_alignment: int = 1
 
     @property
     def written_size(self) -> int:
@@ -1669,12 +1674,22 @@ class StreamedWeight:
                      ranges: Sequence[WeightByteRange],
                      chunk_size: int = 8 * 1024 * 1024):
         for segment in ranges:
+            alignment = segment.transform_alignment
+            if alignment <= 0 or segment.size % alignment:
+                raise ValueError(
+                    f"invalid transform alignment for {segment.path}: "
+                    f"{segment.size} bytes / {alignment}")
             remaining = segment.size
             written = 0
             with open(segment.path, "rb") as source:
                 source.seek(segment.offset)
                 while remaining:
-                    chunk = source.read(min(chunk_size, remaining))
+                    take = min(chunk_size, remaining)
+                    if remaining > take and alignment > 1:
+                        take -= take % alignment
+                    if take <= 0:
+                        take = min(alignment, remaining)
+                    chunk = source.read(take)
                     if not chunk:
                         raise EOFError(
                             f"short source range in {segment.path} at "
@@ -2103,7 +2118,10 @@ def save_package(output_path: str,
         weight_files = {}  # relative_name -> (offset, size)
         weight_paths = {}  # relative_name -> filesystem path used for packing
         weight_headers = {}  # headers for streamed entries
-        weight_entries = []  # (path-or-StreamedWeight, size), package order
+        # Align each embedded XMAP data payload, rather than its header, to a
+        # cache line. Canonical BG32 is then both directly consumable by the
+        # loader and aligned like the old heap sidecar used by its hot kernel.
+        weight_entries = []  # (path-or-StreamedWeight, size, offset)
         weights_len = 0
         streamed_weights = streamed_weights or {}
 
@@ -2126,9 +2144,12 @@ def save_package(output_path: str,
                     header = source.header()
                     _validate_package_weight_header(ref, header)
                     size = source.size
-                    offset = weights_len
-                    weights_len += size
-                    weight_entries.append((source, size))
+                    data_offset = int(header["data_offset"])
+                    offset = (
+                        (weights_len + data_offset + 63) & ~63
+                    ) - data_offset
+                    weights_len = offset + size
+                    weight_entries.append((source, size, offset))
                     weight_files[ref] = [offset, size]
                     weight_headers[ref] = header
                     continue
@@ -2141,9 +2162,12 @@ def save_package(output_path: str,
                 header = _read_weight_header(wpath)
                 _validate_package_weight_header(ref, header)
                 size = os.path.getsize(wpath)
-                offset = weights_len
-                weights_len += size
-                weight_entries.append((wpath, size))
+                data_offset = int(header["data_offset"])
+                offset = (
+                    (weights_len + data_offset + 63) & ~63
+                ) - data_offset
+                weights_len = offset + size
+                weight_entries.append((wpath, size, offset))
                 weight_files[ref] = [offset, size]
                 weight_paths[ref] = wpath
                 weight_headers[ref] = header
@@ -2206,7 +2230,8 @@ def save_package(output_path: str,
         dc_off = pf_off + len(pf_bytes)
         vi_off = dc_off + len(dc_bytes) if vi_bytes else 0
         mtp_off = dc_off + len(dc_bytes) + len(vi_bytes)
-        w_off = mtp_off + len(mtp_bytes)
+        weights_unaligned = mtp_off + len(mtp_bytes)
+        w_off = (weights_unaligned + 63) & ~63
 
         with open(output_path, 'wb') as f:
             f.write(struct.pack('<II', PACKAGE_MAGIC, PACKAGE_VERSION))
@@ -2225,29 +2250,30 @@ def save_package(output_path: str,
             f.write(dc_bytes)
             f.write(vi_bytes)
             f.write(mtp_bytes)
+            f.write(b'\0' * (w_off - weights_unaligned))
             buf = bytearray(8 * 1024 * 1024)
             view = memoryview(buf)
-            for source, _ in weight_entries:
+            weights_written = 0
+            for source, size, offset in weight_entries:
+                f.write(b'\0' * (offset - weights_written))
                 if isinstance(source, StreamedWeight):
                     source.write_to(f)
-                    continue
-                wpath = source
-                with open(wpath, 'rb') as wf:
-                    while True:
-                        n = wf.readinto(buf)
-                        if not n:
-                            break
-                        f.write(view[:n])
-                # Large converters keep intermediate .weights files only so
-                # they can assemble this package.  Reclaim each one after it
-                # has been copied: this prevents the final package and its
-                # complete temporary weight set from needing 2x disk space.
-                if remove_weight_files:
-                    os.remove(wpath)
+                else:
+                    wpath = source
+                    with open(wpath, 'rb') as wf:
+                        while True:
+                            n = wf.readinto(buf)
+                            if not n:
+                                break
+                            f.write(view[:n])
+                    # Large converters keep intermediate .weights files only
+                    # so they can assemble this package. Reclaim each one
+                    # after copying to avoid requiring 2x disk space.
+                    if remove_weight_files:
+                        os.remove(wpath)
+                weights_written = offset + size
 
-        total = (hs + len(meta_json) + len(tok_bytes) + len(jinja_bytes)
-                 + len(pf_bytes) + len(dc_bytes) + len(vi_bytes)
-                 + len(mtp_bytes) + weights_len)
+        total = w_off + weights_len
         print(f"Saved {output_path} ({weights_len} weights + {len(tok_bytes)} tokenizer + "
               f"{len(jinja_bytes)} jinja + {len(pf_bytes)} prefill + "
               f"{len(dc_bytes)} decode + {len(vi_bytes)} vision + "

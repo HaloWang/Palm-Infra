@@ -119,9 +119,29 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
     constexpr size_t kWindow = 1;
     for (size_t begin = 0; begin < sorted.size(); begin += kWindow) {
         const size_t end = std::min(sorted.size(), begin + kWindow);
-        for (uint8_t component = 0; component < 4; ++component) {
-            for (size_t index = begin; index < end; ++index) {
-                Entry* entry = sorted[index];
+        for (size_t index = begin; index < end; ++index) {
+            Entry* entry = sorted[index];
+            const bool is_nvfp4 =
+                entry->gate_up->spec.precision == Precision::NVFP4 &&
+                entry->down->spec.precision == Precision::NVFP4;
+            const bool adjacent_gate =
+                component_offset(*entry, 1) ==
+                component_offset(*entry, 0) +
+                    component_buffer(*entry, 0).size();
+            const bool adjacent_down =
+                component_offset(*entry, 3) ==
+                component_offset(*entry, 2) +
+                    component_buffer(*entry, 2).size();
+            // NVFP4 stores each expert's data and scales contiguously. One
+            // preadv per tensor halves foreground I/O jobs without changing
+            // the storage assumptions of the other quantization formats.
+            const bool combine =
+                is_nvfp4 && adjacent_gate && adjacent_down;
+            const uint8_t first_component = combine ? 4 : 0;
+            const uint8_t component_count = combine ? 2 : 4;
+            for (uint8_t component_index = 0;
+                 component_index < component_count; ++component_index) {
+                const uint8_t component = first_component + component_index;
                 IoJob job;
                 job.component = component;
                 job.trace_id = next_trace_id_++;
@@ -135,8 +155,10 @@ void MoeSsdCache::enqueue_entry_reads_locked(const std::vector<Entry*>& entries,
                         ",\"first_expert\":" + std::to_string(entry->expert) +
                         ",\"experts\":1}");
                 }
-                if (low_priority) low_priority_io_jobs_.push_back(std::move(job));
-                else io_jobs_.push_back(std::move(job));
+                if (low_priority)
+                    low_priority_io_jobs_.push_back(std::move(job));
+                else
+                    io_jobs_.push_back(std::move(job));
             }
         }
     }

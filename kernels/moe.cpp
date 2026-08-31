@@ -215,6 +215,7 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
     view.e8m0_scales = nullptr;
     view.nvfp4_scales = nullptr;
     view.nvfp4_row_scales = nullptr;
+    view.nvfp4_q8_pair_data = nullptr;
     view.num_groups = 0;
     view.is_interleaved = false;
     view.is_q4_repacked = false;
@@ -280,6 +281,12 @@ static bool make_weight_rows_view(const Tensor& src, int64_t row0, int rows, int
         view.nvfp4_scales = src.nvfp4_scales +
             static_cast<size_t>(row0) * groups_per_row;
         view.nvfp4_row_scales = src.nvfp4_row_scales + row0;
+        if (src.nvfp4_q8_pair_data) {
+            if ((row0 & 3) != 0) return false;
+            view.nvfp4_q8_pair_data =
+                src.nvfp4_q8_pair_data +
+                static_cast<size_t>(row0 / 4) * groups_per_row * 32;
+        }
         view.group_size = 16;
         view.groups_per_row = static_cast<uint32_t>(groups_per_row);
         view.num_groups = static_cast<uint32_t>(

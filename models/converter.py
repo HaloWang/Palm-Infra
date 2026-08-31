@@ -110,8 +110,10 @@ def main():
         print(f"Error: unsupported model_type '{model_type}' in {model_dir}/config.json")
         print(f"Supported types: {supported}")
         sys.exit(1)
-    if model_type == "qwen4_exp" and not extra:
-        quant = "native"
+    if model_type == "qwen4_exp":
+        if not extra:
+            quant = "w4g32"
+        prefill_seq_len = 32
     if text_only and model_type != "qwen3_5":
         print("Error: --text-only currently applies only to qwen3_5 checkpoints")
         sys.exit(1)

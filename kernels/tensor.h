@@ -79,6 +79,10 @@ struct Tensor {
     const uint8_t* e8m0_scales = nullptr;
     const uint8_t* nvfp4_scales = nullptr;
     const float* nvfp4_row_scales = nullptr;
+    // Optional four-row/block-interleaved NVFP4 values for CPU kernels. For
+    // offline-packed packages this aliases data; experimental online packing
+    // may also attach a separate sidecar.
+    const uint8_t* nvfp4_q8_pair_data = nullptr;
     // Optional load-time Q8-dot sidecar for native FP8 weights. It keeps the
     // package bytes in FP8 while avoiding per-token FP8 decode on CPUs without
     // native FP8 arithmetic.

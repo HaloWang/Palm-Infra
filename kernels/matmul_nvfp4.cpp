@@ -23,6 +23,18 @@ const std::array<float, 256> kFp8E4m3fnDecodeTable = [] {
     return values;
 }();
 
+inline const uint8_t* nvfp4_block_ptr(
+    const Tensor& weight, int row, int group,
+    int groups_per_row, int bytes_per_row) {
+    if (weight.nvfp4_q8_pair_data) {
+        return weight.nvfp4_q8_pair_data +
+            (static_cast<size_t>(row / 4) * groups_per_row + group) * 32 +
+            static_cast<size_t>(row % 4) * 8;
+    }
+    return static_cast<const uint8_t*>(weight.data) +
+        static_cast<size_t>(row) * bytes_per_row + group * 8;
+}
+
 #if HAS_NEON && defined(__aarch64__)
 struct Nvfp4CoefficientsF16 {
     float16x8_t low;
@@ -77,6 +89,27 @@ inline int8x16_t decode_nvfp4_coefficients_q8(const uint8_t* packed) {
         vandq_u8(bytes16, vdupq_n_u8(0x0f));
     const uint8x16_t high = vshrq_n_u8(bytes16, 4);
     return vqtbl1q_s8(coefficient_table, vzip1q_u8(low, high));
+}
+
+struct Nvfp4CoefficientPairQ8 {
+    int8x16_t first;
+    int8x16_t second;
+};
+
+inline Nvfp4CoefficientPairQ8 decode_nvfp4_coefficient_pair_q8(
+    const uint8_t* packed) {
+    const int8x16_t coefficient_table = {
+        0, 1, 2, 3, 4, 6, 8, 12,
+        0, -1, -2, -3, -4, -6, -8, -12,
+    };
+    const uint8x16_t bytes = vld1q_u8(packed);
+    const uint8x16_t low =
+        vandq_u8(bytes, vdupq_n_u8(0x0f));
+    const uint8x16_t high = vshrq_n_u8(bytes, 4);
+    return {
+        vqtbl1q_s8(coefficient_table, vzip1q_u8(low, high)),
+        vqtbl1q_s8(coefficient_table, vzip2q_u8(low, high)),
+    };
 }
 
 inline float nvfp4_dot16_q8(const int8_t* activation,
@@ -164,11 +197,7 @@ bool nvfp4_fp16_activation_enabled() {
 }
 
 bool nvfp4_q8_activation_enabled() {
-    static const bool enabled = [] {
-        const char* value = std::getenv("MOLLM_NVFP4_Q8_ACT");
-        return value && std::strcmp(value, "0") != 0;
-    }();
-    return enabled;
+    return true;
 }
 
 inline float32x4_t nvfp4_partial16_decoded(
@@ -213,6 +242,40 @@ inline float32x2_t reduce_two_dots(
     float32x4_t row0, float32x4_t row1) {
     const float32x4_t pairs = vpaddq_f32(row0, row1);
     return vpadd_f32(vget_low_f32(pairs), vget_high_f32(pairs));
+}
+
+inline int32x4_t reduce_four_dots_s32(
+    int32x4_t row0, int32x4_t row1,
+    int32x4_t row2, int32x4_t row3) {
+    // SDOT leaves four independent partial sums in each vector. Pairwise
+    // reduction keeps all four output rows in SIMD lanes instead of issuing
+    // four scalar ADDV reductions and rebuilding a vector afterwards.
+    return vpaddq_s32(
+        vpaddq_s32(row0, row1), vpaddq_s32(row2, row3));
+}
+
+inline float32x4_t accumulate_nvfp4_q8_pair_group(
+    float32x4_t sums, int8x16_t q8, const uint8_t* block,
+    const uint8_t* scale0, int groups, int group,
+    float activation_scale) {
+    const Nvfp4CoefficientPairQ8 pair01 =
+        decode_nvfp4_coefficient_pair_q8(block);
+    const Nvfp4CoefficientPairQ8 pair23 =
+        decode_nvfp4_coefficient_pair_q8(block + 16);
+    const int32x4_t zero = vdupq_n_s32(0);
+    const float32x4_t dots = vcvtq_f32_s32(reduce_four_dots_s32(
+        vdotq_s32(zero, pair01.first, q8),
+        vdotq_s32(zero, pair01.second, q8),
+        vdotq_s32(zero, pair23.first, q8),
+        vdotq_s32(zero, pair23.second, q8)));
+    const float32x4_t weight_scales = {
+        kFp8E4m3fnDecodeTable[scale0[group]],
+        kFp8E4m3fnDecodeTable[scale0[groups + group]],
+        kFp8E4m3fnDecodeTable[scale0[2 * groups + group]],
+        kFp8E4m3fnDecodeTable[scale0[3 * groups + group]],
+    };
+    return vfmaq_n_f32(
+        sums, vmulq_f32(dots, weight_scales), activation_scale);
 }
 
 inline float32x4_t accumulate_nvfp4_four_rows(
@@ -260,7 +323,6 @@ void matmul_nvfp4_range(const Tensor& A, const Tensor& B, Tensor& C,
     float* c = C.ptr<float>();
 
     for (int n = n_begin; n < n_end; ++n) {
-        const uint8_t* row = packed + static_cast<size_t>(n) * (K / 2);
         const uint8_t* scales =
             B.nvfp4_scales + static_cast<size_t>(n) * groups_per_row;
         for (int m = 0; m < M; ++m) {
@@ -269,13 +331,17 @@ void matmul_nvfp4_range(const Tensor& A, const Tensor& B, Tensor& C,
             for (int group = 0; group < groups_per_row; ++group) {
 #if HAS_NEON && defined(__aarch64__)
                 const float block = nvfp4_dot16(
-                    x + group * 16, row + group * 8);
+                    x + group * 16,
+                    nvfp4_block_ptr(
+                        B, n, group, groups_per_row, K / 2));
                 sum += block * kFp8E4m3fnDecodeTable[scales[group]];
 #else
                 float block = 0.0f;
                 const int k_begin = group * 16;
                 for (int k = k_begin; k < k_begin + 16; ++k) {
-                const uint8_t byte = row[k >> 1];
+                const uint8_t* block_data = nvfp4_block_ptr(
+                    B, n, group, groups_per_row, K / 2);
+                const uint8_t byte = block_data[(k - k_begin) >> 1];
                 const uint8_t nibble =
                     (k & 1) ? static_cast<uint8_t>(byte >> 4)
                             : static_cast<uint8_t>(byte & 0x0f);
@@ -322,14 +388,14 @@ void matmul_nvfp4_small_m_range(
             sums4[block] = vdupq_n_f32(0.0f);
         float32x2_t sum2 = vdup_n_f32(0.0f);
         float sum1 = 0.0f;
-        const uint8_t* row =
-            packed + static_cast<size_t>(n) * bytes_per_row;
         const uint8_t* scales =
             B.nvfp4_scales + static_cast<size_t>(n) * groups;
 
         for (int group = 0; group < groups; ++group) {
             const Nvfp4Coefficients16 coefficients =
-                decode_nvfp4_coefficients16(row + group * 8);
+                decode_nvfp4_coefficients16(
+                    nvfp4_block_ptr(
+                        B, n, group, groups, bytes_per_row));
             const float scale =
                 0.5f * kFp8E4m3fnDecodeTable[scales[group]];
             const int k = group * 16;
@@ -543,9 +609,110 @@ void matmul_nvfp4_gemv_four_q8_range(
     }
 }
 
+void matmul_nvfp4_gemv_four_q8_pair_range(
+    const int8_t* activation, const float* activation_scales,
+    const Tensor& B, Tensor& C, int n_begin, int n_end) {
+    const int K = static_cast<int>(B.shape[1]);
+    const int groups = K / 16;
+    const uint8_t* pair_packed = B.nvfp4_q8_pair_data;
+    float* output = C.ptr<float>();
+    int n = n_begin;
+    for (; n + 3 < n_end; n += 4) {
+        const uint8_t* tile = pair_packed +
+            static_cast<size_t>(n / 4) * groups * 32;
+        const uint8_t* scale0 =
+            B.nvfp4_scales + static_cast<size_t>(n) * groups;
+        float32x4_t sums = vdupq_n_f32(0.0f);
+        int group = 0;
+        for (; group + 1 < groups; group += 2) {
+            const float scale = 0.5f * activation_scales[group / 2];
+            sums = accumulate_nvfp4_q8_pair_group(
+                sums, vld1q_s8(activation + group * 16),
+                tile + static_cast<size_t>(group) * 32,
+                scale0, groups, group, scale);
+            sums = accumulate_nvfp4_q8_pair_group(
+                sums, vld1q_s8(activation + (group + 1) * 16),
+                tile + static_cast<size_t>(group + 1) * 32,
+                scale0, groups, group + 1, scale);
+        }
+        if (group < groups) {
+            sums = accumulate_nvfp4_q8_pair_group(
+                sums, vld1q_s8(activation + group * 16),
+                tile + static_cast<size_t>(group) * 32,
+                scale0, groups, group,
+                0.5f * activation_scales[group / 2]);
+        }
+        sums = vmulq_f32(
+            sums, vld1q_f32(B.nvfp4_row_scales + n));
+        vst1q_f32(output + n, sums);
+    }
+    if (n < n_end) {
+        const int bytes_per_row = K / 2;
+        for (; n < n_end; ++n) {
+            const uint8_t* scales =
+                B.nvfp4_scales + static_cast<size_t>(n) * groups;
+            float sum = 0.0f;
+            for (int group = 0; group < groups; ++group) {
+                sum += nvfp4_dot16_q8(
+                           activation + group * 16,
+                           nvfp4_block_ptr(
+                               B, n, group, groups, bytes_per_row)) *
+                       (0.5f * activation_scales[group / 2]) *
+                       kFp8E4m3fnDecodeTable[scales[group]];
+            }
+            output[n] = sum * B.nvfp4_row_scales[n];
+        }
+    }
+}
+
 #endif
 
 }  // namespace
+
+bool pack_nvfp4_q8_pairs(const uint8_t* source, uint8_t* destination,
+                         int N, int K) {
+    if (!source || !destination || N <= 0 || K <= 0 ||
+        (N % 4) != 0 || (K % 16) != 0)
+        return false;
+    const int groups = K / 16;
+    const int bytes_per_row = K / 2;
+    for (int n = 0; n < N; n += 4) {
+        uint8_t* tile = destination +
+            static_cast<size_t>(n / 4) * groups * 32;
+        int group = 0;
+#if HAS_NEON && defined(__aarch64__)
+        const uint64_t* row0 = reinterpret_cast<const uint64_t*>(
+            source + static_cast<size_t>(n) * bytes_per_row);
+        const uint64_t* row1 = reinterpret_cast<const uint64_t*>(
+            source + static_cast<size_t>(n + 1) * bytes_per_row);
+        const uint64_t* row2 = reinterpret_cast<const uint64_t*>(
+            source + static_cast<size_t>(n + 2) * bytes_per_row);
+        const uint64_t* row3 = reinterpret_cast<const uint64_t*>(
+            source + static_cast<size_t>(n + 3) * bytes_per_row);
+        for (; group + 1 < groups; group += 2) {
+            const uint64x2_t values0 = vld1q_u64(row0 + group);
+            const uint64x2_t values1 = vld1q_u64(row1 + group);
+            const uint64x2_t values2 = vld1q_u64(row2 + group);
+            const uint64x2_t values3 = vld1q_u64(row3 + group);
+            uint64_t* block = reinterpret_cast<uint64_t*>(
+                tile + static_cast<size_t>(group) * 32);
+            vst1q_u64(block, vzip1q_u64(values0, values1));
+            vst1q_u64(block + 2, vzip1q_u64(values2, values3));
+            vst1q_u64(block + 4, vzip2q_u64(values0, values1));
+            vst1q_u64(block + 6, vzip2q_u64(values2, values3));
+        }
+#endif
+        for (; group < groups; ++group) {
+            uint8_t* block = tile + static_cast<size_t>(group) * 32;
+            for (int row = 0; row < 4; ++row)
+                std::memcpy(
+                    block + row * 8,
+                    source + static_cast<size_t>(n + row) * bytes_per_row +
+                        group * 8, 8);
+        }
+    }
+    return true;
+}
 
 bool kernel_matmul_nvfp4_gemv_batch(
     const std::vector<Tensor>& inputs,
@@ -650,9 +817,22 @@ bool kernel_matmul_nvfp4_gemv_batch(
         0, N, n_chunk, [&](int, int n_begin, int n_end) {
             for (size_t i = 0; i < batch; ++i) {
                 if (use_q8_activation) {
-                    matmul_nvfp4_gemv_four_q8_range(
-                        q8_activation_data[i], q8_scale_data[i],
-                        weights[i], outputs[i], n_begin, n_end);
+                    if (weights[i].nvfp4_q8_pair_data) {
+                        matmul_nvfp4_gemv_four_q8_pair_range(
+                            q8_activation_data[i], q8_scale_data[i],
+                            weights[i], outputs[i], n_begin, n_end);
+                    } else {
+                        matmul_nvfp4_gemv_four_q8_range(
+                            q8_activation_data[i], q8_scale_data[i],
+                            weights[i], outputs[i], n_begin, n_end);
+                    }
+                } else if (weights[i].nvfp4_q8_pair_data) {
+                    // The pair layout is primarily for Q8 decode. Preserve
+                    // correctness when that optional path is disabled by
+                    // using the layout-aware exact kernel.
+                    matmul_nvfp4_range(
+                        inputs[i], weights[i], outputs[i],
+                        Activation::NONE, 0, -1, n_begin, n_end);
                 } else if (use_fp16_activation) {
                     matmul_nvfp4_gemv_four_f16_range(
                         fp16_activation_ptrs[i], weights[i], outputs[i],
@@ -682,15 +862,24 @@ void matmul_dispatch_nvfp4(const Tensor& A, const Tensor& B, Tensor& C,
     const int K = static_cast<int>(A.shape[0]);
     const int N = static_cast<int>(B.shape[0]);
     const int threads = thread_pool ? thread_pool->num_threads() : 1;
-    const bool use_fp16_activation =
+    const bool use_q8_activation =
 #if HAS_NEON && defined(__aarch64__)
-        M == 1 && nvfp4_fp16_activation_enabled();
+        M == 1 && act == Activation::NONE &&
+        nvfp4_q8_activation_enabled();
 #else
         false;
 #endif
-    timer.set_shape(use_fp16_activation ? "nvfp4_gemv_fp16act"
-                                        : M == 1 ? "nvfp4_gemv"
-                                                 : "nvfp4_gemm",
+    const bool use_fp16_activation =
+#if HAS_NEON && defined(__aarch64__)
+        M == 1 && !use_q8_activation && nvfp4_fp16_activation_enabled();
+#else
+        false;
+#endif
+    timer.set_shape(use_q8_activation ? "nvfp4_gemv_q8act"
+                                      : use_fp16_activation
+                                            ? "nvfp4_gemv_fp16act"
+                                            : M == 1 ? "nvfp4_gemv"
+                                                     : "nvfp4_gemm",
                     M, N, K, 16, K > 0 ? K / 16 : 0,
                     false, false, threads);
     if (A.prec != Precision::FP32 || B.prec != Precision::NVFP4 ||
@@ -701,6 +890,13 @@ void matmul_dispatch_nvfp4(const Tensor& A, const Tensor& B, Tensor& C,
     }
 #if HAS_NEON && defined(__aarch64__)
     static thread_local std::vector<__fp16> fp16_activation;
+    static thread_local std::vector<int8_t> q8_activation;
+    static thread_local std::vector<float> q8_activation_scales;
+    if (use_q8_activation) {
+        quantize_a_q8_blocks(
+            A.ptr<float>(), 1, K, K, K,
+            q8_activation, q8_activation_scales);
+    }
     if (use_fp16_activation) {
         fp16_activation.resize(static_cast<size_t>(K));
         convert_fp32_to_fp16(
@@ -708,11 +904,28 @@ void matmul_dispatch_nvfp4(const Tensor& A, const Tensor& B, Tensor& C,
     }
     const __fp16* fp16_activation_data =
         use_fp16_activation ? fp16_activation.data() : nullptr;
+    const int8_t* q8_activation_data =
+        use_q8_activation ? q8_activation.data() : nullptr;
+    const float* q8_scale_data =
+        use_q8_activation ? q8_activation_scales.data() : nullptr;
 #endif
     auto run = [&](int begin, int end) {
 #if HAS_NEON && defined(__aarch64__)
         if (M == 1) {
-            if (use_fp16_activation) {
+            if (use_q8_activation) {
+                if (B.nvfp4_q8_pair_data) {
+                    matmul_nvfp4_gemv_four_q8_pair_range(
+                        q8_activation_data, q8_scale_data,
+                        B, C, begin, end);
+                } else {
+                    matmul_nvfp4_gemv_four_q8_range(
+                        q8_activation_data, q8_scale_data,
+                        B, C, begin, end);
+                }
+            } else if (B.nvfp4_q8_pair_data) {
+                matmul_nvfp4_range(
+                    A, B, C, act, act_n_begin, act_n_len, begin, end);
+            } else if (use_fp16_activation) {
                 matmul_nvfp4_gemv_four_f16_range(
                     fp16_activation_data, B, C, act,
                     act_n_begin, act_n_len, begin, end);

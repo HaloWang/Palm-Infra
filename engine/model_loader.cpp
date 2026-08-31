@@ -658,14 +658,16 @@ bool LLMEngine::load_graph(Graph& g, ExecContext& exec_ctx, const char* path) {
                             t, wref, data, packed_weights_);
                 }
                 // Once a CPU sidecar owns every value needed by the selected
-                // FP8 kernel, the original package pages are no longer used at
-                // inference time. Exclude the whole weight blob (header, data,
-                // and E8M0 scales) from dense warmup/mlock. Gate this on the
-                // sidecar pointer rather than the architecture or weight name
-                // so unsupported platforms retain the raw fallback.
+                // kernel, the original package pages are no longer used at
+                // inference time. Exclude the whole weight blob from dense
+                // warmup/mlock. Gate this on the prepared pointers rather
+                // than the architecture or weight name so unsupported
+                // platforms retain their raw fallback.
                 const bool complete_cpu_sidecar =
                     (t.prec == Precision::FP8_E4M3 &&
                      (t.q8_repack_data || t.fp8_bf16_fp16_data)) ||
+                    (t.prec == Precision::INT8 && t.q8_repack_data &&
+                     t.scales) ||
                     (t.prec == Precision::FP32 && t.fp32_bf16_data) ||
                     (t.prec == Precision::FP16 && t.is_interleaved &&
                      t.data != data);

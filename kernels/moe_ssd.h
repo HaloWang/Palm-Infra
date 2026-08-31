@@ -310,9 +310,9 @@ private:
     void io_worker_main(int worker_index);
     void cross_layer_worker_main();
     void stop_io_workers();
-    static Tensor make_tensor(const MoeSsdTensorSource& source,
-                              const uint8_t* data,
-                              const uint8_t* scales);
+    Tensor make_tensor(const MoeSsdTensorSource& source,
+                       const uint8_t* data,
+                       const uint8_t* scales) const;
 
     int fd_ = -1;
     uint64_t file_size_ = 0;

@@ -274,6 +274,7 @@ static BenchResult run_nvfp4_batch_bench(const BenchConfig& cfg) {
     const size_t scale_bytes = static_cast<size_t>(N) * K / 16;
     std::vector<float> activation(K), output(static_cast<size_t>(batch) * N);
     std::vector<uint8_t> packed(static_cast<size_t>(batch) * weight_bytes);
+    std::vector<uint8_t> pair_packed;
     std::vector<uint8_t> scales(static_cast<size_t>(batch) * scale_bytes);
     std::vector<float> row_scales(static_cast<size_t>(batch) * N);
     fill_rand(activation.data(), K);
@@ -286,7 +287,16 @@ static BenchResult run_nvfp4_batch_bench(const BenchConfig& cfg) {
         scales[i] = static_cast<uint8_t>(0x30 + (i & 7));
     for (size_t i = 0; i < row_scales.size(); ++i)
         row_scales[i] = 0.01f + 0.001f * static_cast<float>(i & 7);
-
+    pair_packed.resize(packed.size());
+    for (int i = 0; i < batch; ++i) {
+        if (!pack_nvfp4_q8_pairs(
+                packed.data() + static_cast<size_t>(i) * weight_bytes,
+                pair_packed.data() + static_cast<size_t>(i) * weight_bytes,
+                N, K)) {
+            std::fprintf(stderr, "bench_matmul: NVFP4 pair pack failed\n");
+            std::exit(1);
+        }
+    }
     const Tensor input = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, K, 1, 1, 1,
         activation.data());
@@ -306,6 +316,8 @@ static BenchResult run_nvfp4_batch_bench(const BenchConfig& cfg) {
             scales.data() + static_cast<size_t>(i) * scale_bytes;
         weight.nvfp4_row_scales =
             row_scales.data() + static_cast<size_t>(i) * N;
+        weight.nvfp4_q8_pair_data =
+            pair_packed.data() + static_cast<size_t>(i) * weight_bytes;
         weights.push_back(weight);
         outputs.push_back(Tensor::create(
             Precision::FP32, MemoryType::EXTERNAL, N, 1, 1, 1,

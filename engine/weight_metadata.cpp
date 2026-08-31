@@ -27,6 +27,7 @@ bool configure_weight_metadata(Tensor& tensor,
     tensor.e8m0_scales = nullptr;
     tensor.nvfp4_scales = nullptr;
     tensor.nvfp4_row_scales = nullptr;
+    tensor.nvfp4_q8_pair_data = nullptr;
     tensor.fp8_q8_scales = nullptr;
     tensor.group_size = 0;
     tensor.num_groups = 0;

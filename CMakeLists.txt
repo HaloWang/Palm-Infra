@@ -515,6 +515,8 @@ if(MOLLM_BUILD_TESTS)
                               test_rwkv7_quant_policy.py)
         add_mollm_python_test(test_moe_expert_storage_metadata
                               test_moe_expert_storage_metadata.py)
+        add_mollm_python_test(test_nvfp4_stream test_nvfp4_stream.py)
+        add_mollm_python_test(test_w4g32_stream test_w4g32_stream.py)
         add_test(
             NAME test_canonical_w4_storage
             COMMAND ${Python3_EXECUTABLE}

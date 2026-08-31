@@ -21,6 +21,7 @@
 //                             float scales[8] + q4dot q[8][16B]
 //                      bit 3: FP8 E4M3 scales are E8M0 over 128x128 blocks
 //                      bit 4: storage-only expert-interleaved native payload
+//                      bit 5: NVFP4 values use four-row, block-16 pair layout
 //   8       4      ndim    — number of dimensions (1-4)
 //   12      4      precision — Precision enum value
 //   16      8      shape[0]
@@ -52,6 +53,10 @@ public:
     // resident tensor loading must deinterleave it first. SSD MoE reads the
     // per-expert slices directly from package metadata.
     static constexpr uint32_t FLAG_EXPERT_INTERLEAVED = 1u << 4;
+    // NVFP4 values are grouped as [N/4, K/16, 4, 8 bytes]. This preserves
+    // the native E2M1 representation while making adjacent output rows
+    // contiguous for the CPU Q8-dot GEMV kernel.
+    static constexpr uint32_t FLAG_NVFP4_Q8_PAIR = 1u << 5;
 
     struct Header {
         uint32_t magic;

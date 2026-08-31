@@ -104,7 +104,8 @@ bool valid_header(const MappedFile::Header& header, size_t file_size) {
                                      MappedFile::FLAG_INT4_BG128 |
                                      MappedFile::FLAG_INT4_BG32 |
                                      MappedFile::FLAG_FP8_BLOCK128 |
-                                     MappedFile::FLAG_EXPERT_INTERLEAVED;
+                                     MappedFile::FLAG_EXPERT_INTERLEAVED |
+                                     MappedFile::FLAG_NVFP4_Q8_PAIR;
     if ((header.flags & ~known_flags) != 0 ||
         header.ndim == 0 || header.ndim > 4 ||
         header.precision >

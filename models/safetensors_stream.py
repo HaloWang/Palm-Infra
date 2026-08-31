@@ -18,7 +18,9 @@ import numpy as np
 from transpile import (
     Precision,
     StreamedWeight,
+    WEIGHT_FLAG_INT4_BG32,
     WEIGHT_FLAG_FP8_BLOCK128,
+    WEIGHT_FLAG_NVFP4_Q8_PAIR,
     WeightByteRange,
 )
 
@@ -223,6 +225,141 @@ def dense_streamed_weight(index: SafeTensorIndex,
             num_groups=scale.nbytes,
         )
     raise ValueError(f"unsupported dense dtype {tensor.dtype}: {name}")
+
+
+def _fp16_to_bg32(chunk: bytes, columns: int) -> bytes:
+    """Quantize complete FP16 rows into canonical FP32-scale BG32 blocks."""
+    row_bytes = columns * 2
+    if columns <= 0 or columns % 32 or len(chunk) % row_bytes:
+        raise ValueError(
+            f"invalid FP16 BG32 chunk: {len(chunk)} bytes, K={columns}")
+    values = np.frombuffer(chunk, dtype="<f2").reshape(-1, columns)
+    rows = values.shape[0]
+    groups = columns // 32
+    output = bytearray(((rows + 7) // 8) * groups * 160)
+    for row_begin in range(0, rows, 8):
+        valid = min(8, rows - row_begin)
+        tile = values[row_begin:row_begin + valid].astype(np.float32)
+        for group in range(groups):
+            block_values = tile[:, group * 32:(group + 1) * 32]
+            maximum = np.max(np.abs(block_values), axis=1)
+            scales = np.where(maximum > 0, maximum / 7.0, 1.0).astype("<f4")
+            quantized = np.rint(block_values / scales[:, None])
+            quantized = np.clip(quantized, -7, 7).astype(np.int8)
+            packed = ((quantized[:, 0::2].astype(np.uint8) & 0x0f) |
+                      ((quantized[:, 1::2].astype(np.uint8) & 0x0f) << 4))
+            block_index = (row_begin // 8) * groups + group
+            offset = block_index * 160
+            output[offset:offset + valid * 4] = scales.tobytes()
+            for row in range(valid):
+                begin = offset + 32 + row * 16
+                output[begin:begin + 16] = packed[row].tobytes()
+    return bytes(output)
+
+
+def quantize_w4g32_streamed_weight(weight: StreamedWeight) -> StreamedWeight:
+    """Convert a streamed FP16 matrix to the one supported dense W4 layout.
+
+    Quantization happens in row tiles while the package is written, so even
+    fused projections do not need a resident FP16 copy or a runtime sidecar.
+    """
+    if weight.precision != Precision.FP16 or len(weight.logical_shape) != 2:
+        raise ValueError("W4G32 quantization requires a streamed FP16 matrix")
+    rows, columns = weight.logical_shape
+    if rows <= 0 or columns <= 0 or columns % 32:
+        raise ValueError(f"W4G32 requires positive N and K%32=0: {(rows, columns)}")
+    row_bytes = columns * 2
+    output_ranges = []
+    for segment in weight.data_ranges:
+        if segment.written_size != segment.size or segment.size % row_bytes:
+            raise ValueError("W4G32 source range must contain complete FP16 rows")
+        segment_rows = segment.size // row_bytes
+        previous = segment.transform
+
+        def transform(chunk: bytes, previous=previous, columns=columns):
+            if previous is not None:
+                chunk = previous(chunk)
+            return _fp16_to_bg32(chunk, columns)
+
+        full_rows = segment_rows - segment_rows % 8
+        if full_rows:
+            full_size = full_rows * row_bytes
+            output_ranges.append(WeightByteRange(
+                segment.path, segment.offset, full_size, transform,
+                (full_rows // 8) * (columns // 32) * 160,
+                max(segment.transform_alignment, 8 * row_bytes)))
+        if full_rows != segment_rows:
+            tail_rows = segment_rows - full_rows
+            output_ranges.append(WeightByteRange(
+                segment.path, segment.offset + full_rows * row_bytes,
+                tail_rows * row_bytes, transform,
+                (columns // 32) * 160,
+                max(segment.transform_alignment, row_bytes)))
+
+    expected_bytes = ((rows + 7) // 8) * (columns // 32) * 160
+    actual_bytes = sum(segment.written_size for segment in output_ranges)
+    if actual_bytes != expected_bytes:
+        raise ValueError(
+            "W4G32 concatenation must preserve eight-row tile boundaries: "
+            f"{actual_bytes} != {expected_bytes}")
+    return StreamedWeight(
+        precision=Precision.INT4,
+        logical_shape=weight.logical_shape,
+        data_ranges=output_ranges,
+        group_size=32,
+        num_groups=rows * (columns // 32),
+        flags=WEIGHT_FLAG_INT4_BG32)
+
+
+def quantize_w8pc_streamed_weight(weight: StreamedWeight) -> StreamedWeight:
+    """Quantize a streamed FP16 matrix to row-major W8 per-channel."""
+    if weight.precision != Precision.FP16 or len(weight.logical_shape) != 2:
+        raise ValueError("W8PC quantization requires a streamed FP16 matrix")
+    rows, columns = weight.logical_shape
+    if rows <= 0 or columns <= 0:
+        raise ValueError(f"W8PC requires a non-empty matrix: {(rows, columns)}")
+    row_bytes = columns * 2
+    data_ranges = []
+    scale_ranges = []
+    for segment in weight.data_ranges:
+        if segment.written_size != segment.size or segment.size % row_bytes:
+            raise ValueError("W8PC source range must contain complete FP16 rows")
+        segment_rows = segment.size // row_bytes
+        previous = segment.transform
+
+        def values(chunk: bytes, previous=previous, columns=columns):
+            if previous is not None:
+                chunk = previous(chunk)
+            matrix = np.frombuffer(chunk, dtype="<f2").reshape(-1, columns)
+            matrix = matrix.astype(np.float32)
+            maximum = np.max(np.abs(matrix), axis=1)
+            scales = np.where(maximum > 0, maximum / 127.0, 1.0)
+            return np.clip(
+                np.rint(matrix / scales[:, None]), -127, 127
+            ).astype(np.int8).tobytes()
+
+        def scales(chunk: bytes, previous=previous, columns=columns):
+            if previous is not None:
+                chunk = previous(chunk)
+            matrix = np.frombuffer(chunk, dtype="<f2").reshape(-1, columns)
+            maximum = np.max(np.abs(matrix.astype(np.float32)), axis=1)
+            return np.where(
+                maximum > 0, maximum / 127.0, 1.0
+            ).astype("<f4").tobytes()
+
+        data_ranges.append(WeightByteRange(
+            segment.path, segment.offset, segment.size, values,
+            segment_rows * columns, row_bytes))
+        scale_ranges.append(WeightByteRange(
+            segment.path, segment.offset, segment.size, scales,
+            segment_rows * 4, row_bytes))
+    return StreamedWeight(
+        precision=Precision.INT8,
+        logical_shape=weight.logical_shape,
+        data_ranges=data_ranges,
+        scale_ranges=scale_ranges,
+        group_size=columns,
+        num_groups=rows)
 
 
 def fp32_streamed_weight(
@@ -434,6 +571,25 @@ def _repeat_f32_scalar(count: int):
     return transform
 
 
+def _pair_pack_nvfp4(packed_k: int):
+    """Reorder row-major NVFP4 bytes into [row4, group, row, byte]."""
+    if packed_k <= 0 or packed_k % 8:
+        raise ValueError(f"invalid NVFP4 packed K: {packed_k}")
+    groups = packed_k // 8
+
+    def transform(chunk: bytes) -> bytes:
+        tile_bytes = 4 * packed_k
+        if len(chunk) % tile_bytes:
+            raise ValueError(
+                "NVFP4 pair-pack chunk is not four-row aligned")
+        values = np.frombuffer(chunk, dtype=np.uint8)
+        return np.ascontiguousarray(
+            values.reshape(-1, 4, groups, 8).transpose(0, 2, 1, 3)
+        ).tobytes()
+
+    return transform
+
+
 def aggregate_nvfp4_experts(
         index: SafeTensorIndex,
         expert_projection_names: Iterable[Iterable[str]]) -> StreamedWeight:
@@ -476,7 +632,13 @@ def aggregate_nvfp4_experts(
                 raise ValueError(f"invalid NVFP4 block scale: {scale.name}")
             if scale2.dtype != "F32" or scale2.shape not in ((), (1,)):
                 raise ValueError(f"invalid NVFP4 global scale: {scale2.name}")
-            data_ranges.append(tensor.source)
+            if rows % 4:
+                raise ValueError(
+                    f"NVFP4 rows are not pair-pack aligned: {name}")
+            data_ranges.append(WeightByteRange(
+                tensor.source.path, tensor.source.offset, tensor.source.size,
+                _pair_pack_nvfp4(packed_k), tensor.source.size,
+                4 * packed_k))
             expert_scales.append(scale.source)
             expert_globals.append(WeightByteRange(
                 scale2.source.path, scale2.source.offset, scale2.source.size,
@@ -499,5 +661,6 @@ def aggregate_nvfp4_experts(
         scale_ranges=scale_ranges,
         group_size=16,
         num_groups=total_groups,
+        flags=WEIGHT_FLAG_NVFP4_Q8_PAIR,
         expert_interleave_count=len(experts),
     )
