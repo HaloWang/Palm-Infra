@@ -7,6 +7,10 @@
 
 class ThreadPool;
 
+void kernel_gdn_x86_avx2(const OpParams& params,
+                         const std::vector<const Tensor*>& inputs,
+                         std::vector<Tensor*>& outputs,
+                         ThreadPool* thread_pool);
 void kernel_gdn_x86_avx512(const OpParams& params,
                            const std::vector<const Tensor*>& inputs,
                            std::vector<Tensor*>& outputs,

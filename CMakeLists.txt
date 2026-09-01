@@ -54,7 +54,9 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         kernels/matmul_x86_avx2.cpp
         kernels/matmul_x86_avx512.cpp
         kernels/matmul_x86_vnni.cpp
+        kernels/gdn_x86_avx2.cpp
         kernels/gdn_x86_avx512.cpp
+        kernels/attention_x86_avx2.cpp
         kernels/attention_x86_avx512.cpp)
 else()
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
@@ -155,6 +157,10 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             PROPERTIES COMPILE_OPTIONS
                        "-mavx512f;-mavx512bw;-mavx512vl;-mavx512vnni;-mfma")
         set_source_files_properties(
+            kernels/gdn_x86_avx2.cpp
+            kernels/attention_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
+        set_source_files_properties(
             kernels/gdn_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
         set_source_files_properties(
@@ -164,6 +170,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         # Isolate SIMD TUs so the rest of the library stays on the baseline ISA.
         set_source_files_properties(
             kernels/matmul_x86_avx2.cpp
+            kernels/gdn_x86_avx2.cpp
+            kernels/attention_x86_avx2.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
         set_source_files_properties(
             kernels/matmul_x86_avx512.cpp

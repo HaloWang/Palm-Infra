@@ -1245,6 +1245,12 @@ void kernel_sdpa(const OpParams& params,
                     head_dim, v_head_dim, scale, mask_ptr);
                 continue;
             }
+            if (mollm::cpu::capabilities().x86_avx2) {
+                sdpa_x86_avx2_head(
+                    Q_head, K_head, V_head, O_head, src_seqlen, dst_seqlen,
+                    head_dim, v_head_dim, scale, mask_ptr);
+                continue;
+            }
 #endif
             naive_sdpa_head(Q_head, K_head, V_head, O_head,
                             src_seqlen, dst_seqlen, head_dim, v_head_dim,

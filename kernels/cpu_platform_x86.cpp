@@ -13,6 +13,10 @@
 #include <immintrin.h>
 #include <vector>
 
+#if defined(_MSC_VER) && !defined(__clang__)
+#include <intrin.h>
+#endif
+
 namespace mollm::cpu {
 
 namespace {
@@ -31,6 +35,63 @@ using Int4VnniFn = void (*)(const int8_t*, const float*, const int16_t*,
 using QuantizeVnniFn = void (*)(const float*, int8_t*, float*, int16_t*, int,
                                 int, int, int);
 
+struct X86Features {
+    bool avx2 = false;
+    bool fma = false;
+    bool f16c = false;
+    bool avx512f = false;
+    bool avx512bw = false;
+    bool avx512vl = false;
+    bool avx512vnni = false;
+};
+
+X86Features probe_x86_features() {
+    X86Features features;
+#if defined(__GNUC__) || defined(__clang__)
+    __builtin_cpu_init();
+    features.avx2 = __builtin_cpu_supports("avx2");
+    features.fma = __builtin_cpu_supports("fma");
+    features.f16c = __builtin_cpu_supports("f16c");
+    features.avx512f = __builtin_cpu_supports("avx512f");
+    features.avx512bw = __builtin_cpu_supports("avx512bw");
+    features.avx512vl = __builtin_cpu_supports("avx512vl");
+    features.avx512vnni = __builtin_cpu_supports("avx512vnni");
+#elif defined(_MSC_VER)
+    // MSVC has no __builtin_cpu_supports. Probe CPUID and XCR0 so the
+    // separately compiled AVX2/AVX-512 TUs are used only when the OS has
+    // actually enabled the corresponding state.
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    const int max_leaf = regs[0];
+    if (max_leaf < 1)
+        return features;
+    __cpuid(regs, 1);
+    const unsigned ecx = static_cast<unsigned>(regs[2]);
+    const bool osxsave = (ecx & (1u << 27)) != 0;
+    const bool cpu_avx = (ecx & (1u << 28)) != 0;
+    features.fma = (ecx & (1u << 12)) != 0;
+    features.f16c = (ecx & (1u << 29)) != 0;
+    if (!osxsave || !cpu_avx)
+        return features;
+    const unsigned long long xcr0 = _xgetbv(0);
+    if ((xcr0 & 0x6ull) != 0x6ull)
+        return features;
+    if (max_leaf < 7)
+        return features;
+    __cpuidex(regs, 7, 0);
+    const unsigned ebx = static_cast<unsigned>(regs[1]);
+    const unsigned ecx7 = static_cast<unsigned>(regs[2]);
+    features.avx2 = (ebx & (1u << 5)) != 0;
+    if ((xcr0 & 0xE6ull) == 0xE6ull) {
+        features.avx512f = (ebx & (1u << 16)) != 0;
+        features.avx512bw = (ebx & (1u << 30)) != 0;
+        features.avx512vl = (ebx & (1u << 31)) != 0;
+        features.avx512vnni = (ecx7 & (1u << 11)) != 0;
+    }
+#endif
+    return features;
+}
+
 struct X86Dispatch {
     Capabilities caps;
     const char* name = "x86-scalar";
@@ -44,15 +105,14 @@ struct X86Dispatch {
 
 X86Dispatch detect_dispatch() {
     X86Dispatch dispatch;
-#if defined(__GNUC__) || defined(__clang__)
-    __builtin_cpu_init();
-    const bool has_avx2 = __builtin_cpu_supports("avx2");
-    const bool has_fma = __builtin_cpu_supports("fma");
-    const bool has_f16c = __builtin_cpu_supports("f16c");
-    const bool has_avx512 = __builtin_cpu_supports("avx512f");
-    const bool has_avx512_bw = __builtin_cpu_supports("avx512bw");
-    const bool has_avx512_vl = __builtin_cpu_supports("avx512vl");
-    const bool has_avx512_vnni = __builtin_cpu_supports("avx512vnni");
+    const X86Features hw = probe_x86_features();
+    const bool has_avx2 = hw.avx2;
+    const bool has_fma = hw.fma;
+    const bool has_f16c = hw.f16c;
+    const bool has_avx512 = hw.avx512f;
+    const bool has_avx512_bw = hw.avx512bw;
+    const bool has_avx512_vl = hw.avx512vl;
+    const bool has_avx512_vnni = hw.avx512vnni;
 
     const char* requested = std::getenv("MOLLM_X86_ISA");
     const bool force_scalar =
@@ -97,7 +157,6 @@ X86Dispatch detect_dispatch() {
         dispatch.int4 = x86::matmul_int4_bg_avx2_range;
         dispatch.int8 = x86::matmul_int8_avx2_range;
     }
-#endif
     return dispatch;
 }
 

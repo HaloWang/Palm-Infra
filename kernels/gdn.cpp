@@ -190,6 +190,10 @@ void kernel_gdn_prefill(const OpParams& params,
         kernel_gdn_x86_avx512(params, inputs, outputs, thread_pool);
         return;
     }
+    if (mollm::cpu::capabilities().x86_avx2) {
+        kernel_gdn_x86_avx2(params, inputs, outputs, thread_pool);
+        return;
+    }
 #endif
     int num_heads   = graph_params::get_i32(params, 0, 16);
     int k_head_dim  = graph_params::get_i32(params, 1, 128);
