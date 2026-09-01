@@ -274,10 +274,21 @@ void kernel_gdn_decode(const OpParams& params,
                        ThreadPool* thread_pool) {
 #if HAS_NEON
     kernel_gdn_decode_neon(params, inputs, outputs, thread_pool);
-#else
-    // Fallback: reuse prefill scalar path
-    kernel_gdn_prefill(params, inputs, outputs, thread_pool);
+    return;
 #endif
+#if defined(MOLLM_CPU_X86_SIMD)
+    // seq=1 uses the same AVX2/AVX-512 recurrence as prefill; NEON is the
+    // only ISA with a decode-specialized kernel.
+    if (mollm::cpu::capabilities().x86_avx512) {
+        kernel_gdn_x86_avx512(params, inputs, outputs, thread_pool);
+        return;
+    }
+    if (mollm::cpu::capabilities().x86_avx2) {
+        kernel_gdn_x86_avx2(params, inputs, outputs, thread_pool);
+        return;
+    }
+#endif
+    kernel_gdn_prefill(params, inputs, outputs, thread_pool);
 }
 
 void kernel_gdn_conv_decode(const OpParams& params,
@@ -294,7 +305,8 @@ void kernel_gdn_conv_decode(const OpParams& params,
     const int qkv_total =
         2 * num_heads * k_dim + num_v_heads * v_dim;
 
-    std::vector<float> convolved((size_t)qkv_total);
+    thread_local std::vector<float> convolved;
+    convolved.resize((size_t)qkv_total);
     Tensor qkv_conv = Tensor::create(
         Precision::FP32, MemoryType::EXTERNAL, qkv_total, 1, 1, 1,
         convolved.data());

@@ -25,9 +25,9 @@ void kernel_shortconv(const OpParams& params,
     float* state_data = static_cast<float*>(inputs[2]->data);
     float* output_data = output.ptr<float>();
 
-#if HAS_NEON
-    // The decode path is common enough to avoid allocating the prefill
-    // staging buffer. Qwen3.5 uses a fixed four-element convolution.
+    // Decode is a 4-tap FIR + SiLU per channel. Keep it allocation-free on
+    // every ISA; the NEON gate used to force x86 through the prefill staging
+    // buffer on every GDN token.
     if (seq_len == 1 && kernel_size == 4) {
         constexpr int prefix_len = 3;
         auto process_decode = [&](int, int begin, int end) {
@@ -56,7 +56,6 @@ void kernel_shortconv(const OpParams& params,
         }
         return;
     }
-#endif
 
     const int n_real = graph_params::get_i32(params, 1, seq_len);
     const int prefix_len = kernel_size - 1;

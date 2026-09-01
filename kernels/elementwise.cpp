@@ -1,5 +1,10 @@
 #include "kernels/elementwise.h"
 #include "kernels/activations.h"
+#include "kernels/cpu_platform.h"
+
+#if defined(MOLLM_CPU_X86_SIMD)
+#include "kernels/x86_avx2_eltwise.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -420,6 +425,12 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
                         i2 * gate.stride[2] + i1 * gate.stride[1]);
                     float* op = dst + (size_t)row * D;
                     int i = 0;
+#if defined(MOLLM_CPU_X86_SIMD)
+                    if (mollm::cpu::capabilities().x86_avx2) {
+                        sigmoid_mul_row_x86_avx2(vp, gp, op, D);
+                        continue;
+                    }
+#endif
 #if HAS_NEON
                     for (; i + 3 < D; i += 4) {
                         const float32x4_t gv = vld1q_f32(gp + i);
@@ -552,6 +563,12 @@ void kernel_elementwise(OpType op, const std::vector<const Tensor*>& inputs,
                     const float* up = row + I;
                     float* out_row = dst + (size_t)flat_row * I;
                     int i = 0;
+#if defined(MOLLM_CPU_X86_SIMD)
+                    if (mollm::cpu::capabilities().x86_avx2) {
+                        swiglu_row_x86_avx2(gate, up, out_row, I);
+                        continue;
+                    }
+#endif
 #if HAS_NEON
                     for (; i + 3 < I; i += 4) {
                         const float32x4_t g = vld1q_f32(gate + i);

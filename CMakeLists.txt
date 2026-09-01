@@ -57,7 +57,8 @@ elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         kernels/gdn_x86_avx2.cpp
         kernels/gdn_x86_avx512.cpp
         kernels/attention_x86_avx2.cpp
-        kernels/attention_x86_avx512.cpp)
+        kernels/attention_x86_avx512.cpp
+        kernels/x86_avx2_eltwise.cpp)
 else()
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_scalar.cpp)
 endif()
@@ -159,6 +160,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         set_source_files_properties(
             kernels/gdn_x86_avx2.cpp
             kernels/attention_x86_avx2.cpp
+            kernels/x86_avx2_eltwise.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx2;-mfma")
         set_source_files_properties(
             kernels/gdn_x86_avx512.cpp
@@ -172,6 +174,7 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
             kernels/matmul_x86_avx2.cpp
             kernels/gdn_x86_avx2.cpp
             kernels/attention_x86_avx2.cpp
+            kernels/x86_avx2_eltwise.cpp
             PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
         set_source_files_properties(
             kernels/matmul_x86_avx512.cpp

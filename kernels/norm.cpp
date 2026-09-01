@@ -1,5 +1,10 @@
 #include "kernels/norm.h"
+#include "kernels/cpu_platform.h"
 #include "kernels/threading.h"
+
+#if defined(MOLLM_CPU_X86_SIMD)
+#include "kernels/x86_avx2_eltwise.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -113,6 +118,12 @@ void kernel_rms_norm(const Tensor& x, const Tensor& weight,
     const float* w_ptr = weight.ptr<float>();
     float*       o_ptr = out.ptr<float>();
 
+#if defined(MOLLM_CPU_X86_SIMD)
+    if (mollm::cpu::capabilities().x86_avx2) {
+        rms_norm_x86_avx2(x_ptr, w_ptr, o_ptr, D, N, eps, ldx, ldo);
+        return;
+    }
+#endif
 #if HAS_NEON
     rms_norm_neon(x_ptr, w_ptr, o_ptr, D, N, eps, ldx, ldo);
 #else
@@ -138,6 +149,13 @@ void kernel_add_rms_norm(Tensor& residual, const Tensor& update,
             float* r = residual_data + (size_t)n * ldr;
             const float* u = update_data + (size_t)n * ldu;
             float* o = out_data + (size_t)n * ldo;
+#if defined(MOLLM_CPU_X86_SIMD)
+            if (mollm::cpu::capabilities().x86_avx2) {
+                add_rms_norm_row_x86_avx2(
+                    r, u, o, weight_data, D, eps);
+                continue;
+            }
+#endif
             float sum_sq = 0.0f;
             int d = 0;
 #if HAS_NEON

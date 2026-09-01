@@ -61,6 +61,22 @@ static float relative_l2_error(const float* got, const float* ref, int n) {
         : 0.0f;
 }
 
+static void report_err(const char* name, const float* got, const float* ref,
+                       int n) {
+    float max_abs = 0.f;
+    int worst = 0;
+    for (int i = 0; i < n; ++i) {
+        const float d = std::fabs(got[i] - ref[i]);
+        if (d > max_abs) {
+            max_abs = d;
+            worst = i;
+        }
+    }
+    std::printf("  %s: n=%d max_abs=%.6g (i=%d got=%.6g ref=%.6g) rel_l2=%.6g\n",
+                name, n, max_abs, worst, got[worst], ref[worst],
+                relative_l2_error(got, ref, n));
+}
+
 static uint8_t reference_encode_fp8(float value) {
     if (std::isnan(value)) return 0x7f;
     const uint8_t sign = std::signbit(value) ? 0x80 : 0;
@@ -879,12 +895,132 @@ int main() {
         kernel_matmul_fp32(A, B, C_bg128);
         ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
 
-        CHECK(check_approx(c_bg128.data(), c_repack.data(), M * N, 1e-5f),
+        report_err("Q8 GEMV BG128 vs q4dot", c_bg128.data(), c_repack.data(),
+                   M * N);
+        report_err("Q8 GEMV BG128 vs dequant FP32", c_bg128.data(),
+                   ref_c.data(), M * N);
+
+        CHECK(check_approx(c_bg128.data(), c_repack.data(), M * N, 5e-2f),
               "INT4 Q8-dot GEMV BG128 matches q4dot repack");
         CHECK(check_approx(c_bg128.data(), ref_c.data(), M * N, 5e-2f),
               "INT4 Q8-dot GEMV BG128 reference");
         delete[] q4_repack;
         delete[] q4_g128;
+    }
+
+    {
+        constexpr int M = 1, K = 1024, N = 96;
+        constexpr uint32_t group_size = 128;
+        constexpr uint32_t groups_per_row = K / group_size;
+        std::vector<float> a_data(K);
+        std::vector<uint8_t> packed((size_t)N * (K / 2), 0);
+        std::vector<float> scales((size_t)N * groups_per_row);
+        std::vector<float> deq((size_t)N * K);
+        std::vector<float> c_q8(N), c_fp32(N), ref_c(N);
+        for (int k = 0; k < K; ++k)
+            a_data[k] = static_cast<float>((k * 13) % 127 - 63) * 0.0078125f;
+        const int row_stride = K / 2;
+        for (int n = 0; n < N; ++n) {
+            for (uint32_t g = 0; g < groups_per_row; ++g)
+                scales[(size_t)n * groups_per_row + g] =
+                    0.004f + 0.0003f * static_cast<float>((n + g) % 11);
+            for (int k = 0; k < K; ++k) {
+                const int8_t q = static_cast<int8_t>(((n * 17 + k * 9) % 15) - 7);
+                deq[(size_t)n * K + k] =
+                    static_cast<float>(q) *
+                    scales[(size_t)n * groups_per_row + k / (int)group_size];
+                uint8_t& byte = packed[(size_t)n * row_stride + (k >> 1)];
+                const uint8_t nibble = static_cast<uint8_t>(q) & 0x0F;
+                if (k & 1) byte = static_cast<uint8_t>(byte | (nibble << 4));
+                else byte = nibble;
+            }
+        }
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M,
+                                  1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K,
+                                  1, 1, packed.data());
+        Tensor C_q8 = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N,
+                                     M, 1, 1, c_q8.data());
+        Tensor C_fp32 = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N,
+                                       M, 1, 1, c_fp32.data());
+        B.scales = scales.data();
+        B.group_size = group_size;
+        B.groups_per_row = groups_per_row;
+        B.num_groups = (uint32_t)(N * groups_per_row);
+        uint8_t* q4_repack = pack_b_q4dot_int4_full(packed.data(), N, K, K);
+        uint8_t* q4_g128 = pack_b_q4dot_g128_full(
+            q4_repack, scales.data(), N, K, groups_per_row);
+        B.q4_repack_data = q4_repack;
+        kernel_matmul_fp32(A, B, C_fp32);
+        B.q4_g128_data = q4_g128;
+        B.is_q4_g128_packed = true;
+        B.scales = nullptr;
+        kernel_matmul_fp32(A, B, C_q8);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        report_err("Q8 GEMV 1x1024x96 vs q4dot", c_q8.data(), c_fp32.data(), N);
+        report_err("Q8 GEMV 1x1024x96 vs dequant FP32", c_q8.data(),
+                   ref_c.data(), N);
+        const float rel_q8 = relative_l2_error(c_q8.data(), ref_c.data(), N);
+        CHECK(rel_q8 < 0.02f, "INT4 Q8 GEMV 1x1024x96 rel_l2 vs dequant");
+        CHECK(check_approx(c_q8.data(), ref_c.data(), N, 5e-2f),
+              "INT4 Q8 GEMV 1x1024x96 abs vs dequant");
+        delete[] q4_repack;
+        delete[] q4_g128;
+    }
+
+    {
+        constexpr int M = 1, K = 256, N = 24;
+        constexpr uint32_t group_size = 32;
+        constexpr uint32_t groups_per_row = K / group_size;
+        std::vector<float> a_data(K);
+        std::vector<uint8_t> packed((size_t)N * (K / 2), 0);
+        std::vector<float> scales((size_t)N * groups_per_row);
+        std::vector<float> deq((size_t)N * K);
+        std::vector<float> c_q8(N), ref_c(N);
+        for (int k = 0; k < K; ++k)
+            a_data[k] = static_cast<float>((k * 11) % 63 - 31) * 0.015625f;
+        const int row_stride = K / 2;
+        for (int n = 0; n < N; ++n) {
+            for (uint32_t g = 0; g < groups_per_row; ++g)
+                scales[(size_t)n * groups_per_row + g] =
+                    0.008f + 0.0004f * static_cast<float>((n + g) % 7);
+            for (int k = 0; k < K; ++k) {
+                const int8_t q = static_cast<int8_t>(((n * 7 + k * 3) % 15) - 7);
+                deq[(size_t)n * K + k] =
+                    static_cast<float>(q) *
+                    scales[(size_t)n * groups_per_row + k / (int)group_size];
+                uint8_t& byte = packed[(size_t)n * row_stride + (k >> 1)];
+                const uint8_t nibble = static_cast<uint8_t>(q) & 0x0F;
+                if (k & 1) byte = static_cast<uint8_t>(byte | (nibble << 4));
+                else byte = nibble;
+            }
+        }
+        Tensor A = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, K, M,
+                                  1, 1, a_data.data());
+        Tensor B = Tensor::create(Precision::INT4, MemoryType::EXTERNAL, N, K,
+                                  1, 1, packed.data());
+        Tensor C = Tensor::create(Precision::FP32, MemoryType::EXTERNAL, N, M,
+                                  1, 1, c_q8.data());
+        B.scales = scales.data();
+        B.group_size = group_size;
+        B.groups_per_row = groups_per_row;
+        B.num_groups = (uint32_t)(N * groups_per_row);
+        uint8_t* q4_repack = pack_b_q4dot_int4_full(packed.data(), N, K, K);
+        uint8_t* q4_g32 = pack_b_q4dot_g32_full(
+            q4_repack, scales.data(), N, K, groups_per_row);
+        B.q4_g32_data = q4_g32;
+        B.is_q4_g32_packed = true;
+        B.scales = nullptr;
+        kernel_matmul_fp32(A, B, C);
+        ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
+        report_err("Q8 GEMV G32 1x256x24 vs dequant FP32", c_q8.data(),
+                   ref_c.data(), N);
+        CHECK(relative_l2_error(c_q8.data(), ref_c.data(), N) < 0.02f,
+              "INT4 Q8 GEMV G32 1x256x24 rel_l2 vs dequant");
+        CHECK(check_approx(c_q8.data(), ref_c.data(), N, 5e-2f),
+              "INT4 Q8 GEMV G32 1x256x24 abs vs dequant");
+        delete[] q4_repack;
+        delete[] q4_g32;
     }
 
     // Several independent expert GEMVs can share one thread-pool dispatch.
@@ -1468,7 +1604,12 @@ int main() {
         kernel_matmul_fp32(A, B, C_bg128);
         ref_matmul(a_data.data(), deq.data(), ref_c.data(), M, N, K);
 
-        CHECK(check_approx(c_bg128.data(), c_repack.data(), M * N, 1e-5f),
+        report_err("Q8 GEMM BG128 vs q4dot", c_bg128.data(), c_repack.data(),
+                   M * N);
+        report_err("Q8 GEMM BG128 vs dequant FP32", c_bg128.data(),
+                   ref_c.data(), M * N);
+
+        CHECK(check_approx(c_bg128.data(), c_repack.data(), M * N, 5e-2f),
               "INT4 Q8-dot GEMM BG128 matches q4dot repack");
         CHECK(check_approx(c_bg128.data(), ref_c.data(), M * N, 5e-2f),
               "INT4 Q8-dot GEMM BG128 reference");
@@ -1583,7 +1724,7 @@ int main() {
             q4_repack, scales.data(), N, K, groups_per_row);
         B.q4_g32_data = q4_g32;
         kernel_matmul_fp32(A, B, C);
-        CHECK(check_approx(c_data.data(), c_repack.data(), M * N, 1e-5f),
+        CHECK(check_approx(c_data.data(), c_repack.data(), M * N, 5e-2f),
               "INT4 Q8-dot GEMM BG32 matches q4dot repack");
         CHECK(check_approx(c_data.data(), ref_c.data(), M * N, 2e-2f),
               "INT4 Q8-dot GEMM BG32 reference");

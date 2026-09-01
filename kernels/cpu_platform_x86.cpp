@@ -8,6 +8,7 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <immintrin.h>
@@ -34,6 +35,10 @@ using Int4VnniFn = void (*)(const int8_t*, const float*, const int16_t*,
                             int, int, int);
 using QuantizeVnniFn = void (*)(const float*, int8_t*, float*, int16_t*, int,
                                 int, int, int);
+using QuantizeQ8Avx2Fn = void (*)(const float*, int8_t*, float*, int32_t*, int,
+                                  int);
+using Int4Q8GemvFn = void (*)(const int8_t*, const float*, const int32_t*,
+                              const Tensor&, Tensor&, int, int);
 
 struct X86Features {
     bool avx2 = false;
@@ -100,6 +105,8 @@ struct X86Dispatch {
     Int4Fn int4 = nullptr;
     Int4VnniFn int4_vnni = nullptr;
     QuantizeVnniFn quantize_vnni = nullptr;
+    QuantizeQ8Avx2Fn quantize_q8 = nullptr;
+    Int4Q8GemvFn int4_q8_gemv = nullptr;
     Int8Fn int8 = nullptr;
 };
 
@@ -143,6 +150,10 @@ X86Dispatch detect_dispatch() {
         if (dispatch.caps.x86_avx512_vnni)
             dispatch.quantize_vnni = x86::quantize_q8_vnni_range;
         dispatch.int8 = x86::matmul_int8_avx512_range;
+        if (has_avx2) {
+            dispatch.quantize_q8 = x86::quantize_q8_avx2;
+            dispatch.int4_q8_gemv = x86::matmul_int4_q8_bg_avx2_gemv;
+        }
         return dispatch;
     }
     if (!force_scalar && has_avx2 && has_fma) {
@@ -156,6 +167,8 @@ X86Dispatch detect_dispatch() {
             dispatch.fp16 = x86::matmul_fp16_avx2_range;
         dispatch.int4 = x86::matmul_int4_bg_avx2_range;
         dispatch.int8 = x86::matmul_int8_avx2_range;
+        dispatch.quantize_q8 = x86::quantize_q8_avx2;
+        dispatch.int4_q8_gemv = x86::matmul_int4_q8_bg_avx2_gemv;
     }
     return dispatch;
 }
@@ -245,6 +258,67 @@ bool matmul_int4_packed(const Tensor& A, const Tensor& B, Tensor& C, int lda,
         } else {
             int4_vnni(quantized_a, activation_scales, activation_sums,
                       vnni_data, B, C, K, ldc, 0, M, 0, N);
+        }
+        return true;
+    }
+
+    const auto quantize_q8 = dispatch().quantize_q8;
+    const auto int4_q8_gemv = dispatch().int4_q8_gemv;
+    const bool use_q8 =
+        quantize_q8 && int4_q8_gemv && (is_bg32 || is_bg128) &&
+        (K % static_cast<int>(B.group_size) == 0);
+    if (use_q8) {
+        struct Q8Scratch {
+            std::vector<int8_t> qA;
+            std::vector<float> scales;
+            std::vector<int32_t> sums;
+        };
+        thread_local Q8Scratch scratch;
+        const int q8_groups = K / static_cast<int>(B.group_size);
+        scratch.qA.resize(static_cast<size_t>(M) * K);
+        scratch.scales.resize(static_cast<size_t>(M) * q8_groups);
+        scratch.sums.resize(static_cast<size_t>(M) * q8_groups);
+        int8_t* const quantized_a = scratch.qA.data();
+        float* const activation_scales = scratch.scales.data();
+        int32_t* const activation_sums = scratch.sums.data();
+        const auto quant_begin = std::chrono::steady_clock::now();
+        for (int m = 0; m < M; ++m) {
+            quantize_q8(A.ptr<float>() + static_cast<size_t>(m) * lda,
+                        quantized_a + static_cast<size_t>(m) * K,
+                        activation_scales + static_cast<size_t>(m) * q8_groups,
+                        activation_sums + static_cast<size_t>(m) * q8_groups, K,
+                        static_cast<int>(B.group_size));
+        }
+        const auto quant_end = std::chrono::steady_clock::now();
+        matmul_record_q8_quant_a(
+            std::chrono::duration<double, std::milli>(
+                quant_end - quant_begin).count());
+        const int n_threads = thread_pool ? thread_pool->num_threads() : 1;
+        if (M == 1) {
+            if (n_threads > 1 && N >= 64) {
+                const int chunk = std::max(64, (N + n_threads - 1) / n_threads);
+                thread_pool->parallel_for(
+                    0, N, chunk, [&](int, int n_begin, int n_end) {
+                        int4_q8_gemv(quantized_a, activation_scales,
+                                     activation_sums, B, C, n_begin, n_end);
+                    });
+            } else {
+                int4_q8_gemv(quantized_a, activation_scales, activation_sums, B,
+                             C, 0, N);
+            }
+        } else if (n_threads > 1 && N >= 64) {
+            int chunk = std::max(64, (N + n_threads - 1) / n_threads);
+            chunk = (chunk + 7) & ~7;
+            thread_pool->parallel_for(
+                0, N, chunk, [&](int, int n_begin, int n_end) {
+                    x86::matmul_int4_q8_bg_avx2_gemm(
+                        quantized_a, activation_scales, activation_sums, B, C,
+                        M, K, ldc, n_begin, n_end);
+                });
+        } else {
+            x86::matmul_int4_q8_bg_avx2_gemm(
+                quantized_a, activation_scales, activation_sums, B, C, M, K,
+                ldc, 0, N);
         }
         return true;
     }
