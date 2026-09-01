@@ -1,4 +1,5 @@
 #include "engine/tokenizer.h"
+#include "tests/test_temp.h"
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -41,8 +42,8 @@ int main() {
     // Loading is transactional: successful reloads replace all prior state,
     // while a failed reload leaves the current tokenizer usable.
     {
-        const char* first_path = "/tmp/mollm_tokenizer_reload_first.json";
-        const char* second_path = "/tmp/mollm_tokenizer_reload_second.json";
+        const std::string first_path = test_temp_path("mollm_tokenizer_reload_first.json");
+        const std::string second_path = test_temp_path("mollm_tokenizer_reload_second.json");
         {
             std::ofstream f(first_path);
             f << R"({"model":{"vocab":{"a":0},"merges":[]},"added_tokens":[{"id":2,"content":"<old>"},{"id":3,"content":"<|im_end|>"}]})";
@@ -57,7 +58,7 @@ int main() {
         check_ids(tok.encode("<old>"), {2}, "first HF added token encodes");
         CHECK(tok.eos_id() == 3, "first HF tokenizer sets eos");
 
-        CHECK(!tok.load("/tmp/mollm_tokenizer_missing.json"),
+        CHECK(!tok.load(test_temp_path("mollm_tokenizer_missing.json")),
               "failed tokenizer reload is reported");
         check_ids(tok.encode("<old>"), {2},
                   "failed reload preserves tokenizer state");
@@ -69,8 +70,8 @@ int main() {
         CHECK(tok.eos_id() == 128001,
               "successful reload resets special-token defaults");
 
-        std::remove(first_path);
-        std::remove(second_path);
+        std::remove(first_path.c_str());
+        std::remove(second_path.c_str());
         ran_any = true;
     }
 
@@ -78,7 +79,7 @@ int main() {
     // three before their main split regex. BPE merges must not cross those
     // chunk boundaries: "28448" is "284" + "48", not five digits.
     {
-        const char* path = "/tmp/mollm_digit_triples_tokenizer_test.json";
+        const std::string path = test_temp_path("mollm_digit_triples_tokenizer_test.json");
         {
             std::ofstream f(path);
             f << R"({
@@ -115,13 +116,13 @@ int main() {
         CHECK(tok.load(path), "digit-triples HF tokenizer loads");
         check_ids(tok.encode("28448"), {4, 5},
                   "digit triples preserve isolated BPE boundaries");
-        std::remove(path);
+        std::remove(path.c_str());
         ran_any = true;
     }
 
     // DeepSeek-V4 uses full-width-bar special tokens and an explicit BOS.
     {
-        const char* path = "/tmp/mollm_deepseek_v4_tokenizer_test.json";
+        const std::string path = test_temp_path("mollm_deepseek_v4_tokenizer_test.json");
         {
             std::ofstream f(path);
             f << R"({"model":{"vocab":{"a":0,"b":3,"c":4},"merges":[]},"added_tokens":[)"
@@ -145,7 +146,7 @@ int main() {
             }),
             {2, 10, 0, 11, 12, 3, 1, 10, 4, 11, 12},
             "DeepSeek-V4 multi-turn chat preserves assistant prefix");
-        std::remove(path);
+        std::remove(path.c_str());
         ran_any = true;
     }
 
@@ -153,7 +154,7 @@ int main() {
     // content by a full-width `im middle` token. This is distinct from the
     // otherwise similar DeepSeek-V4 marker set.
     {
-        const char* path = "/tmp/mollm_role_middle_tokenizer_test.json";
+        const std::string path = test_temp_path("mollm_role_middle_tokenizer_test.json");
         {
             std::ofstream f(path);
             f << R"({
@@ -211,7 +212,7 @@ int main() {
              21, 28, 24, 0, 25,
              22, 29, 24, 26, 31},
             "role-middle multi-turn chat template");
-        std::remove(path);
+        std::remove(path.c_str());
         ran_any = true;
     }
 
@@ -219,14 +220,14 @@ int main() {
     // ChatML vocabulary but differ in whether generation starts with thinking
     // tags.
     {
-        const char* tokenizer_path =
-            "/tmp/mollm_chatml_style_tokenizer_test.json";
-        const char* plain_path =
-            "/tmp/mollm_chatml_plain_template_test.jinja";
-        const char* optional_disable_path =
-            "/tmp/mollm_chatml_optional_disable_template_test.jinja";
-        const char* thinking_path =
-            "/tmp/mollm_chatml_thinking_template_test.jinja";
+        const std::string tokenizer_path =
+            test_temp_path("mollm_chatml_style_tokenizer_test.json");
+        const std::string plain_path =
+            test_temp_path("mollm_chatml_plain_template_test.jinja");
+        const std::string optional_disable_path =
+            test_temp_path("mollm_chatml_optional_disable_template_test.jinja");
+        const std::string thinking_path =
+            test_temp_path("mollm_chatml_thinking_template_test.jinja");
         {
             std::ofstream f(tokenizer_path);
             f << R"({
@@ -278,20 +279,20 @@ int main() {
                    12, 3, 3, 13, 3, 3},
                   "thinking ChatML adds empty thinking block");
 
-        std::remove(tokenizer_path);
-        std::remove(plain_path);
-        std::remove(optional_disable_path);
-        std::remove(thinking_path);
+        std::remove(tokenizer_path.c_str());
+        std::remove(plain_path.c_str());
+        std::remove(optional_disable_path.c_str());
+        std::remove(thinking_path.c_str());
         ran_any = true;
     }
 
     // A role-token template is not equivalent to Llama-3's header template,
     // even when both tokenizers use the same BOS token.
     {
-        const char* tokenizer_path =
-            "/tmp/mollm_role_tokens_tokenizer_test.json";
-        const char* template_path =
-            "/tmp/mollm_role_tokens_template_test.jinja";
+        const std::string tokenizer_path =
+            test_temp_path("mollm_role_tokens_tokenizer_test.json");
+        const std::string template_path =
+            test_temp_path("mollm_role_tokens_template_test.jinja");
         {
             std::ofstream f(tokenizer_path);
             f << R"({
@@ -316,18 +317,18 @@ int main() {
         check_ids(tok.apply_chat("a"), {20, 21, 0, 22},
                   "role-token chat does not use Llama headers");
 
-        std::remove(tokenizer_path);
-        std::remove(template_path);
+        std::remove(tokenizer_path.c_str());
+        std::remove(template_path.c_str());
         ran_any = true;
     }
 
     // HY-V3 uses distinct Hunyuan role tokens and injects its default
     // no-thinking mode into the system prefix.
     {
-        const char* tokenizer_path =
-            "/tmp/mollm_hyv3_tokenizer_test.json";
-        const char* template_path =
-            "/tmp/mollm_hyv3_template_test.jinja";
+        const std::string tokenizer_path =
+            test_temp_path("mollm_hyv3_tokenizer_test.json");
+        const std::string template_path =
+            test_temp_path("mollm_hyv3_template_test.jinja");
         {
             std::ofstream f(tokenizer_path);
             f << R"({
@@ -370,18 +371,18 @@ int main() {
                    21, 0, 22, 24, 25},
                   "HY-V3 multi-turn template");
 
-        std::remove(tokenizer_path);
-        std::remove(template_path);
+        std::remove(tokenizer_path.c_str());
+        std::remove(template_path.c_str());
         ran_any = true;
     }
 
     // The public Hy3 checkpoint namespaces its HY-V3 control tokens with
     // `:opensource` while keeping the same template semantics.
     {
-        const char* tokenizer_path =
-            "/tmp/mollm_hy3_opensource_tokenizer_test.json";
-        const char* template_path =
-            "/tmp/mollm_hy3_opensource_template_test.jinja";
+        const std::string tokenizer_path =
+            test_temp_path("mollm_hy3_opensource_tokenizer_test.json");
+        const std::string template_path =
+            test_temp_path("mollm_hy3_opensource_template_test.jinja");
         {
             std::ofstream f(tokenizer_path);
             f << R"({
@@ -415,8 +416,8 @@ int main() {
                   {20, 26, 27, 21, 0, 22, 24, 25},
                   "Hy3 opensource no-think template");
 
-        std::remove(tokenizer_path);
-        std::remove(template_path);
+        std::remove(tokenizer_path.c_str());
+        std::remove(template_path.c_str());
         ran_any = true;
     }
 
@@ -424,7 +425,7 @@ int main() {
     // `id python-bytes-literal byte_length` format. This is deliberately a
     // tiny fixture; the production vocabulary has the same syntax.
     {
-        const char* path = "/tmp/mollm_rwkv_vocab_test.txt";
+        const std::string path = test_temp_path("mollm_rwkv_vocab_test.txt");
         {
             std::ofstream f(path);
             f << "0 b'<EOD>' 5\n";
@@ -446,14 +447,14 @@ int main() {
               "RWKV legacy chat template");
         CHECK(tok.stop_sequences() == std::vector<std::string>({"\n\n"}),
               "RWKV legacy text stop sequence");
-        std::remove(path);
+        std::remove(path.c_str());
         ran_any = true;
     }
 
     // A damaged Python literal ending in a bare backslash used to advance the
     // parser past the string before dereferencing it.
     {
-        const char* path = "/tmp/mollm_rwkv_vocab_trailing_slash.txt";
+        const std::string path = test_temp_path("mollm_rwkv_vocab_trailing_slash.txt");
         {
             std::ofstream f(path);
             f << "0 b'abc\\ 4\n";
@@ -464,7 +465,7 @@ int main() {
                   "RWKV trailing slash is preserved");
         CHECK(tok.decode(std::vector<int>{0}) == "abc\\",
               "RWKV trailing-slash literal decodes safely");
-        std::remove(path);
+        std::remove(path.c_str());
         ran_any = true;
     }
 

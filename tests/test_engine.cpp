@@ -1,6 +1,7 @@
 #include "engine/engine.h"
 #include "engine/input_prep.h"
 #include "engine/vision.h"
+#include "tests/test_temp.h"
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -180,8 +181,8 @@ int main() {
             0x71,0xfd,0x61,0x00,0x00,0x00,0x00,0x49,0x45,0x4e,0x44,0xae,
             0x42,0x60,0x82,
         };
-        const char* path = "/tmp/mollm_transparent_rgb.png";
-        FILE* file = std::fopen(path, "wb");
+        const std::string path = test_temp_path("mollm_transparent_rgb.png");
+        FILE* file = std::fopen(path.c_str(), "wb");
         bool wrote =
             file && std::fwrite(png, 1, sizeof(png), file) == sizeof(png);
         if (file) wrote = std::fclose(file) == 0 && wrote;
@@ -191,7 +192,7 @@ int main() {
         int width = 0;
         int height = 0;
         CHECK(mollm::detail::decode_image_file_rgba(
-                  path, rgba, width, height),
+                  path.c_str(), rgba, width, height),
               "decode transparent PNG fixture");
         CHECK(width == 64 && height == 64 && rgba.size() == 64 * 64 * 4,
               "transparent PNG dimensions are preserved");
@@ -199,7 +200,7 @@ int main() {
                   rgba[0] == 255 && rgba[1] == 0 &&
                   rgba[2] == 0 && rgba[3] == 0,
               "transparent pixel keeps its hidden red RGB value");
-        std::remove(path);
+        std::remove(path.c_str());
     }
 #endif
 
@@ -207,7 +208,7 @@ int main() {
     {
         LLMEngine e;
         EngineConfig cfg;
-        cfg.package_path = "/tmp/nonexistent.mollm";
+        cfg.package_path = test_temp_path("nonexistent.mollm");
         CHECK(!e.load(cfg), "load fails on missing package");
         CHECK(e.config().package_path.empty(),
               "failed load rolls engine config back to empty state");
@@ -229,14 +230,14 @@ int main() {
 
     // ---- package header validation ----
     {
-        const char* wrong_version = "/tmp/mollm_wrong_version.mollm";
-        const char* overlap = "/tmp/mollm_overlap.mollm";
-        const char* vision_overlap = "/tmp/mollm_vision_overlap.mollm";
-        CHECK(write_package_header(wrong_version, 99, false),
+        const std::string wrong_version = test_temp_path("mollm_wrong_version.mollm");
+        const std::string overlap = test_temp_path("mollm_overlap.mollm");
+        const std::string vision_overlap = test_temp_path("mollm_vision_overlap.mollm");
+        CHECK(write_package_header(wrong_version.c_str(), 99, false),
               "write wrong-version package");
-        CHECK(write_package_header(overlap, 1, true),
+        CHECK(write_package_header(overlap.c_str(), 1, true),
               "write overlapping-section package");
-        CHECK(write_package_header(vision_overlap, 1, false, true),
+        CHECK(write_package_header(vision_overlap.c_str(), 1, false, true),
               "write overlapping vision-section package");
 
         EngineConfig cfg;
@@ -252,9 +253,9 @@ int main() {
         cfg.package_path = vision_overlap;
         CHECK(!vision_overlap_engine.load(cfg),
               "reject overlapping optional vision graph");
-        std::remove(wrong_version);
-        std::remove(overlap);
-        std::remove(vision_overlap);
+        std::remove(wrong_version.c_str());
+        std::remove(overlap.c_str());
+        std::remove(vision_overlap.c_str());
     }
 
     if (failures == 0) {

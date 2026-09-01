@@ -3,6 +3,7 @@
 #include "kernels/moe.h"
 #include "kernels/moe_ssd.h"
 #include "kernels/tensor.h"
+#include "tests/test_temp.h"
 
 #include <algorithm>
 #include <cmath>
@@ -274,7 +275,7 @@ int main() {
     // The SSD route must be numerically identical to the ordinary aggregate
     // expert path. Write the same FP16 expert slices to a temporary package
     // stand-in, then leave the aggregate Tensor pointers intentionally null.
-    const char* ssd_path = "/tmp/mollm_test_moe_ssd_e2e.bin";
+    const std::string ssd_path = test_temp_path("mollm_test_moe_ssd_e2e.bin");
     {
         std::ofstream file(ssd_path, std::ios::binary);
         file.write(reinterpret_cast<const char*>(experts_gate_up_h.data()),
@@ -319,7 +320,7 @@ int main() {
     };
     kernel_qwen3_moe(inputs_ssd, out_ssd_t, nullptr, H, E, KTOP, I, SI);
     CHECK(close_enough(out_ssd, ref_h, 2e-2f), "MoE SSD expert paging matches FP16 reference");
-    std::remove(ssd_path);
+    std::remove(ssd_path.c_str());
 
     // Exercise graph dispatch/allocation path.
     Graph g;

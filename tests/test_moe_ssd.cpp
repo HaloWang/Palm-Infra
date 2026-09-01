@@ -1,6 +1,7 @@
 #include "graph/mmap_file.h"
 #include "kernels/matmul.h"
 #include "kernels/moe_ssd.h"
+#include "tests/test_temp.h"
 
 #include <chrono>
 #include <cstdio>
@@ -52,7 +53,7 @@ MoeSsdTensorSpec spec(const char* name, uint64_t offset) {
 } // namespace
 
 int main() {
-    const std::string path = "/tmp/mollm_test_moe_ssd.bin";
+    const std::string path = test_temp_path("mollm_test_moe_ssd.bin");
     // Three gate expert slices, then three down slices. The values are raw
     // fp16 bit patterns; the cache must preserve their byte ordering exactly.
     const uint16_t contents[] = {
@@ -89,7 +90,7 @@ int main() {
     // Direct BG128 blocks carry their own scales. The SSD cache should accept
     // a source without a duplicate scale sidecar and expose a tensor that
     // dispatches through the embedded-scale kernels.
-    const std::string bg128_path = "/tmp/mollm_test_moe_ssd_bg128.bin";
+    const std::string bg128_path = test_temp_path("mollm_test_moe_ssd_bg128.bin");
     {
         constexpr size_t block_bytes = 544;
         std::vector<uint8_t> bg128_contents(2 * block_bytes);
@@ -146,7 +147,7 @@ int main() {
     // Native MXFP4 experts keep one raw E8M0 byte per 32-value block.
     {
         const std::string mxfp4_path =
-            "/tmp/mollm_test_moe_ssd_mxfp4.bin";
+            test_temp_path("mollm_test_moe_ssd_mxfp4.bin");
         std::vector<uint8_t> bytes(34, 0x22); // E2M1 value 1 in both nibbles
         bytes[32] = 127; // gate scale = 1
         bytes[33] = 127; // down scale = 1
@@ -217,7 +218,7 @@ int main() {
             scales.data() + rows * (cols / 16));
         for (int row = 0; row < rows; ++row) row_scales[row] = 1.0f;
         const std::string nvfp4_path =
-            "/tmp/mollm_test_moe_ssd_nvfp4_pair.bin";
+            test_temp_path("mollm_test_moe_ssd_nvfp4_pair.bin");
         {
             std::ofstream out(nvfp4_path, std::ios::binary);
             out.write(reinterpret_cast<const char*>(pair_packed.data()),
@@ -306,7 +307,7 @@ int main() {
     // than treating the intervening sidecar bytes as matrix data.
     {
         const std::string interleaved_path =
-            "/tmp/mollm_test_moe_ssd_interleaved.bin";
+            test_temp_path("mollm_test_moe_ssd_interleaved.bin");
         std::vector<uint16_t> interleaved(24, 0xffff);
         for (int expert = 0; expert < 3; ++expert) {
             interleaved[expert * 4] =

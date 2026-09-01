@@ -93,9 +93,15 @@ jobs:
             throw "expected AMD64 runner"
           }
       - name: Install E2E fixture dependency
-        run: python -m pip install --disable-pip-version-check numpy
+        shell: cmd
+        run: |
+          python -m pip install --disable-pip-version-check numpy
+          python -c "import numpy, sys; print(sys.executable)"
+          for /f "delims=" %%P in ('python -c "import sys; print(sys.executable)"') do echo PYTHON_EXE=%%P>> "%GITHUB_ENV%"
       - name: Verify E2E fixture dependency
-        run: python -c "import numpy"
+        shell: cmd
+        run: |
+          "%PYTHON_EXE%" -c "import numpy; print(numpy.__version__)"
       - name: Enable MSVC
         shell: cmd
         run: |
@@ -106,7 +112,7 @@ jobs:
         shell: cmd
         run: |
           call "%VCVARS%"
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl -DMOLLM_BUILD_TESTS=ON -DMOLLM_BUILD_EXAMPLE=OFF -DPython3_EXECUTABLE="${{ steps.python.outputs.python-path }}"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl -DMOLLM_BUILD_TESTS=ON -DMOLLM_BUILD_EXAMPLE=OFF -DPython3_EXECUTABLE="%PYTHON_EXE%"
       - name: Build
         shell: cmd
         run: |
@@ -114,9 +120,24 @@ jobs:
           cmake --build build -j 2
       - name: Test
         shell: cmd
+        env:
+          PYTHONUTF8: "1"
         run: |
           call "%VCVARS%"
           ctest --test-dir build --output-on-failure
+      - name: Show failed tests
+        if: failure()
+        shell: cmd
+        run: |
+          if exist build\Testing\Temporary\LastTestsFailed.log type build\Testing\Temporary\LastTestsFailed.log
+      - name: Upload CTest logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-ctest-log
+          path: |
+            build/Testing/Temporary/LastTestsFailed.log
+            build/Testing/Temporary/LastTest.log
 
   x86-sanitizers:
     name: Linux x86_64 (ASan + UBSan)

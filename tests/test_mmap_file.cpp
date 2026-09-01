@@ -1,5 +1,6 @@
 #include "graph/mmap_file.h"
 #include "kernels/tensor.h"
+#include "tests/test_temp.h"
 #include <cstdio>
 #include <cstring>
 #include <limits>
@@ -48,6 +49,13 @@ static bool write_header_only(const char* path,
 }
 
 int main() {
+    const std::string p_mmap = test_temp_path("test_mmap.bin");
+    const std::string p_overflow = test_temp_path("test_mmap_overflow.bin");
+    const std::string p_bad_ndim = test_temp_path("test_mmap_bad_ndim.bin");
+    const std::string p_mmap2 = test_temp_path("test_mmap2.bin");
+    const std::string p_bad = test_temp_path("test_mmap_bad.bin");
+    const std::string p_move = test_temp_path("test_mmap_move.bin");
+
     // ---- Header size ----
     CHECK(sizeof(MappedFile::Header) == 88, "Header is 88 bytes");
 
@@ -106,11 +114,11 @@ int main() {
         hdr.shape[2]  = 1;
         hdr.shape[3]  = 1;
 
-        CHECK(write_test_file("/tmp/test_mmap.bin", hdr, data, sizeof(data)),
+        CHECK(write_test_file(p_mmap.c_str(), hdr, data, sizeof(data)),
               "write test file");
 
         MappedFile mf;
-        CHECK(mf.open("/tmp/test_mmap.bin"), "open test file");
+        CHECK(mf.open(p_mmap.c_str()), "open test file");
         CHECK(mf.is_open(), "is_open after open");
         CHECK(mf.header().magic == MappedFile::MAGIC, "magic matches");
         CHECK(mf.header().shape[0] == 4, "shape[0]");
@@ -140,11 +148,11 @@ int main() {
         hdr.shape[0] = 1;
         hdr.data_offset = std::numeric_limits<uint64_t>::max() - 3;
         hdr.data_size = 8;
-        CHECK(write_header_only("/tmp/test_mmap_overflow.bin", hdr),
+        CHECK(write_header_only(p_overflow.c_str(), hdr),
               "write overflowed range file");
 
         MappedFile mf;
-        CHECK(!mf.open("/tmp/test_mmap_overflow.bin"),
+        CHECK(!mf.open(p_overflow.c_str()),
               "reject overflowed data range");
         CHECK(!mf.is_open() && mf.data() == nullptr,
               "failed open leaves no mapped data");
@@ -152,9 +160,9 @@ int main() {
         hdr.data_offset = 0;
         hdr.data_size = 0;
         hdr.ndim = 0;
-        CHECK(write_header_only("/tmp/test_mmap_bad_ndim.bin", hdr),
+        CHECK(write_header_only(p_bad_ndim.c_str(), hdr),
               "write invalid ndim file");
-        CHECK(!mf.open("/tmp/test_mmap_bad_ndim.bin"),
+        CHECK(!mf.open(p_bad_ndim.c_str()),
               "reject invalid dimension count");
     }
 
@@ -174,12 +182,12 @@ int main() {
         hdr.group_size  = 32;
         hdr.num_groups  = 1;
 
-        CHECK(write_test_file("/tmp/test_mmap2.bin", hdr, data, sizeof(data),
+        CHECK(write_test_file(p_mmap2.c_str(), hdr, data, sizeof(data),
                               scales, sizeof(scales)),
               "write file with scales");
 
         MappedFile mf;
-        CHECK(mf.open("/tmp/test_mmap2.bin"), "open file with scales");
+        CHECK(mf.open(p_mmap2.c_str()), "open file with scales");
         CHECK(mf.data_size() == sizeof(data), "data_size with scales");
         CHECK(mf.scales_size() == sizeof(scales), "scales_size");
         CHECK(mf.scales() != nullptr, "scales not null");
@@ -197,11 +205,11 @@ int main() {
     {
         MappedFile::Header hdr = {};
         hdr.magic = 0xDEADBEEF;
-        CHECK(write_test_file("/tmp/test_mmap_bad.bin", hdr, nullptr, 0),
+        CHECK(write_test_file(p_bad.c_str(), hdr, nullptr, 0),
               "write bad magic file");
 
         MappedFile mf;
-        CHECK(!mf.open("/tmp/test_mmap_bad.bin"), "reject bad magic");
+        CHECK(!mf.open(p_bad.c_str()), "reject bad magic");
     }
 
     // ---- move semantics ----
@@ -215,11 +223,11 @@ int main() {
         hdr.shape[1]  = 1;
         hdr.shape[2]  = 1;
         hdr.shape[3]  = 1;
-        CHECK(write_test_file("/tmp/test_mmap_move.bin", hdr, data, sizeof(data)),
+        CHECK(write_test_file(p_move.c_str(), hdr, data, sizeof(data)),
               "write move test file");
 
         MappedFile mf;
-        CHECK(mf.open("/tmp/test_mmap_move.bin"), "open for move");
+        CHECK(mf.open(p_move.c_str()), "open for move");
         CHECK(mf.is_open(), "src is_open");
 
         MappedFile mf2 = std::move(mf);
@@ -232,12 +240,12 @@ int main() {
     }
 
     // cleanup
-    remove("/tmp/test_mmap.bin");
-    remove("/tmp/test_mmap2.bin");
-    remove("/tmp/test_mmap_bad.bin");
-    remove("/tmp/test_mmap_move.bin");
-    remove("/tmp/test_mmap_overflow.bin");
-    remove("/tmp/test_mmap_bad_ndim.bin");
+    remove(p_mmap.c_str());
+    remove(p_mmap2.c_str());
+    remove(p_bad.c_str());
+    remove(p_move.c_str());
+    remove(p_overflow.c_str());
+    remove(p_bad_ndim.c_str());
 
     if (failures == 0) {
         printf("\nAll mmap_file tests passed!\n");

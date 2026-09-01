@@ -1,11 +1,12 @@
 #include "kernels/trace.h"
+#include "tests/test_temp.h"
 
 #include <cstdio>
 #include <fstream>
 #include <string>
 
 int main() {
-    const std::string path = "/tmp/mollm_test_trace.json";
+    const std::string path = test_temp_path("mollm_test_trace.json");
     mollm_trace::start(path);
     mollm_trace::set_thread_name("trace-test-main");
     mollm_trace::record_duration("unit", "complete_event", 1, 3,

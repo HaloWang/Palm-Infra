@@ -120,7 +120,7 @@ def main():
 
     mod_name, func_name = SUPPORTED_MODELS[model_type]
 
-    print(f"Detected model_type='{model_type}' → {mod_name}.{func_name}()")
+    print(f"Detected model_type='{model_type}' -> {mod_name}.{func_name}()")
     print(f"  model_dir:       {model_dir}")
     print(f"  output:          {output_path}")
     print(f"  prefill_chunk:   {prefill_seq_len} (internal)")

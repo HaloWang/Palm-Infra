@@ -1,4 +1,5 @@
 #include "graph/graph.h"
+#include "tests/test_temp.h"
 #include <cstdio>
 #include <cstring>
 
@@ -41,6 +42,14 @@ static bool patch_u32(const char* path, long offset, uint32_t value) {
 }
 
 int main() {
+    const std::string p_graph = test_temp_path("test_graph.gllm");
+    const std::string p_empty = test_temp_path("test_graph_empty.gllm");
+    const std::string p_strs = test_temp_path("test_graph_strs.gllm");
+    const std::string p_truncated = test_temp_path("test_graph_truncated.gllm");
+    const std::string p_huge = test_temp_path("test_graph_huge_count.gllm");
+    const std::string p_bad_ref = test_temp_path("test_graph_bad_ref.gllm");
+    const std::string p_invalid = test_temp_path("test_graph_invalid.gllm");
+
     // ---- build a test graph ----
     Graph g;
 
@@ -91,11 +100,11 @@ int main() {
     CHECK(g.nodes.size() == 4, "4 nodes in test graph");
 
     // ---- save ----
-    CHECK(graph_save(g, "/tmp/test_graph.gllm"), "save graph");
+    CHECK(graph_save(g, p_graph.c_str()), "save graph");
 
     // ---- load ----
     Graph g2;
-    CHECK(graph_load(g2, "/tmp/test_graph.gllm"), "load graph");
+    CHECK(graph_load(g2, p_graph.c_str()), "load graph");
     CHECK(g2.nodes.size() == 4, "loaded 4 nodes");
     CHECK(g2.graph_inputs.size() == 1, "1 graph input");
     CHECK(g2.graph_outputs.size() == 1, "1 graph output");
@@ -135,9 +144,9 @@ int main() {
 
     // ---- empty graph round-trip ----
     Graph g3;
-    CHECK(graph_save(g3, "/tmp/test_graph_empty.gllm"), "save empty graph");
+    CHECK(graph_save(g3, p_empty.c_str()), "save empty graph");
     Graph g4;
-    CHECK(graph_load(g4, "/tmp/test_graph_empty.gllm"), "load empty graph");
+    CHECK(graph_load(g4, p_empty.c_str()), "load empty graph");
     CHECK(g4.nodes.empty(), "empty graph loaded");
 
     // ---- edge case: params with strings only ----
@@ -149,34 +158,33 @@ int main() {
     g5.nodes.push_back(n);
     g5.graph_inputs = {0};
     g5.graph_outputs = {0};
-    CHECK(graph_save(g5, "/tmp/test_graph_strs.gllm"), "save str-only graph");
+    CHECK(graph_save(g5, p_strs.c_str()), "save str-only graph");
     Graph g6;
-    CHECK(graph_load(g6, "/tmp/test_graph_strs.gllm"), "load str-only graph");
+    CHECK(graph_load(g6, p_strs.c_str()), "load str-only graph");
     CHECK(g6.nodes[0].params.str.size() == 2, "2 str params loaded");
     CHECK(g6.nodes[0].params.str[0] == "path/to/weights.bin", "str[0] matches");
     CHECK(g6.nodes[0].params.str[1] == "another/path.bin", "str[1] matches");
 
     // ---- malformed input is rejected transactionally ----
-    CHECK(copy_file_without_last_byte("/tmp/test_graph.gllm",
-                                      "/tmp/test_graph_truncated.gllm"),
+    CHECK(copy_file_without_last_byte(p_graph.c_str(), p_truncated.c_str()),
           "write truncated graph");
-    CHECK(!graph_load(g2, "/tmp/test_graph_truncated.gllm"),
+    CHECK(!graph_load(g2, p_truncated.c_str()),
           "reject truncated graph");
     CHECK(g2.nodes.size() == 4 && g2.graph_outputs[0] == 3,
           "failed load preserves destination graph");
 
-    CHECK(graph_save(g, "/tmp/test_graph_huge_count.gllm"),
+    CHECK(graph_save(g, p_huge.c_str()),
           "save graph for count corruption");
-    CHECK(patch_u32("/tmp/test_graph_huge_count.gllm", 12, UINT32_MAX),
+    CHECK(patch_u32(p_huge.c_str(), 12, UINT32_MAX),
           "corrupt metadata count");
-    CHECK(!graph_load(g2, "/tmp/test_graph_huge_count.gllm"),
+    CHECK(!graph_load(g2, p_huge.c_str()),
           "reject impossible collection count");
 
-    CHECK(graph_save(g, "/tmp/test_graph_bad_ref.gllm"),
+    CHECK(graph_save(g, p_bad_ref.c_str()),
           "save graph for reference corruption");
-    CHECK(patch_u32("/tmp/test_graph_bad_ref.gllm", 28, 99),
+    CHECK(patch_u32(p_bad_ref.c_str(), 28, 99),
           "corrupt graph output id");
-    CHECK(!graph_load(g2, "/tmp/test_graph_bad_ref.gllm"),
+    CHECK(!graph_load(g2, p_bad_ref.c_str()),
           "reject out-of-range graph output");
 
     Graph invalid;
@@ -185,17 +193,17 @@ int main() {
     self_referencing.inputs = {0};
     invalid.nodes.push_back(self_referencing);
     invalid.graph_outputs = {0};
-    CHECK(!graph_save(invalid, "/tmp/test_graph_invalid.gllm"),
+    CHECK(!graph_save(invalid, p_invalid.c_str()),
           "reject non-topological graph on save");
 
     // cleanup
-    remove("/tmp/test_graph.gllm");
-    remove("/tmp/test_graph_empty.gllm");
-    remove("/tmp/test_graph_strs.gllm");
-    remove("/tmp/test_graph_truncated.gllm");
-    remove("/tmp/test_graph_huge_count.gllm");
-    remove("/tmp/test_graph_bad_ref.gllm");
-    remove("/tmp/test_graph_invalid.gllm");
+    remove(p_graph.c_str());
+    remove(p_empty.c_str());
+    remove(p_strs.c_str());
+    remove(p_truncated.c_str());
+    remove(p_huge.c_str());
+    remove(p_bad_ref.c_str());
+    remove(p_invalid.c_str());
 
     if (failures == 0) {
         printf("\nAll io tests passed!\n");
