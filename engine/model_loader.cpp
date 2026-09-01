@@ -24,8 +24,7 @@
 #include <unordered_set>
 #include <vector>
 
-#include <sys/mman.h>
-#include <unistd.h>
+#include "graph/posix_io.h"
 
 namespace {
 
@@ -135,7 +134,7 @@ void LLMEngine::clear_model_state() {
     mtp_stats_ = MtpStats{};
 
     for (const auto& range : locked_dense_ranges_) {
-        munlock(range.first, range.second);
+        mollm::io::munlock(range.first, range.second);
     }
     locked_dense_ranges_.clear();
 
@@ -149,7 +148,7 @@ void LLMEngine::clear_model_state() {
     mmap_weight_exclusion_ranges_.clear();
 
     if (package_mmap_) {
-        munmap(package_mmap_, package_mmap_size_);
+        mollm::io::munmap(package_mmap_, package_mmap_size_);
     }
     package_mmap_ = nullptr;
     package_mmap_size_ = 0;
@@ -182,7 +181,7 @@ size_t LLMEngine::warmup_package_weights() {
     if (package_weights_resident_)
         return 0;
 
-    long page_size_long = sysconf(_SC_PAGESIZE);
+    long page_size_long = mollm::io::page_size();
     size_t page_size = page_size_long > 0 ? (size_t)page_size_long : 4096;
 
     const uint8_t* p = package_weights_base_;
@@ -192,18 +191,14 @@ size_t LLMEngine::warmup_package_weights() {
         mollm::detail::normalize_byte_ranges(
             mmap_weight_exclusion_ranges_, len);
 
-#if defined(MADV_WILLNEED)
-    // Preserve the eager readahead behaviour for ordinary mmap packages. In
-    // SSD mode it would pull aggregate expert tensors into the kernel cache,
-    // so dense-only warmup below intentionally relies on page touches alone.
     if (expert_ranges.empty()) {
         uintptr_t start = reinterpret_cast<uintptr_t>(package_weights_base_);
         uintptr_t aligned_start = (start / page_size) * page_size;
         size_t prefix = static_cast<size_t>(start - aligned_start);
-        madvise(reinterpret_cast<void*>(aligned_start),
-                prefix + package_weights_size_, MADV_WILLNEED);
+        mollm::io::madvise(reinterpret_cast<void*>(aligned_start),
+                           prefix + package_weights_size_,
+                           mollm::io::kMadvWillneed);
     }
-#endif
 
     uint8_t sink = 0;
     size_t warmed = 0;
@@ -233,7 +228,7 @@ size_t LLMEngine::lock_dense_package_weights() {
     const size_t warmed = warmup_package_weights();
     const size_t len = package_weights_size_;
     const uint8_t* base = package_weights_base_;
-    const long system_page = sysconf(_SC_PAGESIZE);
+    const long system_page = mollm::io::page_size();
     const size_t page_size =
         system_page > 0 ? static_cast<size_t>(system_page) : 4096;
 
@@ -241,11 +236,6 @@ size_t LLMEngine::lock_dense_package_weights() {
         mollm::detail::normalize_byte_ranges(
             mmap_weight_exclusion_ranges_, len);
 
-#if defined(MADV_DONTNEED)
-    // Expert aggregates and dense weights with complete CPU sidecars are no
-    // longer read through this mapping. Graph loading touched the latter to
-    // build their packed representation, so proactively release those clean
-    // file pages before locking the real dense working set and expert cache.
     for (const auto& range : expert_ranges) {
         if (range.begin >= range.end)
             continue;
@@ -257,11 +247,10 @@ size_t LLMEngine::lock_dense_package_weights() {
             raw_begin / page_size * page_size;
         const uintptr_t aligned_end =
             (raw_end + page_size - 1) / page_size * page_size;
-        madvise(
+        mollm::io::madvise(
             reinterpret_cast<void*>(aligned_begin),
-            aligned_end - aligned_begin, MADV_DONTNEED);
+            aligned_end - aligned_begin, mollm::io::kMadvDontneed);
     }
-#endif
 
     auto lock_range = [&](uint64_t begin, uint64_t end) -> bool {
         if (begin >= end)
@@ -273,7 +262,7 @@ size_t LLMEngine::lock_dense_package_weights() {
             (raw_end + page_size - 1) / page_size * page_size;
         const size_t bytes = aligned_end - aligned_begin;
         void* address = reinterpret_cast<void*>(aligned_begin);
-        if (mlock(address, bytes) != 0)
+        if (mollm::io::mlock(address, bytes) != 0)
             return false;
         locked_dense_ranges_.push_back({address, bytes});
         return true;
@@ -304,7 +293,7 @@ size_t LLMEngine::lock_dense_package_weights() {
             (void)key;
             if (buffer.empty())
                 continue;
-            if (mlock(buffer.data(), buffer.size()) != 0) {
+            if (mollm::io::mlock(buffer.data(), buffer.size()) != 0) {
                 complete = false;
                 break;
             }
@@ -335,7 +324,7 @@ size_t LLMEngine::lock_dense_package_weights() {
             for (auto& buffer : prepared.layouts) {
                 if (buffer.empty())
                     continue;
-                if (mlock(buffer.data(), buffer.size()) != 0) {
+                if (mollm::io::mlock(buffer.data(), buffer.size()) != 0) {
                     complete = false;
                     break;
                 }
@@ -349,7 +338,7 @@ size_t LLMEngine::lock_dense_package_weights() {
     if (!complete) {
         const int err = errno;
         for (const auto& range : locked_dense_ranges_)
-            munlock(range.first, range.second);
+            mollm::io::munlock(range.first, range.second);
         locked_dense_ranges_.clear();
         std::fprintf(stderr, "Engine: could not lock dense mmap weights: %s\n",
                      std::strerror(err));

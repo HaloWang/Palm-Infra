@@ -41,6 +41,11 @@ if(MOLLM_SANITIZERS)
     add_link_options(${MOLLM_SANITIZER_FLAGS})
 endif()
 
+if(MSVC)
+    add_compile_options(/utf-8 /EHsc /Zc:__cplusplus)
+    add_compile_definitions(_CRT_SECURE_NO_WARNINGS NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64|arm")
     set(MOLLM_CPU_PLATFORM_SOURCE kernels/cpu_platform_arm.cpp)
 elseif(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
@@ -63,6 +68,7 @@ set(SOURCES
     # graph
     graph/buffer_pool.cpp
     graph/mmap_file.cpp
+    graph/posix_io.cpp
     graph/io.cpp
     graph/cpu_backend.cpp
     graph/execute.cpp
@@ -154,9 +160,23 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
         set_source_files_properties(
             kernels/attention_x86_avx512.cpp
             PROPERTIES COMPILE_OPTIONS "-mavx512f;-mfma")
+    elseif(MSVC)
+        # Isolate SIMD TUs so the rest of the library stays on the baseline ISA.
+        set_source_files_properties(
+            kernels/matmul_x86_avx2.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX2")
+        set_source_files_properties(
+            kernels/matmul_x86_avx512.cpp
+            kernels/gdn_x86_avx512.cpp
+            kernels/attention_x86_avx512.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        set_source_files_properties(
+            kernels/matmul_x86_vnni.cpp
+            PROPERTIES COMPILE_OPTIONS "/arch:AVX512")
+        message(STATUS "x86 SIMD providers: MSVC /arch:AVX2 and /arch:AVX512")
     else()
         message(FATAL_ERROR
-            "The x86 SIMD providers currently require GCC or Clang")
+            "The x86 SIMD providers currently require GCC, Clang, or MSVC")
     endif()
 endif()
 add_library(mollm::mollm ALIAS mollm_lib)

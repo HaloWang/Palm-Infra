@@ -28,6 +28,10 @@ class ThreadPool;
 #include <arm_neon.h>
 #endif
 
+#if defined(_MSC_VER) && !MOLLM_CPU_ARM_NEON
+#include <cstring>
+#endif
+
 namespace mollm::cpu {
 
 enum class X86Isa : uint8_t {
@@ -42,6 +46,108 @@ using fp16_t = __fp16;
 // Clang exposes __fp16 as a storage-only type on x86. Keep it as the
 // canonical storage spelling so legacy kernel signatures remain compatible.
 using fp16_t = __fp16;
+#elif defined(_MSC_VER)
+// MSVC has no _Float16 / __fp16. Store IEEE binary16 bits and convert
+// through float so existing `(__fp16)x` / `(float)h` call sites compile.
+// Software conversion uses the IEEE default: round-to-nearest, ties-to-even,
+// matching GCC `_Float16`. x86 F16C / WOA NEON can replace this later.
+inline uint16_t fp16_bits_from_f32(float value) {
+    auto round_rne = [](uint32_t magnitude, int shift) -> uint32_t {
+        if (shift <= 0)
+            return magnitude;
+        if (shift >= 32)
+            return 0;
+        const uint32_t kept = magnitude >> shift;
+        const uint32_t round_bit = (magnitude >> (shift - 1)) & 1u;
+        const uint32_t sticky =
+            shift == 1 ? 0u : (magnitude & ((1u << (shift - 1)) - 1u));
+        if (round_bit != 0 && (sticky != 0 || (kept & 1u) != 0))
+            return kept + 1u;
+        return kept;
+    };
+
+    uint32_t bits = 0;
+    std::memcpy(&bits, &value, sizeof(bits));
+    const uint16_t sign = static_cast<uint16_t>((bits >> 16) & 0x8000u);
+    const uint32_t abs_bits = bits & 0x7FFFFFFFu;
+    if (abs_bits >= 0x7F800000u) {
+        if (abs_bits == 0x7F800000u)
+            return static_cast<uint16_t>(sign | 0x7C00u);
+        return static_cast<uint16_t>(
+            sign | 0x7E00u | ((abs_bits >> 13) & 0x1FFu));
+    }
+
+    const int exp = static_cast<int>(abs_bits >> 23);
+    const uint32_t frac = abs_bits & 0x7FFFFFu;
+    // f32 denormals are far below f16 min subnormal (2^-24).
+    if (exp == 0)
+        return sign;
+
+    const int exp16 = exp - 127 + 15;
+    if (exp16 >= 31)
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    if (exp16 <= 0) {
+        if (exp16 < -10)
+            return sign;
+        const uint32_t kept = round_rne(frac | 0x800000u, 14 - exp16);
+        if (kept >= 0x400u)
+            return static_cast<uint16_t>(sign | 0x0400u);
+        return static_cast<uint16_t>(sign | kept);
+    }
+
+    const uint32_t kept = round_rne(frac, 13);
+    int rounded_exp = exp16;
+    uint32_t mantissa = kept;
+    if (mantissa > 0x3FFu) {
+        mantissa = 0;
+        rounded_exp++;
+    }
+    if (rounded_exp >= 31)
+        return static_cast<uint16_t>(sign | 0x7C00u);
+    return static_cast<uint16_t>(
+        sign | (static_cast<uint16_t>(rounded_exp) << 10) |
+        static_cast<uint16_t>(mantissa));
+}
+
+inline float fp16_bits_to_f32(uint16_t value) {
+    const uint16_t sign = static_cast<uint16_t>((value & 0x8000u) >> 15);
+    const uint16_t exponent = static_cast<uint16_t>((value & 0x7C00u) >> 10);
+    uint16_t significand = static_cast<uint16_t>(value & 0x03FFu);
+    uint32_t bits = 0;
+    if (exponent == 0) {
+        if (significand == 0) {
+            bits = static_cast<uint32_t>(sign) << 31;
+        } else {
+            int denorm_exp = 0;
+            while ((significand & 0x200u) == 0) {
+                significand = static_cast<uint16_t>(significand << 1);
+                ++denorm_exp;
+            }
+            significand = static_cast<uint16_t>((significand << 1) & 0x3FFu);
+            bits = (static_cast<uint32_t>(sign) << 31) |
+                   (static_cast<uint32_t>(-denorm_exp - 15 + 127) << 23) |
+                   (static_cast<uint32_t>(significand) << 13);
+        }
+    } else if (exponent == 0x1F) {
+        bits = (static_cast<uint32_t>(sign) << 31) | (0xFFu << 23) |
+               (static_cast<uint32_t>(significand) << 13);
+    } else {
+        bits = (static_cast<uint32_t>(sign) << 31) |
+               (static_cast<uint32_t>(exponent - 15 + 127) << 23) |
+               (static_cast<uint32_t>(significand) << 13);
+    }
+    float result = 0.f;
+    std::memcpy(&result, &bits, sizeof(result));
+    return result;
+}
+
+struct fp16_t {
+    uint16_t bits = 0;
+
+    fp16_t() = default;
+    fp16_t(float value) noexcept : bits(fp16_bits_from_f32(value)) {}
+    operator float() const noexcept { return fp16_bits_to_f32(bits); }
+};
 #else
 // GCC supports IEEE binary16 storage on x86 Linux. It is used only for model
 // bytes and scalar conversion; it does not imply native FP16 SIMD.

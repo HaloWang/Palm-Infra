@@ -11,10 +11,7 @@
 #include <utility>
 #include <vector>
 
-#if defined(__APPLE__) || defined(__linux__)
-#include <sys/mman.h>
-#include <unistd.h>
-#endif
+#include "graph/posix_io.h"
 
 namespace {
 
@@ -66,15 +63,13 @@ int64_t positive_remainder(int64_t value, int32_t divisor) {
 
 void prefetch_ple_rows(const uint8_t* table, int row_dim,
                        const int32_t* indices, int rows) {
-#if defined(MADV_WILLNEED)
     static const bool enabled = [] {
         const char* value = std::getenv("MOLLM_PLE_MADVISE");
         return !value || std::strcmp(value, "0") != 0;
     }();
     if (!enabled) return;
     static const uintptr_t page_size = [] {
-        const long value = sysconf(_SC_PAGESIZE);
-        return static_cast<uintptr_t>(value > 0 ? value : 4096);
+        return static_cast<uintptr_t>(mollm::io::page_size());
     }();
     const uintptr_t page_mask = page_size - 1;
     std::vector<std::pair<uintptr_t, uintptr_t>> ranges;
@@ -99,16 +94,10 @@ void prefetch_ple_rows(const uint8_t* table, int row_dim,
         }
     }
     for (size_t index = 0; index < merged; ++index) {
-        madvise(reinterpret_cast<void*>(ranges[index].first),
-                ranges[index].second - ranges[index].first,
-                MADV_WILLNEED);
+        mollm::io::madvise(reinterpret_cast<void*>(ranges[index].first),
+                           ranges[index].second - ranges[index].first,
+                           mollm::io::kMadvWillneed);
     }
-#else
-    (void)table;
-    (void)row_dim;
-    (void)indices;
-    (void)rows;
-#endif
 }
 
 } // namespace

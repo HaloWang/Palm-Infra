@@ -1,5 +1,6 @@
 #include "engine/sampler.h"
 
+#include "graph/posix_io.h"
 #include "kernels/tensor.h"
 
 #include <algorithm>
@@ -159,8 +160,12 @@ PreparedCandidates prepare_candidates(const float* logits, int vocab_size,
 float next_uniform(unsigned int* seed) {
     unsigned int fallback_seed = 42;
     if (!seed) seed = &fallback_seed;
-    return static_cast<float>(rand_r(seed)) /
+#if defined(_WIN32)
+    return static_cast<float>(mollm::io::rand_r(seed)) / 32768.0f;
+#else
+    return static_cast<float>(::rand_r(seed)) /
            static_cast<float>(RAND_MAX);
+#endif
 }
 
 int sample_token_impl(float* logits, int vocab_size, float temperature,

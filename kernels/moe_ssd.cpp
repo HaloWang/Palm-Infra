@@ -12,9 +12,7 @@
 #include <limits>
 #include <utility>
 
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "graph/posix_io.h"
 
 namespace {
 
@@ -90,7 +88,7 @@ MoeSsdCache::MoeSsdCache() = default;
 
 MoeSsdCache::~MoeSsdCache() {
     stop_io_workers();
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) mollm::io::close(fd_);
 }
 
 bool MoeSsdCache::clear_resident() {
@@ -138,17 +136,17 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
         std::fprintf(stderr, "MoE SSD: cache capacity and I/O worker count must be non-zero\n");
         return false;
     }
-    int fd = ::open(package_path.c_str(), O_RDONLY);
+    int fd = mollm::io::open_read(package_path.c_str());
     if (fd < 0) {
         std::fprintf(stderr, "MoE SSD: failed to open %s: %s\n",
                      package_path.c_str(), std::strerror(errno));
         return false;
     }
-    struct stat file_stat {};
-    if (fstat(fd, &file_stat) != 0 || file_stat.st_size < 0) {
+    uint64_t st_size = 0;
+    if (mollm::io::file_size(fd, &st_size) != 0) {
         std::fprintf(stderr, "MoE SSD: failed to stat %s: %s\n",
                      package_path.c_str(), std::strerror(errno));
-        close(fd);
+        mollm::io::close(fd);
         return false;
     }
 #if defined(__APPLE__)
@@ -163,11 +161,11 @@ bool MoeSsdCache::open(const std::string& package_path, size_t capacity_bytes,
     }
 #endif
     stop_io_workers();
-    if (fd_ >= 0) close(fd_);
+    if (fd_ >= 0) mollm::io::close(fd_);
     {
         std::lock_guard<std::mutex> lock(mutex_);
         fd_ = fd;
-        file_size_ = static_cast<uint64_t>(file_stat.st_size);
+        file_size_ = st_size;
         io_workers_count_ = io_workers;
         next_trace_id_ = 1;
         capacity_bytes_ = capacity_bytes;

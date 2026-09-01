@@ -5,7 +5,7 @@
 #include <cstdint>
 #include <memory>
 
-#include <sys/mman.h>
+#include "graph/posix_io.h"
 
 // pread() overwrites every byte in a component. std::vector::resize() clears
 // these multi-megabyte buffers first, making request_many CPU-bound as the
@@ -27,12 +27,12 @@ struct MoeSsdCache::ByteBuffer {
     }
     bool lock() {
         if (locked || length == 0) return true;
-        locked = mlock(storage.get(), length) == 0;
+        locked = mollm::io::mlock(storage.get(), length) == 0;
         return locked;
     }
     void unlock() {
         if (locked) {
-            munlock(storage.get(), length);
+            mollm::io::munlock(storage.get(), length);
             locked = false;
         }
     }

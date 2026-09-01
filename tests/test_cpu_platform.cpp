@@ -57,6 +57,40 @@ int main() {
         return 1;
     }
 
+    auto f32_from_bits = [](uint32_t bits) {
+        float value = 0.f;
+        std::memcpy(&value, &bits, sizeof(value));
+        return value;
+    };
+    auto fp16_bits = [](float value) {
+        const mollm::cpu::fp16_t half = value;
+        uint16_t bits = 0;
+        std::memcpy(&bits, &half, sizeof(bits));
+        return bits;
+    };
+    auto expect_fp16 = [&](float value, uint16_t expected, const char* label) {
+        const uint16_t got = fp16_bits(value);
+        if (got != expected) {
+            std::fprintf(stderr, "%s: got 0x%04x expected 0x%04x\n", label,
+                         got, expected);
+            return false;
+        }
+        return true;
+    };
+    if (!expect_fp16(0.0f, 0x0000, "fp16 +0") ||
+        !expect_fp16(-0.0f, 0x8000, "fp16 -0") ||
+        !expect_fp16(1.0f, 0x3C00, "fp16 1.0") ||
+        !expect_fp16(2.0f, 0x4000, "fp16 2.0") ||
+        !expect_fp16(-2.0f, 0xC000, "fp16 -2.0") ||
+        !expect_fp16(65504.0f, 0x7BFF, "fp16 max finite") ||
+        !expect_fp16(65520.0f, 0x7C00, "fp16 overflow tie") ||
+        !expect_fp16(f32_from_bits(0x3F801000u), 0x3C00,
+                     "fp16 RNE tie-to-even") ||
+        !expect_fp16(f32_from_bits(0x3F803000u), 0x3C02,
+                     "fp16 RNE tie-from-odd")) {
+        return 1;
+    }
+
     std::printf("CPU provider: %s\n", name);
     return 0;
 }

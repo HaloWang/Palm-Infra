@@ -14,6 +14,7 @@
 
 #include "kernels/gdn.h"
 #include "graph/graph.h"
+#include "graph/posix_io.h"
 #include "kernels/tensor.h"
 #include <cmath>
 #include <cstdio>
@@ -27,7 +28,7 @@ static int failures = 0;
 static void fill_rand(float* d, int n, unsigned int* seed) {
     for (int i = 0; i < n; i++) {
         // rand_r for thread-safe-ish determinism across runs
-        d[i] = ((float)rand_r(seed) / (float)RAND_MAX) - 0.5f;
+        d[i] = ((float)mollm::io::rand_r(seed) / 32768.0f) - 0.5f;
     }
 }
 
