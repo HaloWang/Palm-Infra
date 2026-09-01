@@ -77,6 +77,37 @@ jobs:
           MOLLM_X86_ISA: scalar
         run: ctest --test-dir build --output-on-failure
 
+  windows-msvc-build-and-test:
+    name: Windows x86_64 (MSVC)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify x86_64 runner
+        shell: pwsh
+        run: |
+          if ($env:PROCESSOR_ARCHITECTURE -ne "AMD64") {
+            throw "expected AMD64 runner"
+          }
+      - name: Install E2E fixture dependency
+        run: python -m pip install --disable-pip-version-check numpy
+      - name: Verify E2E fixture dependency
+        run: python -c "import numpy"
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -G "Visual Studio 17 2022" -A x64
+          -DCMAKE_BUILD_TYPE=Release
+          -DMOLLM_BUILD_TESTS=ON
+          -DMOLLM_BUILD_EXAMPLE=OFF
+          "-DPython3_EXECUTABLE=${{ env.pythonLocation }}\python.exe"
+      - name: Build
+        run: cmake --build build --config Release -j 2
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
   x86-sanitizers:
     name: Linux x86_64 (ASan + UBSan)
     runs-on: ubuntu-latest

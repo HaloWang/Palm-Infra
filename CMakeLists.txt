@@ -186,6 +186,7 @@ target_include_directories(mollm_lib PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann>
     $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}/mollm>
 )
+target_compile_features(mollm_lib PUBLIC cxx_std_17)
 target_link_libraries(mollm_lib PUBLIC Threads::Threads)
 if(MOLLM_SANITIZERS)
     # Static-library consumers need the sanitizer runtimes at final link time.
