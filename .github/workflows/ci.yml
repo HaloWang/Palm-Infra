@@ -83,6 +83,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
+        id: python
         with:
           python-version: "3.12"
       - name: Verify x86_64 runner
@@ -95,18 +96,27 @@ jobs:
         run: python -m pip install --disable-pip-version-check numpy
       - name: Verify E2E fixture dependency
         run: python -c "import numpy"
+      - name: Enable MSVC
+        shell: cmd
+        run: |
+          for /f "usebackq delims=" %%I in (`"%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
+            echo VCVARS=%%I\VC\Auxiliary\Build\vcvars64.bat>> "%GITHUB_ENV%"
+          )
       - name: Configure
-        run: >
-          cmake -S . -B build
-          -A x64
-          -DCMAKE_BUILD_TYPE=Release
-          -DMOLLM_BUILD_TESTS=ON
-          -DMOLLM_BUILD_EXAMPLE=OFF
-          "-DPython3_EXECUTABLE=${{ env.pythonLocation }}/python.exe"
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_CXX_COMPILER=cl -DMOLLM_BUILD_TESTS=ON -DMOLLM_BUILD_EXAMPLE=OFF -DPython3_EXECUTABLE="${{ steps.python.outputs.python-path }}"
       - name: Build
-        run: cmake --build build --config Release -j 2
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          cmake --build build -j 2
       - name: Test
-        run: ctest --test-dir build -C Release --output-on-failure
+        shell: cmd
+        run: |
+          call "%VCVARS%"
+          ctest --test-dir build --output-on-failure
 
   x86-sanitizers:
     name: Linux x86_64 (ASan + UBSan)
