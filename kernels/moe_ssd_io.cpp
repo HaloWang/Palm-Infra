@@ -1,6 +1,7 @@
 #include "kernels/moe_ssd_internal.h"
 
 #include "kernels/trace.h"
+#include "platform/posix_compat.h"
 
 #include <algorithm>
 #include <atomic>
@@ -12,8 +13,6 @@
 #include <utility>
 #include <vector>
 
-#include <sys/uio.h>
-#include <unistd.h>
 #if defined(__APPLE__)
 #include <pthread/qos.h>
 #endif
@@ -23,10 +22,10 @@ namespace {
 bool preadv_exact(int fd, uint64_t offset, std::vector<iovec> vectors) {
     size_t index = 0;
     while (index < vectors.size()) {
-        const ssize_t bytes = preadv(
+        const ssize_t bytes = mollm_preadv(
             fd, vectors.data() + static_cast<ptrdiff_t>(index),
             static_cast<int>(vectors.size() - index),
-            static_cast<off_t>(offset));
+            offset);
         if (bytes < 0 && errno == EINTR)
             continue;
         if (bytes <= 0) {
@@ -57,8 +56,8 @@ bool MoeSsdCache::read_exact(uint64_t offset, void* dst, size_t bytes) const {
     uint8_t* out = static_cast<uint8_t*>(dst);
     size_t done = 0;
     while (done < bytes) {
-        ssize_t n = pread(fd_, out + done, bytes - done,
-                          static_cast<off_t>(offset + done));
+        ssize_t n = mollm_pread(fd_, out + done, bytes - done,
+                                offset + done);
         if (n < 0 && errno == EINTR) continue;
         if (n <= 0) {
             std::fprintf(stderr, "MoE SSD: pread failed at offset %llu: %s\n",

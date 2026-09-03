@@ -195,7 +195,8 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
     endif()
 
     if(NOT MOLLM_ARM_I8MM_MODE STREQUAL "OFF")
-        set(MOLLM_ARM_I8MM_FLAGS "-march=armv8.6-a+i8mm+fp16+fp16fml")
+        set(MOLLM_ARM_I8MM_FLAGS
+            "-march=armv8.6-a+dotprod+i8mm+fp16+fp16fml")
         set(_mollm_saved_required_flags "${CMAKE_REQUIRED_FLAGS}")
         set(CMAKE_REQUIRED_FLAGS "${CMAKE_REQUIRED_FLAGS} ${MOLLM_ARM_I8MM_FLAGS}")
         set(_mollm_i8mm_probe_source "
@@ -217,14 +218,13 @@ if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64|ARM64")
         if(MOLLM_ARM_I8MM_COMPILES)
             add_library(mollm_arm_i8mm OBJECT
                 kernels/matmul_w4_i8mm.cpp
-                kernels/matmul_w8.cpp)
+                kernels/matmul_w8_i8mm.cpp)
             target_include_directories(mollm_arm_i8mm PRIVATE
                 ${CMAKE_CURRENT_SOURCE_DIR}
                 ${CMAKE_CURRENT_SOURCE_DIR}/third_party/nlohmann)
             target_compile_definitions(mollm_arm_i8mm PRIVATE
                 MOLLM_CPU_ARM_NEON=1
                 MOLLM_ARM_I8MM_KERNELS=1
-                MOLLM_W8_I8MM_ONLY=1
                 __ARM_NEON=1)
             target_compile_options(mollm_arm_i8mm PRIVATE
                 ${MOLLM_ARM_I8MM_FLAGS})
@@ -396,6 +396,9 @@ if(MOLLM_BUILD_EXAMPLE)
         examples/cli_common.cpp
     )
     target_link_libraries(mollm_bench PRIVATE mollm_lib)
+    if(WIN32)
+        target_link_libraries(mollm_bench PRIVATE Psapi)
+    endif()
 
     add_executable(mollm_ppl
         examples/ppl.cpp

@@ -1,20 +1,17 @@
 #include "engine/engine.h"
 #include "kernels/moe_ssd.h"
+#include "platform/posix_compat.h"
 
 #include <algorithm>
 #include <cerrno>
 #include <cstdint>
+#include <cstdlib>
 #include <cstdio>
 #include <cstring>
 #include <json.hpp>
 #include <limits>
 #include <new>
 #include <vector>
-
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 using json = nlohmann::json;
 
@@ -33,7 +30,7 @@ public:
     explicit ScopedFd(int fd = -1) : fd_(fd) {}
     ~ScopedFd() {
         if (fd_ >= 0)
-            close(fd_);
+            mollm_close(fd_);
     }
 
     ScopedFd(const ScopedFd&) = delete;
@@ -46,7 +43,7 @@ public:
             return true;
         const int fd = fd_;
         fd_ = -1;
-        return close(fd) == 0;
+        return mollm_close(fd) == 0;
     }
 
 private:
@@ -59,7 +56,7 @@ public:
         : address_(address), size_(size) {}
     ~ScopedMapping() {
         if (address_)
-            munmap(address_, size_);
+            mollm_munmap(address_, size_);
     }
 
     ScopedMapping(const ScopedMapping&) = delete;
@@ -98,8 +95,7 @@ bool read_exact_at(int fd, uint64_t offset, void* dst, size_t len,
     size_t done = 0;
     while (done < len) {
         size_t chunk = std::min<size_t>(len - done, 64 * 1024 * 1024);
-        ssize_t n =
-            pread(fd, out + done, chunk, static_cast<off_t>(offset + done));
+        ssize_t n = mollm_pread(fd, out + done, chunk, offset + done);
         if (n < 0) {
             if (errno == EINTR)
                 continue;
@@ -120,7 +116,7 @@ bool write_exact(int fd, const void* src, size_t len, const char* label) {
     const uint8_t* data = static_cast<const uint8_t*>(src);
     size_t done = 0;
     while (done < len) {
-        ssize_t written = write(fd, data + done, len - done);
+        ssize_t written = mollm_write(fd, data + done, len - done);
         if (written < 0) {
             if (errno == EINTR)
                 continue;
@@ -144,8 +140,23 @@ bool extract_temp_section(int source_fd, const uint8_t* mapped,
     if (length == 0)
         return true;
 
-    char path[] = "/tmp/mollm_pkg_XXXXXX";
-    ScopedFd output(mkstemp(path));
+    const char* configured_tmp = std::getenv("TMPDIR");
+    std::string path_template;
+    if (configured_tmp && *configured_tmp) {
+        path_template = configured_tmp;
+    } else {
+#if defined(_WIN32)
+        path_template = mollm_default_temp_directory();
+#else
+        path_template = "/tmp";
+#endif
+    }
+    if (path_template.back() != '/' && path_template.back() != '\\')
+        path_template.push_back('/');
+    path_template += "mollm_pkg_XXXXXX";
+    std::vector<char> path(path_template.begin(), path_template.end());
+    path.push_back('\0');
+    ScopedFd output(mollm_mkstemp(path.data()));
     if (output.get() < 0) {
         fprintf(stderr, "Engine: failed to create temporary %s: %s\n", label,
                 strerror(errno));
@@ -173,11 +184,11 @@ bool extract_temp_section(int source_fd, const uint8_t* mapped,
     if (!output.close_now())
         ok = false;
     if (!ok) {
-        std::remove(path);
+        std::remove(path.data());
         return false;
     }
 
-    out_path = path;
+    out_path = path.data();
     temp_files.push_back(out_path);
     return true;
 }
@@ -323,22 +334,20 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
                              std::string& mtp_path,
                              std::string& tok_path,
                              std::string& jinja_path) {
-    ScopedFd package_file(open(path.c_str(), O_RDONLY));
+    ScopedFd package_file(mollm_open_readonly(path.c_str()));
     if (package_file.get() < 0) {
         fprintf(stderr, "Engine: failed to open package %s\n", path.c_str());
         return false;
     }
-    struct stat st;
-    if (fstat(package_file.get(), &st) != 0) {
+    uint64_t file_size_u64 = 0;
+    if (!mollm_file_size(package_file.get(), file_size_u64)) {
         return false;
     }
-    if (st.st_size < 0 ||
-        static_cast<uint64_t>(st.st_size) >
-            static_cast<uint64_t>(SIZE_MAX)) {
+    if (file_size_u64 > static_cast<uint64_t>(SIZE_MAX)) {
         fprintf(stderr, "Engine: package size is unsupported\n");
         return false;
     }
-    size_t file_size = st.st_size;
+    size_t file_size = static_cast<size_t>(file_size_u64);
 
     uint8_t header[128];
     if (!read_exact_at(package_file.get(), 0, header, sizeof(header),
@@ -688,8 +697,7 @@ bool LLMEngine::load_package(const std::string& path, std::string& pf_path,
         return true;
     }
 
-    void* mapped = mmap(nullptr, file_size, PROT_READ, MAP_PRIVATE,
-                        package_file.get(), 0);
+    void* mapped = mollm_mmap_readonly(package_file.get(), file_size);
     package_file.close_now();
     if (mapped == MAP_FAILED) {
         fprintf(stderr, "Engine: mmap failed for %s\n", path.c_str());

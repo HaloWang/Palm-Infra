@@ -24,12 +24,25 @@ void mollm_print_moe_profile(const char* title);
 #include <string>
 #include <vector>
 
-// Peak RSS reporting (portable: getrusage works on macOS + Linux).
 // Reports peak resident set size in bytes across the whole process lifetime,
 // including mmap'd weights and all BufferPool allocations.
+#if defined(_WIN32)
+#include <windows.h>
+#include <psapi.h>
+#else
 #include <sys/resource.h>
+#endif
 
 static double peak_rss_mb() {
+#if defined(_WIN32)
+    PROCESS_MEMORY_COUNTERS counters {};
+    counters.cb = sizeof(counters);
+    if (!GetProcessMemoryInfo(GetCurrentProcess(), &counters,
+                              sizeof(counters))) {
+        return 0.0;
+    }
+    return counters.PeakWorkingSetSize / (1024.0 * 1024.0);
+#else
     struct rusage ru;
     getrusage(RUSAGE_SELF, &ru);
 #if defined(__APPLE__)
@@ -38,6 +51,7 @@ static double peak_rss_mb() {
 #else
     // Linux: ru_maxrss is in kilobytes
     return ru.ru_maxrss / 1024.0;
+#endif
 #endif
 }
 

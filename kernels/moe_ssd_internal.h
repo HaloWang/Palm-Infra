@@ -1,11 +1,10 @@
 #pragma once
 
 #include "kernels/moe_ssd.h"
+#include "platform/posix_compat.h"
 
 #include <cstdint>
 #include <memory>
-
-#include <sys/mman.h>
 
 // pread() overwrites every byte in a component. std::vector::resize() clears
 // these multi-megabyte buffers first, making request_many CPU-bound as the
@@ -27,12 +26,12 @@ struct MoeSsdCache::ByteBuffer {
     }
     bool lock() {
         if (locked || length == 0) return true;
-        locked = mlock(storage.get(), length) == 0;
+        locked = mollm_mlock(storage.get(), length) == 0;
         return locked;
     }
     void unlock() {
         if (locked) {
-            munlock(storage.get(), length);
+            mollm_munlock(storage.get(), length);
             locked = false;
         }
     }

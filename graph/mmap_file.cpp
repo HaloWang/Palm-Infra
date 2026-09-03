@@ -36,7 +36,7 @@ static void* map_file(const char* path, size_t* out_size) {
     return ptr;
 }
 
-static void unmap_file(void* ptr) {
+static void unmap_file(void* ptr, size_t) {
     if (ptr) UnmapViewOfFile(ptr);
 }
 

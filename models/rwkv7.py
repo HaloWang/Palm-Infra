@@ -29,11 +29,28 @@ def _canonical_quant(quant: str) -> str:
         return "w4mixg32"
     if q in ("w4", "w4mix", "w4mixg128"):
         return "w4mixg128"
+    if q == "w4allg32":
+        return "w4allg32"
+    if q in ("w4all", "w4allg128"):
+        return "w4allg128"
+    if q in ("w4select", "w4selectg128"):
+        return "w4selectg128"
     raise ValueError(f"unsupported RWKV quant mode: {quant}")
 
 
 def _is_small_lora(name: str) -> bool:
     return name.endswith(("_w1", "_w2", "_a1", "_a2", "_v1", "_v2", "_g1", "_g2"))
+
+
+def _is_selected_w4_matrix(name: str) -> bool:
+    """Core ML-inspired mixed map expressed in mollm's W4/W8 formats."""
+    return name.endswith((
+        "_att_receptance_weight",
+        "_att_key_weight",
+        "_att_value_weight",
+        "_ffn_key_weight",
+        "_ffn_value_weight",
+    ))
 
 
 def _quant_spec(quant: str, name: str, k: int) -> tuple[str, int] | None:
@@ -42,6 +59,10 @@ def _quant_spec(quant: str, name: str, k: int) -> tuple[str, int] | None:
         return None
     if quant == "w8pc":
         return ("w8", k)
+    if quant in ("w4allg32", "w4allg128"):
+        return ("w4", 32 if quant == "w4allg32" else 128)
+    if quant == "w4selectg128":
+        return ("w4", 128) if _is_selected_w4_matrix(name) else ("w8", 128)
     # Mixed W4: retain the vocabulary projection and low-rank attention
     # adapters at W8; large attention/FFN matrices use symmetric W4.
     if name == "lm_head" or _is_small_lora(name):
@@ -363,7 +384,9 @@ if __name__ == "__main__":
     parser.add_argument("--tokenizer", default="")
     parser.add_argument("--quant", default="fp16",
                         choices=("fp16", "w8", "w8pc", "w4", "w4mixg32",
-                                 "w4mixg128"))
+                                 "w4mixg128", "w4allg32", "w4all",
+                                 "w4allg128",
+                                 "w4select", "w4selectg128"))
     args = parser.parse_args()
     convert_rwkv7(args.checkpoint, args.output, args.prefill_seq_len,
                   args.tokenizer, args.quant)

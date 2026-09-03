@@ -608,24 +608,33 @@ static void matmul_fp16_neon_8x8_range_packed_a(const __fp16* A_packed,
                     float16x8_t b_vec =
                         vld1q_f16(&B_packed[(n & ~7) * K + k * 8]);
 
-                    // For each N column j, broadcast b_vec[j] and FMA with
-                    // a_vec low half (rows 0..3) and high half (rows 4..7)
-                    c[0][0] = vfmlalq_laneq_low_f16(c[0][0], a_vec, b_vec, 0);
-                    c[0][1] = vfmlalq_laneq_high_f16(c[0][1], a_vec, b_vec, 0);
-                    c[1][0] = vfmlalq_laneq_low_f16(c[1][0], a_vec, b_vec, 1);
-                    c[1][1] = vfmlalq_laneq_high_f16(c[1][1], a_vec, b_vec, 1);
-                    c[2][0] = vfmlalq_laneq_low_f16(c[2][0], a_vec, b_vec, 2);
-                    c[2][1] = vfmlalq_laneq_high_f16(c[2][1], a_vec, b_vec, 2);
-                    c[3][0] = vfmlalq_laneq_low_f16(c[3][0], a_vec, b_vec, 3);
-                    c[3][1] = vfmlalq_laneq_high_f16(c[3][1], a_vec, b_vec, 3);
-                    c[4][0] = vfmlalq_laneq_low_f16(c[4][0], a_vec, b_vec, 4);
-                    c[4][1] = vfmlalq_laneq_high_f16(c[4][1], a_vec, b_vec, 4);
-                    c[5][0] = vfmlalq_laneq_low_f16(c[5][0], a_vec, b_vec, 5);
-                    c[5][1] = vfmlalq_laneq_high_f16(c[5][1], a_vec, b_vec, 5);
-                    c[6][0] = vfmlalq_laneq_low_f16(c[6][0], a_vec, b_vec, 6);
-                    c[6][1] = vfmlalq_laneq_high_f16(c[6][1], a_vec, b_vec, 6);
-                    c[7][0] = vfmlalq_laneq_low_f16(c[7][0], a_vec, b_vec, 7);
-                    c[7][1] = vfmlalq_laneq_high_f16(c[7][1], a_vec, b_vec, 7);
+                    // Widen A and the broadcast B lane explicitly. HarmonyOS
+                    // Clang 15 miscompiles the vfmlalq_laneq_*_f16 sequence at
+                    // -O2/-O3 for this FP32-accumulation fallback, producing
+                    // incorrect output while the unoptimized build passes.
+                    // The production FP16-accumulation fast path below is
+                    // unchanged; this keeps the exact fallback both optimized
+                    // and compiler-stable.
+                    const float32x4_t a_lo =
+                        vcvt_f32_f16(vget_low_f16(a_vec));
+                    const float32x4_t a_hi =
+                        vcvt_f32_f16(vget_high_f16(a_vec));
+                    c[0][0] = vfmaq_n_f32(c[0][0], a_lo, (float)vgetq_lane_f16(b_vec, 0));
+                    c[0][1] = vfmaq_n_f32(c[0][1], a_hi, (float)vgetq_lane_f16(b_vec, 0));
+                    c[1][0] = vfmaq_n_f32(c[1][0], a_lo, (float)vgetq_lane_f16(b_vec, 1));
+                    c[1][1] = vfmaq_n_f32(c[1][1], a_hi, (float)vgetq_lane_f16(b_vec, 1));
+                    c[2][0] = vfmaq_n_f32(c[2][0], a_lo, (float)vgetq_lane_f16(b_vec, 2));
+                    c[2][1] = vfmaq_n_f32(c[2][1], a_hi, (float)vgetq_lane_f16(b_vec, 2));
+                    c[3][0] = vfmaq_n_f32(c[3][0], a_lo, (float)vgetq_lane_f16(b_vec, 3));
+                    c[3][1] = vfmaq_n_f32(c[3][1], a_hi, (float)vgetq_lane_f16(b_vec, 3));
+                    c[4][0] = vfmaq_n_f32(c[4][0], a_lo, (float)vgetq_lane_f16(b_vec, 4));
+                    c[4][1] = vfmaq_n_f32(c[4][1], a_hi, (float)vgetq_lane_f16(b_vec, 4));
+                    c[5][0] = vfmaq_n_f32(c[5][0], a_lo, (float)vgetq_lane_f16(b_vec, 5));
+                    c[5][1] = vfmaq_n_f32(c[5][1], a_hi, (float)vgetq_lane_f16(b_vec, 5));
+                    c[6][0] = vfmaq_n_f32(c[6][0], a_lo, (float)vgetq_lane_f16(b_vec, 6));
+                    c[6][1] = vfmaq_n_f32(c[6][1], a_hi, (float)vgetq_lane_f16(b_vec, 6));
+                    c[7][0] = vfmaq_n_f32(c[7][0], a_lo, (float)vgetq_lane_f16(b_vec, 7));
+                    c[7][1] = vfmaq_n_f32(c[7][1], a_hi, (float)vgetq_lane_f16(b_vec, 7));
                 }
 
                 // Write back: column-major → row-major C
