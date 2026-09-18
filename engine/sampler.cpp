@@ -159,8 +159,18 @@ PreparedCandidates prepare_candidates(const float* logits, int vocab_size,
 float next_uniform(unsigned int* seed) {
     unsigned int fallback_seed = 42;
     if (!seed) seed = &fallback_seed;
+#if defined(_WIN32)
+    // rand_r is POSIX-only. Keep the sampler state local to the caller on
+    // Windows as well, using the traditional ANSI C LCG rather than the
+    // process-global rand() state.
+    unsigned int value = *seed;
+    value = value * 1103515245u + 12345u;
+    *seed = value;
+    return static_cast<float>((value / 65536u) % 32768u) / 32767.0f;
+#else
     return static_cast<float>(rand_r(seed)) /
            static_cast<float>(RAND_MAX);
+#endif
 }
 
 int sample_token_impl(float* logits, int vocab_size, float temperature,

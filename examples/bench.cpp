@@ -1,4 +1,5 @@
 #include "examples/cli_common.h"
+#include "kernels/cpu_platform.h"
 
 #include <algorithm>
 #include <chrono>
@@ -213,6 +214,7 @@ void print_kv_summary(double load_ms, double load_warmup_ms, size_t load_warmup_
     std::printf("load_ms=%.2f\n", load_ms);
     std::printf("load_warmup_ms=%.2f\n", load_warmup_ms);
     std::printf("load_warmup_mb=%.1f\n", load_warmup_bytes / 1e6);
+    std::printf("cpu_isa=%s\n", mollm::cpu::isa_name());
     std::printf("threads=%d\n", engine.config().num_threads);
     std::printf("prompt_tokens=%d\n", m.prompt_tokens);
     std::printf("generated_tokens=%d\n", m.generated_tokens);
@@ -396,6 +398,7 @@ void print_human_summary(double load_ms, double load_warmup_ms, size_t load_warm
     human_row("load_ms",     load_ms,                    "ms");
     human_row("load_warmup_ms", load_warmup_ms,           "ms");
     human_row("load_warmup_mb", load_warmup_bytes / 1e6,  "MB");
+    std::printf("  %-24s %12s\n", "cpu_isa", mollm::cpu::isa_name());
     human_row_int("threads", engine.config().num_threads, "");
     if (engine.moe_ssd_offload_enabled()) {
         human_row("moe_ssd_cache_mb", engine.config().moe_ssd_cache_bytes / 1e6, "MB");
